@@ -202,7 +202,10 @@ def _do(fn, *args, **kw):
 churn_ltp = {}                                    # token -> last Close (raw)
 zones = {t: None for t in TOKENS}                 # token -> current RSI zone
 rsis = {t: None for t in TOKENS}                  # token -> last RSI x100
-live = {t: None for t in TOKENS}                  # token -> side last started (BUY/SELL)
+if "live" not in globals():                       # kept across re-pastes so a re-paste does not re-send the same side
+    live = {}
+for _t in TOKENS:
+    live.setdefault(_t, None)                     # token -> side last started (BUY/SELL)
 
 def rsi_zone(rsi_x100):
     if rsi_x100 > RSI_HIGH * 100: return "OVERBOUGHT"
@@ -256,7 +259,7 @@ def activate(token, side):
           f"ival {params['ival']} jval {params['jval']} sval {params['sval']} "
           f"range {params['lowerrange']}-{params['upperrange']}")
 
-def on_signal(token, zone):
+def on_signal(token, zone, force=False):
     """RSI of `token` entered a zone. Manual: on_signal(48987, "OVERBOUGHT") or sell("reliance")."""
     if not (TRADE_START <= datetime.now(IST).time() <= TRADE_END):
         print(f"[churning] {NAME_OF[token]} -> {zone} outside trade window, ignored")
@@ -264,12 +267,15 @@ def on_signal(token, zone):
     if token not in churn_ltp:
         print(f"[churning] no candle close yet for {NAME_OF[token]}, {zone} skipped")
         return
+    if not force and live[token] == ZONE_SIDE[zone]:
+        print(f"[churning] {NAME_OF[token]} -> {zone}: already running {live[token]}, not resent")
+        return
     rsi = rsis[token]
     print(f"[churning] {NAME_OF[token]} RSI {rsi / 100 if rsi is not None else '?'} -> {zone}")
     activate(token, ZONE_SIDE[zone])
 
-def sell(name): on_signal(INSTR[name][1], "OVERBOUGHT")
-def buy(name):  on_signal(INSTR[name][1], "OVERSOLD")
+def sell(name): on_signal(INSTR[name][1], "OVERBOUGHT", force=True)
+def buy(name):  on_signal(INSTR[name][1], "OVERSOLD", force=True)
 
 def pause_all():
     for pf in ALL_PF: _do(pause, pf, USER_ID)

@@ -7,7 +7,7 @@ from deephaven import csv as dhcsv
 
 CACHE_DIR = "/data/fo_market_data"
 FORMAT = "parquet"              # "parquet" or "csv"
-AUTO_AT = dtime(15, 35)         # IST, auto-save time. None = manual only
+AUTO_AT = dtime(15, 55)         # IST, auto-save time. None = manual only
 
 # table variable name in the Deephaven session -> file prefix
 # file = <prefix><yyyy-mm-dd>.pq
