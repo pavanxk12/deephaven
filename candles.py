@@ -1,18 +1,36 @@
 import time
 from datetime import datetime, timezone, timedelta
+
 from deephaven import DynamicTableWriter, dtypes as dht
-from deephaven.constants import NULL_LONG
 from deephaven.table_listener import listen
 
 # stop the previous listener if this script is re-run
 if "h_data" in globals():
     h_data.stop()
 
+if "master" not in globals():
+    raise RuntimeError("'master' not found - run build_master.py first")
+
 IST = timezone(timedelta(hours=5, minutes=30))
 FMT_MIN = "%d-%m-%Y %H:%M"          # ltt is fixed width: "dd-mm-yyyy HH:MM:SS"
 
 START_MIN = int(time.time() // 60 * 60) + 60   # first full minute we build
-RSI_N = 14                                     # RSI period (candles), Wilder smoothing
+
+# ---- token -> symbol lookup (built once from the in-memory master) ----
+# symbol = full contract, e.g. "NIFTY 27OCT26 25000 CE" / "NIFTY 27OCT26 FUT"
+symbol_of = {}
+
+_ch = master["chain"]
+_exp = _ch["expiry"].dt.strftime("%d%b%y").str.upper()
+_strk = _ch["strike"].map("{:g}".format)
+for _tcol, _tp in (("ce_token", "CE"), ("pe_token", "PE")):
+    _names = (_ch["TckrSymb"] + " " + _exp + " " + _strk + " " + _tp).tolist()
+    symbol_of.update(zip(_ch[_tcol].astype("int64").tolist(), _names))
+
+_fu = master["futs"]
+_names = (_fu["TckrSymb"] + " " + _fu["expiry"].dt.strftime("%d%b%y").str.upper() + " FUT").tolist()
+symbol_of.update(zip(_fu["fut_token"].astype("int64").tolist(), _names))
+del _ch, _fu, _exp, _strk, _names
 
 minute_cache = {}   # "dd-mm-yyyy HH:MM" -> epoch seconds of that minute (one entry per minute)
 
@@ -37,61 +55,30 @@ def parse_ltt(s):
 # ---- output: one row per token per closed minute ----
 cw = DynamicTableWriter({
     "MinuteEpoch": dht.int64,
+    "Symbol": dht.string,
     "token": dht.int64,
     "Open": dht.int64,
     "High": dht.int64,
     "Low": dht.int64,
     "Close": dht.int64,
     "Volume": dht.int64,
-    "RSI": dht.int64,        # RSI x 100 (7125 = 71.25), null until RSI_N + 1 candles
 })
 candles = cw.table.view([
     "Minute = epochSecondsToInstant(MinuteEpoch)",
-    "token", "Open", "High", "Low", "Close", "Volume", "RSI",
+    "Symbol", "token", "Open", "High", "Low", "Close", "Volume",
 ])
 
 # ---- state (one entry per token) ----
 cur = {}         # token -> [minute, o, h, l, c, cum_vol, first_vol]
 prev_cum = {}    # token -> cumulative vol at end of last closed candle
 last_seen = {}   # token -> (ltt string, cumulative vol) of last trade seen
-prev_close = {}  # token -> close of last closed candle (for RSI)
-rsi_state = {}   # token -> [changes seen, avg gain, avg loss]
 
 def _close(tok, c):
     minute, o, h, l, cl, cum, first_vol = c
     base = prev_cum.get(tok, first_vol)
-
-    pc = prev_close.get(tok)
-
-    # RSI (Wilder): first RSI_N changes are summed and averaged, then smoothed
-    # a ratio of gains to losses, so paise vs rupees gives the same value
-    rsi = NULL_LONG                              # null until RSI_N changes exist
-    if pc is not None:
-        change = cl - pc
-        gain = change if change > 0 else 0.0
-        loss = -change if change < 0 else 0.0
-        if tok not in rsi_state:
-            rsi_state[tok] = [0, 0.0, 0.0]
-        s = rsi_state[tok]
-        if s[0] < RSI_N:
-            s[0] += 1
-            s[1] += gain
-            s[2] += loss
-            if s[0] == RSI_N:
-                s[1] = s[1] / RSI_N              # seed = simple average
-                s[2] = s[2] / RSI_N
-        else:
-            s[1] = (s[1] * (RSI_N - 1) + gain) / RSI_N
-            s[2] = (s[2] * (RSI_N - 1) + loss) / RSI_N
-        if s[0] == RSI_N:
-            if s[2] == 0:
-                val = 100.0 if s[1] > 0 else 50.0    # no losses: 100, flat: 50
-            else:
-                val = 100 - 100 / (1 + s[1] / s[2])
-            rsi = round(val * 100)               # int, two decimals kept (x100)
-
-    prev_close[tok] = cl
-    cw.write_row(minute, tok, round(o), round(h), round(l), round(cl), max(cum - base, 0), rsi)
+    cw.write_row(minute, symbol_of.get(tok), tok,
+                 round(o), round(h), round(l), round(cl),
+                 max(cum - base, 0))
     prev_cum[tok] = cum
 
 def flush(cutoff_min):

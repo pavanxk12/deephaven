@@ -1,5 +1,4 @@
-# straddle_series.py -- V / D straddle time series (same logic as str.cpp), 1 point per minute
-# supports all symbols (SYMBOLS = None) + stale price guard
+# straddle_series.py -- V / D straddle series from `candles` only: backfill history, then live
 import time
 import threading
 import numpy as np
@@ -13,16 +12,15 @@ from deephaven.pandas import to_pandas
 # =============================== USER INPUT ===============================
 SYMBOLS = None                    # None = every symbol with future + options; or e.g. ["NIFTY", "BANKNIFTY"]
 EXPIRY_INDEX = 0                  # 0 = nearest option expiry, 1 = next, ...
-EXPIRY_OVERRIDE = {}              # e.g. {"NIFTY": "2026-10-13"} to force an expiry per symbol
-WINDOW = 5                        # +/- strikes around ATM (C++ WINDOW)
-SHIFT_THRESHOLD = 3               # re-centre window when ATM drifts more than this
-MIN_SEARCH = 2                    # search +/-2 strikes around the previous minimum
+EXPIRY_OVERRIDE = {}              # e.g. {"NIFTY": "2026-10-13"}
+WINDOW = 5
+SHIFT_THRESHOLD = 3
+MIN_SEARCH = 2
 PRICE_DIV = 100                   # candle Close is paise -> 100. Use 1 if already rupees.
 MAX_AGE_S = 180                   # ignore a price older than this (seconds). None = no guard
-OFFSET_S = 2                      # seconds after each minute boundary (lets the candle close)
+OFFSET_S = 2
 START = dtime(9, 15)
 END = dtime(15, 30)
-RESET_STATE = False               # True = wipe today's series state on re-paste
 # ==========================================================================
 
 for _n in ("candles", "master"):
@@ -42,7 +40,7 @@ if "h_px" in globals():
         pass
 ss_stop = threading.Event()
 
-# ---- 1) series definitions from cached master (no CSV read) ----
+# ---- 1) series definitions from cached master ----
 futs = master["futs"]
 chain = master["chain"]
 futs = futs[futs["expiry"] >= today].sort_values("expiry")
@@ -57,8 +55,8 @@ else:
         if s.upper() not in all_syms:
             print(f"[series] {s}: no future or no options in master, skipped")
 
-near_fut = futs.groupby("TckrSymb")["fut_token"].first()      # nearest future per symbol
-by_sym = {s: g for s, g in chain.groupby("TckrSymb")}         # group once, not N filters
+near_fut = futs.groupby("TckrSymb")["fut_token"].first()
+by_sym = {s: g for s, g in chain.groupby("TckrSymb")}
 
 defs = {}
 for s in use_syms:
@@ -87,15 +85,8 @@ for d in defs.values():
 print(f"[series] {len(defs)} series of {len(all_syms)} symbols with future+options, "
       f"{len(needed)} tokens needed in candles")
 
-# ---- 2) live prices: token -> (price, timestamp) ----
+# ---- 2) prices: token -> (price, timestamp) ----
 px = {}
-try:
-    _snap = to_pandas(candles.last_by("token").view(["token", "Close", "Ts = epochSeconds(Minute) + 60"]))
-    for _t, _c, _ts in zip(_snap["token"], _snap["Close"], _snap["Ts"]):
-        if int(_t) in needed and _c != NULL_LONG and _c > 0:
-            px[int(_t)] = (float(_c) / PRICE_DIV, float(_ts))   # candle close time
-except Exception as e:
-    print(f"[series] could not seed prices: {e}")
 
 def on_px(update, is_replay):
     ch = update.added(["token", "Close"])
@@ -107,24 +98,19 @@ def on_px(update, is_replay):
         if tok in needed and close != NULL_LONG and close > 0:
             px[tok] = (float(close) / PRICE_DIV, now_ts)
 
-h_px = listen(candles, on_px, do_replay=False)
+# ---- 3) output tables: rebuilt on every paste (backfill refills them) ----
+straddle_writer = DynamicTableWriter({
+    "Time": dht.string, "Symbol": dht.string, "Expiry": dht.string,
+    "Point": dht.int64, "Fut": dht.double,
+    "ATMStrike": dht.double, "ATMStraddle": dht.double,
+    "MinStrike": dht.double, "V": dht.double,
+    "Cost": dht.double, "CumCost": dht.double, "D": dht.double,
+    "AltCost": dht.double, "AltCumCost": dht.double, "AltD": dht.double,
+    "Synthetic": dht.double, "Drift": dht.int64,
+})
+straddle_series = straddle_writer.table
 
-# ---- 3) output table + per-series state (kept across re-pastes) ----
-if "straddle_writer" not in globals():
-    straddle_writer = DynamicTableWriter({
-        "Time": dht.string, "Symbol": dht.string, "Expiry": dht.string,
-        "Point": dht.int64, "Fut": dht.double,
-        "ATMStrike": dht.double, "ATMStraddle": dht.double,
-        "MinStrike": dht.double, "V": dht.double,
-        "Cost": dht.double, "CumCost": dht.double, "D": dht.double,
-        "AltCost": dht.double, "AltCumCost": dht.double, "AltD": dht.double,
-        "Synthetic": dht.double, "Drift": dht.int64,
-    })
-    straddle_series = straddle_writer.table
-    straddle_latest = straddle_series.last_by(["Symbol", "Expiry"])
-
-if "ss_state" not in globals() or RESET_STATE:
-    ss_state = {}
+ss_state = {}
 
 def _fresh_state(day):
     return {"date": day, "center": None, "min": None, "alt": None,
@@ -137,7 +123,7 @@ def sample_one(key, d, st, now_str, now_ts):
         if v is None:
             return None
         if MAX_AGE_S is not None and now_ts - v[1] > MAX_AGE_S:
-            return None                              # stale -> treat as missing
+            return None
         return v[0]
 
     fut = get(d["fut"])
@@ -153,15 +139,14 @@ def sample_one(key, d, st, now_str, now_ts):
     atm = int(np.abs(strikes - fut).argmin())
     if st["center"] is None:
         st["center"] = atm
-        st["min"] = atm                              # C++: currentMinPoolIdx_ = windowCenterIdx_
+        st["min"] = atm
     drift = atm - st["center"]
     if abs(drift) > SHIFT_THRESHOLD and atm - WINDOW >= 0 and atm + WINDOW < n:
-        st["center"] = atm                           # re-centre window
+        st["center"] = atm
     lo, hi = st["center"] - WINDOW, st["center"] + WINDOW
     if lo < 0 or hi >= n:
         return False
 
-    # lowestActiveStraddle: full window scan if no previous min, else +/-MIN_SEARCH around it
     prev = st["min"]
     if prev is None:
         cand = range(lo, hi + 1)
@@ -174,12 +159,11 @@ def sample_one(key, d, st, now_str, now_ts):
             continue
         if best_v == 0 or v < best_v:
             best_v, best_i = v, i
-    st["min"] = best_i                               # None -> full scan next time (as in C++)
+    st["min"] = best_i
     if best_i is None:
         return False
     new_v = best_v
 
-    # cost: how much the straddle value jumped because the minimum strike moved
     cost = 0.0
     if prev is not None:
         pv = strad(prev)
@@ -187,7 +171,6 @@ def sample_one(key, d, st, now_str, now_ts):
             cost = abs(new_v - pv)
     st["cum"] += cost
 
-    # alt series: only counts when the minimum moves more than 1 strike from the alt reference
     alt_cost = 0.0
     if st["alt"] is None:
         st["alt"] = best_i
@@ -211,26 +194,45 @@ def sample_one(key, d, st, now_str, now_ts):
     )
     return True
 
-def sample_all():
-    now = datetime.now(IST)
-    if not (START <= now.time() <= END):
-        return
-    day = now.date()
-    now_str = now.strftime("%H:%M:%S")
-    now_ts = time.time()
+def _sample_at(dt, now_ts):
+    """run every series once for simulated or real time dt."""
+    day = dt.date()
+    now_str = dt.strftime("%H:%M:%S")
     ok = 0
     for key, d in defs.items():
         st = ss_state.get(key)
-        if st is None or st["date"] != day:          # new trading day -> fresh series
+        if st is None or st["date"] != day:
             st = ss_state[key] = _fresh_state(day)
         try:
             if sample_one(key, d, st, now_str, now_ts):
                 ok += 1
         except Exception as e:
             print(f"[series] {key} failed: {e}")
-    print(f"[series] {now_str} sampled {ok}/{len(defs)} series")
+    return ok
 
-# ---- 5) timer thread aligned to minute boundary + OFFSET_S ----
+# ---- 5) backfill from the candles table ----
+def backfill():
+    df = to_pandas(candles.view(["Ts = epochSeconds(Minute)", "token", "Close"]))
+    df = df[df["token"].isin(needed) & (df["Close"] != NULL_LONG) & (df["Close"] > 0)]
+    df = df.sort_values("Ts")
+    rows = 0
+    for ts, g in df.groupby("Ts"):
+        for t, c in zip(g["token"], g["Close"]):
+            px[int(t)] = (float(c) / PRICE_DIV, float(ts) + 60)    # candle close time
+        t_s = float(ts) + 60 + OFFSET_S                            # simulated "now"
+        dt = datetime.fromtimestamp(t_s, IST)
+        if START <= dt.time() <= END:
+            rows += _sample_at(dt, t_s)
+    print(f"[series] backfill wrote {rows} rows from candles")
+
+# ---- 6) live: timer aligned to minute boundary + OFFSET_S ----
+def sample_all():
+    now = datetime.now(IST)
+    if not (START <= now.time() <= END):
+        return
+    ok = _sample_at(now, time.time())
+    # print(f"[series] {now.strftime('%H:%M:%S')} sampled {ok}/{len(defs)} series")
+
 def _loop(stop):
     while not stop.is_set():
         now = datetime.now(IST)
@@ -239,5 +241,8 @@ def _loop(stop):
             return
         sample_all()
 
+# ---- run: history first, then live ----
+backfill()
+h_px = listen(candles, on_px, do_replay=False)
 threading.Thread(target=_loop, args=(ss_stop,), daemon=True).start()
-print("[series] running: tables `straddle_series` (history) and `straddle_latest` (latest row per series)")
+print("[series] backfilled, now live: `straddle_series` (history)")
