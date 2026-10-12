@@ -1,8 +1,35 @@
 import time
-from datetime import datetime, timezone, timedelta
+import pandas as pd
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from deephaven import DynamicTableWriter, dtypes as dht
 from deephaven.table_listener import listen
+
+# =============================== USER INPUT ===============================
+MARKET = "US"        # "NSE" or "US"
+
+CONFIGS = {
+    "NSE": dict(
+        ltt_tz="Asia/Kolkata",           # timezone the feed's ltt string is written in
+        ltt_fmt="%d-%m-%Y %H:%M",        # ltt = "dd-mm-yyyy HH:MM:SS"
+        feed="fo_market_data",           # live feed table name
+        int_prices=True,                 # True = round OHLC to int64 (as before), False = double
+    ),
+    "US": dict(
+        ltt_tz="Asia/Kolkata",           # feed stamps IST (confirmed from the row)
+        ltt_fmt="%Y-%m-%dT%H:%M",        # ltt = "yyyy-mm-ddTHH:MM:SS.mmm"
+        feed="fo_market_data",
+        int_prices=True,                 # keeping int as you said
+    ),
+}
+# ==========================================================================
+
+cfg = CONFIGS[MARKET]
+LTT_TZ = ZoneInfo(cfg["ltt_tz"])
+FMT_MIN = cfg["ltt_fmt"]
+INT_PRICES = cfg["int_prices"]
+PRICE_T = dht.int64 if INT_PRICES else dht.double
 
 # stop the previous listener if this script is re-run
 if "h_data" in globals():
@@ -11,44 +38,50 @@ if "h_data" in globals():
 if "master" not in globals():
     raise RuntimeError("'master' not found - run build_master.py first")
 
-IST = timezone(timedelta(hours=5, minutes=30))
-FMT_MIN = "%d-%m-%Y %H:%M"          # ltt is fixed width: "dd-mm-yyyy HH:MM:SS"
-
 START_MIN = int(time.time() // 60 * 60) + 60   # first full minute we build
 
 # ---- token -> symbol lookup (built once from the in-memory master) ----
-# symbol = full contract, e.g. "NIFTY 27OCT26 25000 CE" / "NIFTY 27OCT26 FUT"
 symbol_of = {}
 
+def _fexp(x):
+    return "nan" if pd.isna(x) else x.strftime("%d%b%y").upper()
+
 _ch = master["chain"]
-_exp = _ch["expiry"].dt.strftime("%d%b%y").str.upper()
-_strk = _ch["strike"].map("{:g}".format)
 for _tcol, _tp in (("ce_token", "CE"), ("pe_token", "PE")):
-    _names = (_ch["TckrSymb"] + " " + _exp + " " + _strk + " " + _tp).tolist()
-    symbol_of.update(zip(_ch[_tcol].astype("int64").tolist(), _names))
+    for _t, _s, _e, _k in zip(_ch[_tcol].astype("int64").tolist(),
+                              _ch["TckrSymb"].tolist(),
+                              _ch["expiry"].tolist(),
+                              _ch["strike"].tolist()):
+        symbol_of[_t] = f"{_s} {_fexp(_e)} {_k:g} {_tp}"
 
 _fu = master["futs"]
-_names = (_fu["TckrSymb"] + " " + _fu["expiry"].dt.strftime("%d%b%y").str.upper() + " FUT").tolist()
-symbol_of.update(zip(_fu["fut_token"].astype("int64").tolist(), _names))
-del _ch, _fu, _exp, _strk, _names
+for _t, _s, _e in zip(_fu["fut_token"].astype("int64").tolist(),
+                      _fu["TckrSymb"].tolist(),
+                      _fu["expiry"].tolist()):
+    symbol_of[_t] = f"{_s} {_fexp(_e)} FUT"
+del _ch, _fu
 
-minute_cache = {}   # "dd-mm-yyyy HH:MM" -> epoch seconds of that minute (one entry per minute)
+# equities (only present if master was built by the newer build_master.py)
+for _r in master.get("eqs", pd.DataFrame(columns=["eq_token", "TckrSymb"])).itertuples(index=False):
+    symbol_of[int(_r.eq_token)] = _r.TckrSymb
+
+minute_cache = {}   # "<date> HH:MM" -> epoch seconds of that minute (one entry per minute)
 
 def parse_ltt(s):
     # strptime runs once per minute; every other tick is a slice + dict lookup + int()
     s = s.strip()
-    if len(s) != 19:                 # not "dd-mm-yyyy HH:MM:SS"
+    if len(s) < 5 or s[-3] != ":":   # must end with ":SS"
         return None
-    key = s[:16]
+    key = s[:-3]
     base = minute_cache.get(key)
     if base is None:
         try:
-            base = int(datetime.strptime(key, FMT_MIN).replace(tzinfo=IST).timestamp())
+            base = int(datetime.strptime(key, FMT_MIN).replace(tzinfo=LTT_TZ).timestamp())
         except Exception:
             return None
         minute_cache[key] = base
     try:
-        return base + int(s[17:19])
+        return base + int(s[-2:])
     except Exception:
         return None
 
@@ -57,10 +90,10 @@ cw = DynamicTableWriter({
     "MinuteEpoch": dht.int64,
     "Symbol": dht.string,
     "token": dht.int64,
-    "Open": dht.int64,
-    "High": dht.int64,
-    "Low": dht.int64,
-    "Close": dht.int64,
+    "Open": PRICE_T,
+    "High": PRICE_T,
+    "Low": PRICE_T,
+    "Close": PRICE_T,
     "Volume": dht.int64,
 })
 candles = cw.table.view([
@@ -73,11 +106,14 @@ cur = {}         # token -> [minute, o, h, l, c, cum_vol, first_vol]
 prev_cum = {}    # token -> cumulative vol at end of last closed candle
 last_seen = {}   # token -> (ltt string, cumulative vol) of last trade seen
 
+def _px(v):
+    return round(v) if INT_PRICES else float(v)
+
 def _close(tok, c):
     minute, o, h, l, cl, cum, first_vol = c
     base = prev_cum.get(tok, first_vol)
     cw.write_row(minute, symbol_of.get(tok), tok,
-                 round(o), round(h), round(l), round(cl),
+                 _px(o), _px(h), _px(l), _px(cl),
                  max(cum - base, 0))
     prev_cum[tok] = cum
 
@@ -127,4 +163,6 @@ def on_update(update, is_replay):
     if latest:
         flush(int((latest - 10) // 60 * 60))     # close finished minutes, 10s grace
 
-h_data = listen(fo_market_data, on_update, do_replay=True)
+h_data = listen(globals()[cfg["feed"]], on_update, do_replay=True)
+print(f"[candles] market={MARKET} ltt_tz={cfg['ltt_tz']} fmt={FMT_MIN} feed={cfg['feed']} "
+      f"tokens mapped={len(symbol_of)}")

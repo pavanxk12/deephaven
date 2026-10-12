@@ -10,9 +10,9 @@ from deephaven import agg
 TIMEFRAME_MIN = 5     # 1 = use candles as-is, 5 = 5-minute bars, 15 = 15-minute bars, ...
 
 INDICATORS = [
-    ("RSI", 9),      # -> RSI_14  (Wilder smoothing, int64 = RSI x 100), 14 bars of TIMEFRAME_MIN
-    ("EMA", 9),       # -> EMA_9   (int64, paise like Close)
-    ("EMA", 18),      # -> EMA_18
+    ("RSI", 9),       # -> RSI_9   (Wilder smoothing, int64 = RSI x 100), 9 bars of TIMEFRAME_MIN
+    ("EMA", 9),       # -> EMA_9   (int64, paise like Close; dynamic length min(bars, 9))
+    ("EMA", 18),      # -> EMA_18  (int64, paise like Close; dynamic length min(bars, 18))
 ]
 # ==========================================================================
 
@@ -39,8 +39,8 @@ def _build(src, mins, specs):
 
     need_rsi = any(k == "RSI" for k, _ in specs)
 
-    # ---- 2) bar count per token (+ price change for RSI) in one update_by ----
-    first_ops = [uby.cum_sum(["Cnt = One"])]
+    # ---- 2) bar count + running price sum per token (+ price change for RSI) ----
+    first_ops = [uby.cum_sum(["Cnt = One", "PxSum = Px"])]
     if need_rsi:
         first_ops.append(uby.delta(["D = Px"]))
     t = t.update_by(first_ops, by="token")
@@ -69,7 +69,8 @@ def _build(src, mins, specs):
     finals = ["Pct = (isNull(DayOpen) || DayOpen == 0) ? NULL_LONG : Math.round(10000.0 * (Px - DayOpen) / DayOpen)"]
     for kind, n in specs:
         if kind == "EMA":
-            finals.append(f"EMA_{n} = Cnt < {n} ? NULL_LONG : Math.round(EMA_{n}_raw)")
+            # dynamic length: running average of bars seen while Cnt < n, then true EMA
+            finals.append(f"EMA_{n} = Cnt < {n} ? Math.round(PxSum / Cnt) : Math.round(EMA_{n}_raw)")
         else:
             finals.append(f"RSI_{n} = Cnt <= {n} ? NULL_LONG : Math.round(100.0 * "
                           f"(AvgL_{n} == 0 ? (AvgG_{n} > 0 ? 100.0 : 50.0) : 100.0 - 100.0 / (1.0 + AvgG_{n} / AvgL_{n})))")
