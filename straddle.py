@@ -30,12 +30,11 @@ for _n in ("candles", "master"):
 IST = timezone(timedelta(hours=5, minutes=30))
 today = pd.Timestamp(datetime.now(IST).date())
 
-# ---- stop previous run on re-paste ----
 if "ss_stop" in globals():
     ss_stop.set()
-if "h_px" in globals():
+if "h_ss_px" in globals():
     try:
-        h_px.stop()
+        h_ss_px.stop()
     except Exception:
         pass
 ss_stop = threading.Event()
@@ -101,12 +100,12 @@ def on_px(update, is_replay):
 # ---- 3) output tables: rebuilt on every paste (backfill refills them) ----
 straddle_writer = DynamicTableWriter({
     "Time": dht.string, "Symbol": dht.string, "Expiry": dht.string,
-    "Point": dht.int64, "Fut": dht.double,
+    "Fut": dht.double,
     "ATMStrike": dht.double, "ATMStraddle": dht.double,
     "MinStrike": dht.double, "V": dht.double,
     "Cost": dht.double, "CumCost": dht.double, "D": dht.double,
     "AltCost": dht.double, "AltCumCost": dht.double, "AltD": dht.double,
-    "Synthetic": dht.double, "Drift": dht.int64,
+    "Synthetic": dht.double,
 })
 straddle_series = straddle_writer.table
 
@@ -185,12 +184,12 @@ def sample_one(key, d, st, now_str, now_ts):
     synth = ce - pe + float(strikes[best_i])
     st["n"] += 1
     straddle_writer.write_row(
-        now_str, key[0], key[1], st["n"] - 1, float(fut),
+        now_str, key[0], key[1], float(fut),
         float(strikes[atm]), float(strad(atm)),
         float(strikes[best_i]), float(new_v),
         float(cost), float(st["cum"]), float(new_v + st["cum"]),
         float(alt_cost), float(st["altcum"]), float(new_v + st["altcum"]),
-        float(synth), int(drift),
+        float(synth),
     )
     return True
 
@@ -239,10 +238,13 @@ def _loop(stop):
         nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=1, seconds=OFFSET_S)
         if stop.wait(max(0.5, (nxt - now).total_seconds())):
             return
-        sample_all()
+        try:
+            sample_all()
+        except Exception as e:
+            print(f"[series] loop error: {e!r}")
 
 # ---- run: history first, then live ----
+h_ss_px = listen(candles, on_px, do_replay=False)
 backfill()
-h_px = listen(candles, on_px, do_replay=False)
 threading.Thread(target=_loop, args=(ss_stop,), daemon=True).start()
 print("[series] backfilled, now live: `straddle_series` (history)")

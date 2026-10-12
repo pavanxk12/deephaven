@@ -65,5 +65,5 @@ if AUTO_AT is not None:
     print(f"[eod] will auto-save at {AUTO_AT} IST. Manual: save_eod()")
 
 # host command (not part of the script), copies both files out of the container:
-# docker cp <container_name>:/data/fo_market_data/straddle_2026-10-09.pq /home/pavan/Documents/dev-setup/deephaven/fo_market_data/
-# docker cp <container_name>:/data/fo_market_data/candles_2026-10-09.pq /home/pavan/Documents/dev-setup/deephaven/fo_market_data/
+# docker cp <algofusion-deephaven>:/data/fo_market_data/straddle_2026-10-09.pq /home/pavan/Documents/dev-setup/deephaven/fo_market_data/
+# docker cp <algofusion-deephaven>:/data/fo_market_data/candles_2026-10-09.pq /home/pavan/Documents/dev-setup/deephaven/fo_market_data/
