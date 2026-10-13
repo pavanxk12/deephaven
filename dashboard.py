@@ -1,291 +1,571 @@
-from datetime import datetime
-from deephaven import ui
+import threading
 
-# ---------- light palette ----------
-INK, MUTED, GREY, LINE = "#1f2328", "#57606a", "#6e7781", "#e3e7ec"
-GREEN, RED, AMBER, BLUE, PURPLE = "#1a7f37", "#cf222e", "#b45309", "#1f5fbf", "#8250df"
-WHITE, SOFT = "#ffffff", "#f6f8fa"
-LOT = 50
+from deephaven import ui, agg
 
+# ===========================================================================
+# OPERATOR CONSOLE: summary + message window + order book + net positions, ONE script, ONE dashboard.
+#
+# Needs in your session before running:
+#   master          from build_master.py        (master["symbol_of"]: token -> symbol)
+#   strategy_events KafkaPartition, KafkaOffset, KafkaTimestamp, PF, Payload
+#   orders_trade    fills                       (token, buy_sell, fill_quantity, fill_price, response_order_number)
+#   orders_ack      order confirmations         (order_number, token_no, tcode 20073/20074/20075, volume, price, buy_sell)
+#   fo_market_data  live prices, one row per token (token, ltp)
+#                   if it holds repeated ticks per token, change it to fo_market_data.last_by("token") below
+#   automation.py   (same session) for the Controls panel and the per-position controls
+# ===========================================================================
 
-def now():
-    return datetime.now().strftime("%H:%M:%S")
+# ---------- settings ----------
+SYMBOL_OF = master["symbol_of"]
+PRICE_DIV = 100.0                      # NSE prices arrive in paise
 
+C_SEQ, C_TS, C_PF, C_TEXT = "KafkaOffset", "KafkaTimestamp", "PF", "Payload"   # strategy_events columns
 
-def money(v):
-    return f"+₹{v:,.0f}" if v > 0 else (f"-₹{abs(v):,.0f}" if v < 0 else "₹0")
-
-
-# ---------- small building blocks (explicit colors, so theme can't override) ----------
-def t(text, color=INK, bold=False, mono=False, size=None):
-    style = {"color": color, "fontWeight": "bold" if bold else "normal"}
-    if mono:
-        style["fontFamily"] = "monospace"
-    if size:
-        style["fontSize"] = size
-    return ui.html.span(str(text), style=style)
-
-
-def h(text, size="14px"):
-    return ui.html.div(text, style={"color": INK, "fontWeight": "bold", "fontSize": size})
+GREEN, RED, BLUE, ORANGE, AMBER, PURPLE, GREY, INK = (
+    "#1a7f37", "#cf222e", "#1f5fbf", "#c2410c", "#b45309", "#8250df", "#6e7781", "#1f2328")
 
 
-def btn(label, color, on_press=None, outline=False):
-    return ui.button(
-        label, on_press=on_press,
-        UNSAFE_style={"background": WHITE if outline else color,
-                      "color": color if outline else WHITE,
-                      "border": f"1px solid {color}", "fontWeight": "bold"})
+def symbol_of(token: int) -> str:
+    return SYMBOL_OF.get(int(token), str(token))
 
 
-def tbtn(label, color, bg, border, on_press):
-    return ui.button(label, on_press=on_press, UNSAFE_style={
-        "background": bg, "color": color, "border": f"1px solid {border}", "fontWeight": "bold"})
+# ===========================================================================
+# TABLES (each is one lazy chain; per-row columns use update_view so nothing per-row is stored)
+# ===========================================================================
+
+# ---- messages: LOGMSG rows of strategy_events, classified ----
+messages = (
+    strategy_events
+    .view([f"Seq = {C_SEQ}", f"Ts = {C_TS}", f"Pf = {C_PF}", f"Raw = {C_TEXT}"])
+    .where("Raw.contains(`MSGTYPE=LOGMSG`)")
+    .update_view([
+        "Time = formatDateTime(Ts, timeZone(`Asia/Kolkata`)).substring(11, 23)",
+        "Type = (Raw.contains(`CAT=ERR`) || Raw.contains(`CAT=ALERT`) || Raw.contains(`REJECT`) || Raw.contains(`Reject`)"
+        " || Raw.contains(`ERROR`) || Raw.contains(`Error`) || Raw.contains(`FAILED`) || Raw.contains(`Failed`)) ? `ERROR`"
+        " : Raw.contains(`CAT=EVNT`) ? `EVENT`"
+        " : Raw.contains(`FILLED`) ? `TRADE`"
+        " : Raw.contains(`CAT=TRD`) ? `ORDER`"
+        " : `INFO`",
+        "Msg = Raw.contains(`MSG=`)"
+        " ? Raw.substring(Raw.indexOf(`MSG=`) + 4, Raw.contains(`,COLOR=`) ? Raw.lastIndexOf(`,COLOR=`) : Raw.length())"
+        " : Raw.substring(Raw.lastIndexOf(`LOGMSG,`) + 7)",
+    ])
+    .view(["Seq", "Time", "Type", "Pf", "Msg"])
+)
+
+# ---- net positions: one row per traded token, live LTP joined straight from fo_market_data ----
+net_positions_table = (
+    orders_trade
+    .where("fill_quantity > 0")
+    .update_view([
+        "BuyQty = buy_sell == 1 ? fill_quantity : 0L",
+        "SellQty = buy_sell == 2 ? fill_quantity : 0L",
+        "BuyVal = buy_sell == 1 ? fill_quantity * fill_price / PRICE_DIV : 0.0",
+        "SellVal = buy_sell == 2 ? fill_quantity * fill_price / PRICE_DIV : 0.0",
+    ])
+    .agg_by([agg.sum_(["BuyQty", "SellQty", "BuyVal", "SellVal"]), agg.count_("Fills")], by=["token"])
+    .natural_join(fo_market_data, on="token", joins="LtpRaw = ltp")
+    .update([
+        "Symbol = symbol_of(token)",
+        "Ltp = LtpRaw / PRICE_DIV",
+        "BuyAvg = BuyQty > 0 ? BuyVal / BuyQty : 0.0",
+        "SellAvg = SellQty > 0 ? SellVal / SellQty : 0.0",
+        "NetQty = BuyQty - SellQty",
+        "Realised = Math.min(BuyQty, SellQty) * (SellAvg - BuyAvg)",
+        "M2M = isNull(LtpRaw) ? NULL_DOUBLE : SellVal - BuyVal + NetQty * Ltp",
+        # instrument kind from the symbol text: ...CE / ...PE = option, contains FUT = future, else equity
+        "Kind = (Symbol.endsWith(`CE`) || Symbol.endsWith(`PE`)) ? `OPT` : Symbol.contains(`FUT`) ? `FUT` : `EQ`",
+    ])
+    .view(["token", "Symbol", "BuyQty", "BuyAvg", "BuyVal", "SellQty", "SellAvg", "SellVal", "NetQty", "Ltp", "Realised", "M2M", "Fills", "Kind"])
+    .sort("Symbol")
+)
+
+# ---- order book: latest ack per order, not cancelled, still has quantity left after fills ----
+order_book_table = (
+    orders_ack
+    .view(["OrderId = (long) order_number", "PF", "tcode", "token_no", "buy_sell", "volume", "price", "last_modified"])
+    .last_by("OrderId")
+    .natural_join(
+        orders_trade.agg_by([agg.sum_("FilledQty = fill_quantity")], by="response_order_number")
+        .view(["OrderId = (long) response_order_number", "FilledQty"]),
+        on="OrderId", joins="FilledQty")
+    .update_view("Rem = volume - (isNull(FilledQty) ? 0L : FilledQty)")
+    .where("tcode != 20075 && Rem > 0")
+    .update([
+        "Symbol = symbol_of(token_no)",
+        "Side = buy_sell == 1 ? `BUY` : `SELL`",
+        "Px = price / PRICE_DIV",
+        "Status = Rem < volume ? `PART` : `OPEN`",
+        "Time = formatDateTime(epochSecondsToInstant(last_modified), timeZone(`Asia/Kolkata`)).substring(11, 19)",
+    ])
+    .view(["last_modified", "Time", "OrderId", "PF", "Side", "Symbol", "volume", "Rem", "Px", "Status"])
+    .sort("last_modified")
+)
 
 
-def cell(text, basis, color=INK, bold=False, align="left"):
-    return ui.html.div(str(text), style={
-        "flex": f"0 0 {basis}px", "width": f"{basis}px", "color": color, "textAlign": align,
-        "fontFamily": "monospace", "fontSize": "12px", "fontWeight": "bold" if bold else "normal"})
+
+# ===========================================================================
+# FORMATS
+# ===========================================================================
+TYPE_COLOR = {"TRADE": GREEN, "ORDER": BLUE, "EVENT": PURPLE, "ERROR": RED, "INFO": GREY}
+TYPE_TINT = {"TRADE": "#e6f4ea", "ORDER": "#eaf1fc", "EVENT": "#f1ebfb", "ERROR": "#fde8e8", "INFO": "#ffffff"}
+
+MSG_FORMATS = (
+    [ui.TableFormat(if_=f"Type == `{k}`", background_color=TYPE_TINT[k], color=INK) for k in TYPE_COLOR]
+    + [ui.TableFormat(cols="Type", if_=f"Type == `{k}`", background_color=TYPE_COLOR[k], color="#ffffff") for k in TYPE_COLOR]
+    + [
+        ui.TableFormat(cols="Msg", if_="Msg.contains(`BUY`) || Msg.contains(`BOUGHT`)", color=BLUE),
+        ui.TableFormat(cols="Msg", if_="Msg.contains(`SELL`) || Msg.contains(`SOLD`)", color=ORANGE),
+        ui.TableFormat(cols="Msg", if_="Type == `ERROR`", color=RED),          # last, so it wins
+    ]
+)
+
+ORD_FORMATS = [
+    ui.TableFormat(cols=["volume", "Rem"], value="#,##0"),
+    ui.TableFormat(cols="Px", value="#,##0.00"),
+    ui.TableFormat(cols=["Side", "Symbol"], if_="Side == `BUY`", color=BLUE),
+    ui.TableFormat(cols=["Side", "Symbol"], if_="Side == `SELL`", color=ORANGE),
+    ui.TableFormat(cols="Status", if_="Status == `OPEN`", color=GREEN),
+    ui.TableFormat(cols="Status", if_="Status == `PART`", color=AMBER),
+]
 
 
-def stat(label, value, color=INK):
-    return ui.flex(t(label, MUTED), t(value, color, True, True),
-                   justify_content="space-between", width="100%")
-
-
-def box(*children, **kw):
-    return ui.view(*children, UNSAFE_style={"background": WHITE, "padding": "12px",
-                                            "height": "100%", "overflow": "auto", **kw})
-
-
-def th(text, w, bg=SOFT, color=MUTED, align="right"):
-    return ui.html.div(text, style={
-        "flex": f"0 0 {w}px", "width": f"{w}px", "background": bg, "color": color,
-        "fontWeight": "bold", "fontSize": "11px", "textAlign": align, "padding": "5px 8px",
-        "boxSizing": "border-box", "borderRight": f"1px solid {LINE}", "borderBottom": f"1px solid {LINE}"})
-
-
-def td(text, w, color=INK, bold=False, align="right", bg=WHITE):
-    return ui.html.div(str(text), style={
-        "flex": f"0 0 {w}px", "width": f"{w}px", "color": color, "background": bg,
-        "textAlign": align, "fontFamily": "monospace", "fontSize": "12px",
-        "fontWeight": "bold" if bold else "normal", "padding": "7px 8px", "boxSizing": "border-box",
-        "borderRight": f"1px solid {LINE}", "borderBottom": f"1px solid {LINE}"})
-
-
-TYPE_COLORS = {"TRADE": GREEN, "NEW": BLUE, "MODIFY": PURPLE, "CANCEL": GREY, "EVENT": PURPLE, "ALERT": RED}
-CHIPS = [("Trades", "TRADE", GREEN), ("Orders", "NEW", BLUE), ("Cancels", "CANCEL", GREY),
-         ("Events", "EVENT", PURPLE), ("Alerts", "ALERT", RED)]
+# ===========================================================================
+# WINDOWS
+# ===========================================================================
+def tile(label, text, color):
+    # the grid cannot change font size, so the summary is drawn as tiles: small label, big number
+    return ui.html.div(
+        ui.html.div(label, style={"fontSize": "13px", "fontWeight": "600", "color": GREY, "letterSpacing": "0.5px"}),
+        ui.html.div(text, style={"fontSize": "40px", "fontWeight": "700", "color": color, "lineHeight": "1.15"}),
+        style={"flex": "1", "minWidth": "170px", "padding": "8px 16px", "borderRight": "1px solid #d0d7de"},
+    )
 
 
 @ui.component
-def operator_console():
-    ats, set_ats = ui.use_state(True)
-    orders, set_orders = ui.use_state([
-        {"id": 48675, "side": "BUY", "inst": "RELIANCE 27 OCT FUT", "qty": 500, "px": 1346.30, "st": "OPEN"},
-        {"id": 48673, "side": "BUY", "inst": "NIFTY 27 OCT 25800 PE", "qty": 975, "px": 158.65, "st": "OPEN"},
-        {"id": 48672, "side": "BUY", "inst": "NIFTY 27 OCT 26200 CE", "qty": 975, "px": 164.25, "st": "OPEN"},
-        {"id": 48668, "side": "BUY", "inst": "ICICIBANK 27 OCT 1400 CE", "qty": 700, "px": 32.85, "st": "OPEN"},
-        {"id": 48659, "side": "SELL", "inst": "RELIANCE", "qty": 250, "px": 1344.05, "st": "PART"},
-    ])
-    positions, set_positions = ui.use_state([
-        {"inst": "NIFTY 27 OCT 26200 CE", "bq": 46800, "ba": 162.43, "bv": "76.02 L", "sq": 45825, "sa": 162.85, "sv": "74.62 L", "net": 975, "ltp": 163.30, "m2m": 19685},
-        {"inst": "NIFTY 27 OCT 25800 PE", "bq": 44850, "ba": 159.57, "bv": "71.57 L", "sq": 45825, "sa": 160.03, "sv": "73.33 L", "net": -975, "ltp": 160.65, "m2m": 19822},
-        {"inst": "HDFCBANK 27 OCT FUT", "bq": 68200, "ba": 1022.29, "bv": "6.97 Cr", "sq": 73150, "sa": 1022.52, "sv": "7.48 Cr", "net": -4950, "ltp": 1023.75, "m2m": 9708},
-        {"inst": "HDFCBANK", "bq": 67100, "ba": 1019.13, "bv": "6.84 Cr", "sq": 61600, "sa": 1019.37, "sv": "6.28 Cr", "net": 5500, "ltp": 1020.20, "m2m": 20680},
-        {"inst": "RELIANCE 27 OCT FUT", "bq": 27000, "ba": 1346.66, "bv": "3.64 Cr", "sq": 28500, "sa": 1346.86, "sv": "3.84 Cr", "net": -1500, "ltp": 1347.40, "m2m": 4520},
-        {"inst": "RELIANCE", "bq": 29000, "ba": 1344.03, "bv": "3.90 Cr", "sq": 27500, "sa": 1344.17, "sv": "3.70 Cr", "net": 1500, "ltp": 1345.20, "m2m": 5388},
-        {"inst": "ICICIBANK 27 OCT 1400 CE", "bq": 30800, "ba": 32.77, "bv": "10.09 L", "sq": 31500, "sa": 33.00, "sv": "10.40 L", "net": -700, "ltp": 34.65, "m2m": 6034},
-        {"inst": "SBIN 27 OCT FUT", "bq": 35250, "ba": 862.20, "bv": "3.04 Cr", "sq": 34500, "sa": 862.22, "sv": "2.97 Cr", "net": 750, "ltp": 862.85, "m2m": 1268},
-    ])
-    log, set_log = ui.use_state([
-        {"t": "17:42:26", "type": "TRADE", "msg": "SOLD 1,100 HDFCBANK @ 1,020.05"},
-        {"t": "17:42:25", "type": "TRADE", "msg": "BOUGHT 750 SBIN 27 OCT FUT @ 862.55"},
-        {"t": "17:42:23", "type": "MODIFY", "msg": "BUY NIFTY 27 OCT 25800 PE 158.85 → 158.65"},
-        {"t": "17:42:22", "type": "NEW", "msg": "BUY 500 RELIANCE 27 OCT FUT limit 1,346.30"},
-    ])
-    kinds, set_kinds = ui.use_state(["TRADE", "NEW", "MODIFY", "CANCEL", "EVENT", "ALERT"])
-    query, set_query = ui.use_state("")
-    paused, set_paused = ui.use_state(False)
-    frozen, set_frozen = ui.use_state([])
+def summary_window():
+    # built here so nothing outside this panel needs to change
+    totals = ui.use_memo(
+        lambda: net_positions_table.agg_by(
+            [agg.sum_(["BuyVal", "SellVal", "Realised", "M2M", "Fills"])]
+        ).view([
+            "Turnover = (BuyVal + SellVal) / 1.0E7",
+            "Fills",
+            "GrossM2M = M2M",
+            "RealisedPnl = Realised",
+            "Unrealised = M2M - Realised",
+        ]),
+        [],
+    )
+    open_cnt = ui.use_memo(lambda: order_book_table.count_by("OpenOrders"), [])
+
+    row = ui.use_row_data(totals)
+    orow = ui.use_row_data(open_cnt)
+    v = row if isinstance(row, dict) else {}
+    o = orow if isinstance(orow, dict) else {}
+
+    def val(d, key):
+        x = d.get(key)
+        if x is None or (isinstance(x, float) and x != x):   # None or NaN = missing
+            return None
+        return x
+
+    def num(d, key, fmt, default="-"):
+        x = val(d, key)
+        return default if x is None else format(x, fmt)
+
+    def pnl_color(key):
+        x = val(v, key)
+        return GREEN if x is None or x >= 0 else RED
+
+    return ui.panel(
+        ui.flex(
+            tile("TURNOVER (₹ CR)", num(v, "Turnover", ",.2f", "0.00"), ORANGE),
+            tile("FILLS TODAY", num(v, "Fills", ",.0f", "0"), "#000000"),
+            tile("OPEN ORDERS", num(o, "OpenOrders", ",.0f", "0"), "#000000"),
+            tile("GROSS M2M (₹)", num(v, "GrossM2M", "+,.0f"), pnl_color("GrossM2M")),
+            tile("REALISED (₹)", num(v, "RealisedPnl", "+,.0f", "0"), pnl_color("RealisedPnl")),
+            tile("UNREALISED (₹)", num(v, "Unrealised", "+,.0f"), pnl_color("Unrealised")),
+            wrap=True, align_items="center", height="100%",
+        ),
+        title="Summary",
+    )
+
+@ui.component
+def message_window():
+    kind, set_kind = ui.use_state("ALL")            # one of: ALL, TRADE, ORDER, EVENT, ERROR, INFO
+
+    # "" = show all, otherwise the single selected type
+    type_filter = "" if kind == "ALL" else kind
+
+    def kind_button(label, value):
+        return ui.toggle_button(label, is_selected=kind == value, on_change=lambda _: set_kind(value))
+
+    chips = ui.flex(
+        kind_button("All", "ALL"),
+        kind_button("Trades", "TRADE"),
+        kind_button("Orders", "ORDER"),
+        kind_button("Events", "EVENT"),
+        kind_button("Errors", "ERROR"),
+        kind_button("Info", "INFO"),
+        gap="size-100", wrap=True,
+    )
+
+    return ui.panel(
+        ui.flex(
+            chips,
+            ui.table(
+                messages,
+                key=type_filter,                    # new key = the grid re-applies the filter right away
+                reverse=True,                       # newest on top, done in the browser
+                density="spacious",
+                show_search=True,
+                quick_filters={"Type": type_filter},
+                format_=MSG_FORMATS,
+                hidden_columns=["Seq"],
+                always_fetch_columns=["Type"],
+                column_display_names={"Time": "TIME IST", "Pf": "PF", "Msg": "MESSAGE"},
+                frozen_columns=["Time", "Type"],
+            ),
+            direction="column", gap="size-100", height="100%",
+        ),
+        title="Message window",
+    )
+
+@ui.component
+def order_book():
+    return ui.panel(
+        ui.table(
+            order_book_table,
+            reverse=True,
+            density="spacious",
+            show_search=True,
+            format_=ORD_FORMATS,
+            hidden_columns=["last_modified"],
+            column_display_names={"Time": "TIME IST", "OrderId": "ORDER", "volume": "QTY", "Rem": "REMAINING", "Px": "PRICE"},
+            frozen_columns=["Time"],
+        ),
+        title="Order book",
+    )
+
+
+@ui.component
+def net_positions():
     hide_flat, set_hide_flat = ui.use_state(False)
+    kind, set_kind = ui.use_state("ALL")            # one of: ALL, FUT, OPT, EQ
 
-    def add_log(kind, msg):
-        set_log(lambda old: [{"t": now(), "type": kind, "msg": msg}] + old)
+    def build():
+        conds = []
+        if hide_flat:
+            conds.append("NetQty != 0")
+        if kind != "ALL":
+            conds.append(f"Kind == `{kind}`")
+        return net_positions_table.where(conds) if conds else net_positions_table
 
-    # ---------- handlers ----------
-    def handle_ats(on):
-        set_ats(on)
-        add_log("EVENT", "ATS switched ON" if on else "ATS switched OFF")
+    shown = ui.use_memo(build, [hide_flat, kind])
 
-    def handle_cancel_bids():
-        n = sum(1 for o in orders if o["side"] == "BUY")
-        set_orders([o for o in orders if o["side"] != "BUY"])
-        add_log("CANCEL", f"Cancelled {n} bid orders")
+    def kind_button(label, value):
+        return ui.toggle_button(label, is_selected=kind == value, on_change=lambda _: set_kind(value))
 
-    def handle_square_off():
-        n = sum(1 for p in positions if p["net"] != 0)
-        set_positions([{**p, "net": 0} for p in positions])
-        set_orders([])
-        add_log("ALERT", f"Squared off {n} positions")
-
-    def handle_cancel(order_id):
-        set_orders([o for o in orders if o["id"] != order_id])
-        add_log("CANCEL", f"Cancelled #{order_id}")
-
-    def handle_trade(inst, side):
-        def upd(p):
-            if p["inst"] != inst:
-                return p
-            if side == "BUY":
-                return {**p, "bq": p["bq"] + LOT, "net": p["net"] + LOT}
-            return {**p, "sq": p["sq"] + LOT, "net": p["net"] - LOT}
-        set_positions([upd(p) for p in positions])
-        add_log("TRADE", f"{'BOUGHT' if side == 'BUY' else 'SOLD'} {LOT} {inst}")
-
-    def handle_pause(is_paused):
-        set_paused(is_paused)
-        if is_paused:
-            set_frozen(log)
-
-    def handle_chip(kind):
-        set_kinds(lambda ks: [k for k in ks if k != kind] if kind in ks else ks + [kind])
-
-    # ---------- derived values ----------
-    total_m2m = sum(p["m2m"] for p in positions)
-    expenses = 83372
-    net_m2m = total_m2m - expenses
-    open_count = len(orders)
-    bid_count = sum(1 for o in orders if o["side"] == "BUY")
-    flat_count = sum(1 for p in positions if p["net"] == 0)
-    shown_log = frozen if paused else log
-    shown_log = [m for m in shown_log if m["type"] in kinds and query.lower() in m["msg"].lower()]
-    shown_pos = [p for p in positions if not (hide_flat and p["net"] == 0)]
-
-    # ---------- Controls ----------
-    controls = ui.panel(box(
-        h("ATS · Auto trading"),
-        ui.flex(btn("ON", GREEN, lambda: handle_ats(True), outline=not ats),
-                btn("OFF", RED, lambda: handle_ats(False), outline=ats), gap="size-100"),
-        t("Running since 09:15:00 IST" if ats else "Stopped", GREEN if ats else RED, True),
-        ui.flex(btn(f"Cancel all bids · {bid_count}", AMBER, handle_cancel_bids, outline=True),
-                btn(f"Square off all · {len(positions) - flat_count}", RED, handle_square_off),
-                gap="size-100", wrap=True),
-        UNSAFE_style={"display": "flex", "flexDirection": "column", "gap": "10px"},
-    ), title="Controls")
-
-    # ---------- Summary ----------
-    fills = 1606 + len([m for m in log if m["type"] == "TRADE"]) - 2
-    summary = ui.panel(box(ui.flex(
-        ui.flex(h("Trading activity"), stat("Turnover", "₹40.55 Cr"), stat("Fills today", f"{fills:,}"),
-                stat("Open orders", str(open_count)), direction="column", flex_grow=1, gap="size-100"),
-        ui.flex(h("Mark-to-market"), stat("Gross M2M", money(total_m2m), GREEN if total_m2m >= 0 else RED),
-                stat("Realised", "+₹82,108", GREEN), stat("Unrealised", money(total_m2m - 82108), GREEN),
-                direction="column", flex_grow=1, gap="size-100"),
-        ui.flex(h("Net result"), stat("Net M2M", money(net_m2m), GREEN if net_m2m >= 0 else RED),
-                stat("Expenses", f"₹{expenses:,}", RED), stat("Peak net today", "+₹50,855", GREEN),
-                direction="column", flex_grow=1, gap="size-100"),
-        gap="size-300")), title="Summary")
-
-    # ---------- Message window ----------
-    chips = ui.flex(*[btn(f"{label} {sum(1 for m in log if m['type'] == k)}", c, (lambda k=k: handle_chip(k)),
-                          outline=(k not in kinds)) for label, k, c in CHIPS], gap="size-100", wrap=True)
-
-    message_window = ui.panel(box(
-        ui.flex(ui.text_field(label="Filter", value=query, on_change=set_query, width="size-2400"),
-                ui.toggle_button("Pause", is_selected=paused, on_change=handle_pause),
-                align_items="end", gap="size-100"),
-        chips,
-        *[ui.flex(cell(m["t"], 70, GREY), cell(m["type"], 60, TYPE_COLORS[m["type"]], True), cell(m["msg"], 360),
-                  UNSAFE_style={"borderBottom": f"1px solid {LINE}", "padding": "4px 0"}) for m in shown_log[:60]],
-        UNSAFE_style={"display": "flex", "flexDirection": "column", "gap": "8px"},
-    ), title="Message window")
-
-    # ---------- Order book ----------
-    order_book = ui.panel(box(
-        t(f"{open_count} open · {bid_count} buy · {open_count - bid_count} sell", MUTED),
-        *[ui.flex(cell(o["side"], 50, GREEN if o["side"] == "BUY" else RED, True), cell(o["inst"], 210),
-                  cell(f"{o['qty']:,}", 70, align="right"), cell(f"{o['px']:,.2f}", 90, bold=True, align="right"),
-                  cell(o["st"], 60, AMBER if o["st"] == "PART" else GREEN, True),
-                  btn("×", GREY, (lambda i=o["id"]: handle_cancel(i)), outline=True),
-                  align_items="center", gap="size-100",
-                  UNSAFE_style={"borderBottom": f"1px solid {LINE}", "padding": "4px 0"}) for o in orders],
-        UNSAFE_style={"display": "flex", "flexDirection": "column", "gap": "6px"},
-    ), title="Order book")
-
-    # ---------- Net positions table ----------
-    BUY_H, SELL_H, NET_H = "#e8f0fe", "#fdeee4", "#eef1f4"
-    BUY_C, SELL_C, NET_C = "#1f5fbf", "#b45309", "#3b434d"
-    BUY_B, SELL_B = "#f7faff", "#fffaf6"
-    W = dict(n=30, inst=190, q=72, a=80, v=80, ltp=80, m2m=90, trade=120)
-    TICK = {"HDFCBANK 27 OCT FUT": 1, "HDFCBANK": 1,                      # sample LTP flashes
-            "RELIANCE 27 OCT FUT": -1, "RELIANCE": -1, "ICICIBANK 27 OCT 1400 CE": -1}
-
-    group_hdr = ui.flex(
-        th("", W["n"] + W["inst"]),
-        th("BUY", W["q"] + W["a"] + W["v"], BUY_H, BUY_C, "center"),
-        th("SELL", W["q"] + W["a"] + W["v"], SELL_H, SELL_C, "center"),
-        th("NET", W["q"] + W["ltp"] + W["m2m"], NET_H, NET_C, "center"),
-        th("", W["trade"]),
-    )
-    col_hdr = ui.flex(
-        th("#", W["n"], align="center"), th("INSTRUMENT", W["inst"], align="left"),
-        th("QTY", W["q"], BUY_H, BUY_C), th("AVG", W["a"], BUY_H, BUY_C), th("VALUE", W["v"], BUY_H, BUY_C),
-        th("QTY", W["q"], SELL_H, SELL_C), th("AVG", W["a"], SELL_H, SELL_C), th("VALUE", W["v"], SELL_H, SELL_C),
-        th("QTY", W["q"], NET_H, NET_C), th("LTP", W["ltp"], NET_H, NET_C), th("M2M", W["m2m"], NET_H, NET_C),
-        th("TRADE", W["trade"], align="center"),
+    return ui.panel(
+        ui.flex(
+            ui.flex(
+                ui.toggle_button("Hide flat", is_selected=hide_flat, on_change=set_hide_flat),
+                ui.flex(
+                    kind_button("All", "ALL"),
+                    kind_button("Futures", "FUT"),
+                    kind_button("Options", "OPT"),
+                    kind_button("Equity", "EQ"),
+                    gap="size-100", wrap=True,
+                ),
+                gap="size-200", wrap=True, align_items="center",
+                UNSAFE_style={"flex": "0 0 auto"},          # keep the button row its own height; the rows get the rest
+            ),
+            positions_grid(shown),
+            direction="column", gap="size-100", height="100%",
+        ),
+        title="Net positions",
     )
 
-    def pos_row(i, p):
-        netc = BLUE if p["net"] > 0 else "#c2410c" if p["net"] < 0 else GREY
-        tick = TICK.get(p["inst"], 0)
-        ltp_bg = "#d5eadb" if tick > 0 else "#fbdcdc" if tick < 0 else WHITE
-        m2m_c = GREEN if p["m2m"] >= 0 else RED
-        return ui.flex(
-            td(i + 1, W["n"], GREY, align="center"),
-            td(p["inst"], W["inst"], bold=True, align="left"),
-            td(f"{p['bq']:,}", W["q"], bg=BUY_B), td(f"{p['ba']:,.2f}", W["a"], bg=BUY_B),
-            td(p["bv"], W["v"], MUTED, bg=BUY_B),
-            td(f"{p['sq']:,}", W["q"], bg=SELL_B), td(f"{p['sa']:,.2f}", W["a"], bg=SELL_B),
-            td(p["sv"], W["v"], MUTED, bg=SELL_B),
-            td(f"{p['net']:+,}", W["q"], netc, True),
-            td(f"{p['ltp']:,.2f}", W["ltp"], bg=ltp_bg),
-            td(money(p["m2m"]), W["m2m"], m2m_c, True),
-            ui.flex(tbtn("Buy", BLUE, "#e8f0fe", "#8fb3ee", (lambda n=p["inst"]: handle_trade(n, "BUY"))),
-                    tbtn("Sell", "#c2410c", "#fdeee4", "#f0a87e", (lambda n=p["inst"]: handle_trade(n, "SELL"))),
-                    gap="size-50", align_items="center", justify_content="center",
-                    UNSAFE_style={"flex": f"0 0 {W['trade']}px", "width": f"{W['trade']}px", "background": WHITE,
-                                  "borderRight": f"1px solid {LINE}", "borderBottom": f"1px solid {LINE}"}),
+def automation_call(name, *args):
+    """Call a function of automation.py by name AT CLICK TIME. automation.py runs in this same Deephaven
+    session, so its functions (send_on, send_off, pause_all, exit_all, set_allow, pause_pf, ...) are already global."""
+    fn = globals().get(name)
+    if fn is None:
+        print(f"[console] {name}() not found - run automation.py in this session first")
+        return
+    fn(*args)
+
+
+def watch_automation(redraw):
+    """Effect for a component: pause / allow state lives in automation.py, so look at it every 2 s
+    and call redraw() ONLY when it changed (nothing is drawn while it is idle)."""
+    def sig():
+        return (tuple(sorted(globals().get("paused_pf", ()))),
+                tuple(sorted(globals().get("auto_allow", {}).items())))
+
+    def start():
+        stop = threading.Event()
+
+        def loop():
+            last = sig()
+            while not stop.wait(2):
+                now = sig()
+                if now != last:
+                    last = now
+                    redraw()
+
+        threading.Thread(target=loop, daemon=True).start()
+        return stop.set
+
+    return start
+
+
+def small_btn(label, color, on_press, disabled=False):
+    return ui.button(label, on_press=on_press, is_disabled=disabled,
+                     UNSAFE_style={"background": color, "color": "#ffffff", "border": f"1px solid {color}",
+                                   "fontWeight": "bold", "opacity": "0.35" if disabled else "1",
+                                   "height": "22px", "minWidth": "0", "padding": "0 6px", "fontSize": "11px"})
+
+
+POS_COLS = ["token", "Symbol", "BuyQty", "BuyAvg", "BuyVal", "SellQty", "SellAvg", "SellVal",
+            "NetQty", "Ltp", "Realised", "M2M"]
+# symbol (with checkbox) | BUY qty avg value | SELL qty avg value | NET qty ltp realised m2m | Pause | Square up
+GRID_COLS = ("minmax(230px, 2.2fr) minmax(64px, 1fr) minmax(70px, 1fr) minmax(100px, 1.4fr) "
+             "minmax(64px, 1fr) minmax(70px, 1fr) minmax(100px, 1.4fr) minmax(56px, 0.8fr) "
+             "minmax(76px, 1fr) minmax(76px, 1fr) minmax(76px, 1fr) 70px 90px")
+BUY_BG, SELL_BG = "#f7faff", "#fffaf6"
+
+
+def fmt(x, spec):
+    return "-" if x is None or x != x else format(x, spec)          # None / NaN -> "-"
+
+
+def cell(text, color=INK, bg="transparent", bold=False, size="14px"):
+    return ui.html.div(text, style={"textAlign": "right", "padding": "4px 8px", "color": color, "background": bg,
+                                    "fontSize": size, "fontWeight": "700" if bold else "400"})
+
+
+def sign_color(x):
+    return INK if x is None or x != x or x == 0 else (GREEN if x > 0 else RED)
+
+
+def grid_row(*cells, **kw):
+    return ui.html.div(*cells, **kw, style={"display": "grid", "gridTemplateColumns": GRID_COLS, "alignItems": "center",
+                                            "borderBottom": "1px solid #eef1f4"})
+
+
+def group_cell(text, span, bg):
+    return ui.html.div(text, style={"gridColumn": f"span {span}", "textAlign": "center", "background": bg,
+                                    "fontSize": "12px", "fontWeight": "700", "padding": "3px"})
+
+
+def head_cell(text, left=False):
+    return ui.html.div(text, style={"textAlign": "left" if left else "right", "padding": "2px 8px",
+                                    "fontSize": "12px", "fontWeight": "700", "color": GREY})
+
+
+@ui.component
+def positions_grid(table):
+    """Net positions drawn as real rows, so each row can hold a checkbox (left of the symbol) and
+    Pause / Square up buttons (right of M2M). Rows = positions only (tens), redrawn at most once per
+    server cycle; nothing is stored."""
+    src = ui.use_memo(lambda: table.view(POS_COLS), [table])
+    data = ui.use_table_data(src)
+    armed, set_armed = ui.use_state(None)           # PF whose Square up is waiting for its confirm click
+    _, set_version = ui.use_state(0)                # only used to force a redraw
+
+    def redraw():
+        set_version(lambda n: n + 1)
+
+    ui.use_effect(watch_automation(redraw), [])
+
+    pf_of = globals().get("PF_OF", {})              # token -> PF, from automation.py
+    allowed = globals().get("auto_allow", {})       # token -> True/False, from automation.py
+    paused = globals().get("paused_pf", set())      # PFs the bridge confirmed as paused
+
+    d = data if isinstance(data, dict) else {}
+    rows = [{c: d[c][i] for c in POS_COLS} for i in range(len(d.get("token", [])))]
+
+    def on_allow(token, net, on):
+        if not on and net != 0:                     # rule: cannot block automation while a position is open
+            print(f"[console] cannot block automation on token {token}: net position is {net}, square up first")
+        else:
+            automation_call("set_allow", token, on)
+        redraw()
+
+    def on_pause(pf, is_paused):
+        set_armed(None)
+        automation_call("unpause_pf" if is_paused else "pause_pf", pf)
+        redraw()
+
+    def on_square(pf):
+        if pf not in globals().get("paused_pf", set()):     # rule: no square up until the PF is paused
+            print(f"[console] square up PF {pf} refused: press Pause first")
+            set_armed(None)
+        elif armed != pf:
+            set_armed(pf)                                   # first click arms it, second click sends it
+        else:
+            set_armed(None)
+            automation_call("squareup_pf", pf)
+        redraw()
+
+    def line(r):
+        token, net = int(r["token"]), int(r["NetQty"])
+        pf = pf_of.get(token)                        # None = automation does not trade this token: controls disabled
+        has_pf = pf is not None
+        is_allowed = allowed.get(token, True)
+        is_paused = has_pf and pf in paused
+        return grid_row(
+            ui.checkbox(str(r["Symbol"]), is_selected=is_allowed, is_disabled=(not has_pf) or (is_allowed and net != 0),
+                        on_change=lambda on: on_allow(token, net, on),
+                        UNSAFE_style={"fontSize": "14px", "height": "26px", "minHeight": "0", "paddingLeft": "6px",
+                                      "whiteSpace": "nowrap"}),          # symbol stays on ONE line
+            cell(fmt(r["BuyQty"], ",.0f"), bg=BUY_BG), cell(fmt(r["BuyAvg"], ",.2f"), bg=BUY_BG),
+            cell(fmt(r["BuyVal"], ",.0f"), bg=BUY_BG),
+            cell(fmt(r["SellQty"], ",.0f"), bg=SELL_BG), cell(fmt(r["SellAvg"], ",.2f"), bg=SELL_BG),
+            cell(fmt(r["SellVal"], ",.0f"), bg=SELL_BG),
+            cell(fmt(net, ",.0f"), color=BLUE if net > 0 else ORANGE if net < 0 else INK, bold=True),
+            cell(fmt(r["Ltp"], ",.2f")),
+            cell(fmt(r["Realised"], ",.0f"), color=sign_color(r["Realised"]), bold=True),
+            cell(fmt(r["M2M"], ",.0f"), color=sign_color(r["M2M"]), bold=True),
+            ui.flex(small_btn("Resume" if is_paused else "Pause", GREEN if is_paused else AMBER,
+                              lambda: on_pause(pf, is_paused), disabled=not has_pf), justify_content="center"),
+            ui.flex(small_btn("Confirm?" if armed == pf else "Square up", RED,
+                              lambda: on_square(pf), disabled=not is_paused), justify_content="center"),
+            key=str(token),
         )
 
-    totals = ui.flex(
-        td("Σ", W["n"], GREY, True, "center", SOFT),
-        td(f"Total · {len(positions)} instruments", W["inst"], bold=True, align="left", bg=SOFT),
-        td("", W["q"], bg=SOFT), td("", W["a"], bg=SOFT), td("25.96 Cr", W["v"], bold=True, bg=SOFT),
-        td("", W["q"], bg=SOFT), td("", W["a"], bg=SOFT), td("25.85 Cr", W["v"], bold=True, bg=SOFT),
-        td("", W["q"], bg=SOFT), td("", W["ltp"], bg=SOFT),
-        td(money(total_m2m), W["m2m"], GREEN if total_m2m >= 0 else RED, True, bg=SOFT),
-        td("", W["trade"], bg=SOFT),
+    header = ui.html.div(
+        grid_row(ui.html.div(), group_cell("BUY", 3, "#e8f0fe"), group_cell("SELL", 3, "#fdeee4"),
+                 group_cell("NET", 4, "#eef1f4"), ui.html.div(), ui.html.div()),
+        grid_row(head_cell("SYMBOL", left=True), head_cell("QTY"), head_cell("AVG"), head_cell("VALUE"),
+                 head_cell("QTY"), head_cell("AVG"), head_cell("VALUE"),
+                 head_cell("QTY"), head_cell("LTP"), head_cell("REALISED"), head_cell("M2M"),
+                 ui.html.div(), ui.html.div()),
+        style={"position": "sticky", "top": "0", "background": "#ffffff", "zIndex": "2"},
+    )
+    def total(key):                                  # sum of what is shown (follows the filters), skips missing values
+        return sum(r[key] for r in rows if r[key] is not None and r[key] == r[key])
+
+    big = "15px"
+    footer = ui.html.div(                            # totals sit under their own columns
+        grid_row(
+            ui.html.div("TOTAL", style={"padding": "3px 8px", "fontSize": "12px", "fontWeight": "700", "color": GREY}),
+            cell(fmt(total("BuyQty"), ",.0f"), bg=BUY_BG, bold=True, size=big), cell("", bg=BUY_BG),
+            cell(fmt(total("BuyVal"), ",.0f"), bg=BUY_BG, bold=True, size=big),
+            cell(fmt(total("SellQty"), ",.0f"), bg=SELL_BG, bold=True, size=big), cell("", bg=SELL_BG),
+            cell(fmt(total("SellVal"), ",.0f"), bg=SELL_BG, bold=True, size=big),
+            cell(fmt(total("NetQty"), "+,.0f"), bold=True, size=big), cell(""),
+            cell(fmt(total("Realised"), "+,.0f"), color=sign_color(total("Realised")), bold=True, size=big),
+            cell(fmt(total("M2M"), "+,.0f"), color=sign_color(total("M2M")), bold=True, size=big),
+            ui.html.div(), ui.html.div(),
+        ),
+        style={"position": "sticky", "bottom": "0", "background": "#eef1f4", "borderTop": "2px solid #c9d1d9", "zIndex": "2"},
+    )
+    note = [] if pf_of else [ui.text("automation.py not loaded - checkboxes and buttons are disabled")]
+
+    return ui.html.div(                              # outer box scrolls, inner box keeps the columns from squeezing
+        *note,
+        ui.html.div(header, *[line(r) for r in rows], footer, style={"minWidth": "1140px"}),
+        style={"flex": "1", "minHeight": "0", "overflow": "auto"},
     )
 
-    positions_panel = ui.panel(
-        ui.view(
-            ui.flex(t(f"{len(positions) - flat_count} open · {flat_count} flat", MUTED),
-                    ui.toggle_button("Hide flat", is_selected=hide_flat, on_change=set_hide_flat),
-                    justify_content="space-between", align_items="center",
-                    UNSAFE_style={"padding": "8px 12px"}),
-            ui.flex(group_hdr, col_hdr, *[pos_row(i, p) for i, p in enumerate(shown_pos)], totals,
-                    direction="column", UNSAFE_style={"minWidth": "max-content", "background": WHITE}),
-            UNSAFE_style={"background": WHITE, "height": "100%", "overflow": "auto"}),
-        title="Net positions")
 
-    # Return a column (NOT a dashboard) so state can live in this component
-    return ui.column(
-        ui.row(controls, summary, height=28),
-        ui.row(message_window, ui.column(order_book, positions_panel)),
+@ui.component
+def control_panel():
+    loaded = "send_on" in globals()                                   # False until automation.py has been run
+    sending, set_sending = ui.use_state(bool(globals().get("SEND_ON", False)))
+
+    def handle_switch(on):
+        automation_call("send_on" if on else "send_off")
+        set_sending(bool(globals().get("SEND_ON", False)))             # show the real state (send_on can refuse)
+
+    confirm, set_confirm = ui.use_state(False)          # square off needs a second click
+    _, set_version = ui.use_state(0)                    # only used to force a redraw
+
+    def redraw():
+        set_version(lambda n: n + 1)
+
+    ui.use_effect(watch_automation(redraw), [])
+
+    def paused_count():
+        paused = globals().get("paused_pf", set())
+        pfs = globals().get("ALL_PF", [])
+        return sum(1 for pf in pfs if pf in paused), len(pfs)
+
+    n_paused, n_all = paused_count()
+    all_paused = n_all > 0 and n_paused == n_all        # same rule as per position: Square off only when paused
+
+    def handle_pause_all():
+        set_confirm(False)
+        automation_call("unpause_all" if all_paused else "pause_all")
+        redraw()
+
+    def handle_square_off():
+        set_confirm(False)
+        done, total = paused_count()                    # checked again at click time
+        if total == 0 or done != total:
+            print("[console] square off all refused: press Pause all first")
+        else:
+            automation_call("exit_all")
+        redraw()
+
+    def pbtn(label, color, on_press, outline=False, disabled=False):
+        # plain button with explicit colours, same style as the buttons used earlier
+        return ui.button(label, on_press=on_press, is_disabled=(not loaded) or disabled,
+                         UNSAFE_style={"background": "#ffffff" if outline else color,
+                                       "color": color if outline else "#ffffff",
+                                       "border": f"1px solid {color}", "fontWeight": "bold",
+                                       "opacity": "0.35" if disabled else "1"})
+
+    square = (
+        ui.flex(pbtn("Confirm square off", RED, handle_square_off),
+                pbtn("Cancel", GREY, lambda: set_confirm(False), outline=True), gap="size-100", wrap=True)
+        if confirm and all_paused else pbtn("Square off all", RED, lambda: set_confirm(True), disabled=not all_paused)
+    )
+
+    status_color = GREEN if sending else RED
+    children = [
+        # top row: AUTOMATION label + state on the left, ON / OFF buttons in the top-right corner
+        ui.flex(
+            ui.flex(
+                ui.html.div("AUTOMATION", style={"color": GREY, "fontSize": "11px", "fontWeight": "bold"}),
+                ui.html.div("ON" if sending else "OFF",
+                            style={"color": status_color, "fontSize": "22px", "fontWeight": "700", "lineHeight": "1.1"}),
+                direction="column",
+            ),
+            ui.flex(pbtn("ON", GREEN, lambda: handle_switch(True), outline=not sending),     # filled = current state
+                    pbtn("OFF", RED, lambda: handle_switch(False), outline=sending), gap="size-100"),
+            justify_content="space-between", align_items="start",
+        ),
+        ui.flex(pbtn("Resume all" if all_paused else "Pause all", GREEN if all_paused else AMBER, handle_pause_all),
+                square, gap="size-100", wrap=True),
+        ui.html.div(f"{n_paused}/{n_all} portfolios paused  (Square off needs all paused)",
+                    style={"color": GREY, "fontSize": "11px"}),
+    ]
+    if not loaded:
+        children.append(ui.text("automation.py not loaded"))
+
+    return ui.panel(
+        ui.flex(*children, direction="column", gap="size-150"),
+        title="Controls",
     )
 
 
-# Dashboard at the root of the script -> opens in its own new tab
-operator_v2 = ui.dashboard(operator_console())
+# ===========================================================================
+# ONE DASHBOARD: summary + controls on top, messages left, order book + net positions right
+# ===========================================================================
+operator_console = ui.dashboard(
+    ui.column(
+        ui.row(
+            ui.column(summary_window(), width=72),
+            ui.column(control_panel(), width=28),
+            height=20,
+        ),
+        ui.row(
+            message_window(),
+            ui.column(ui.row(order_book(), height=30), ui.row(net_positions(), height=70)),   # positions get most of the height
+        ),
+    )
+)

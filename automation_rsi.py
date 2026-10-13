@@ -10,6 +10,9 @@
 # are ignored, only the middle 50% (Q2+Q3) may activate / flip.
 # On a flip: pause -> apply (maxqty = cap + ADD_QTY, new side, fresh range/ival/jval/sval) -> unpause.
 # Commands run ASYNC on the NATS event loop: different portfolios overlap, each portfolio stays in order.
+# SEND SWITCH: send_off() = keep computing but send NOTHING to NATS, send_on() = send again.
+# PER-INSTRUMENT SWITCH (operator console checkbox): set_allow(x, False) = never send params for that instrument.
+# PER-PF BUTTONS (operator console): pause_pf(pf), unpause_pf(pf), squareup_pf(pf).
 # Needs `master`, `cmd_queue` (PF, Cmd, Payload), `candles` (token, Symbol, Close) and
 # `indicators` (token, RSI, Pct) in the same Deephaven session.
 # RSI is int64 = RSI x 100. Pct is int64 = percent-from-open x 100.
@@ -24,6 +27,7 @@ from deephaven.pandas import to_pandas
 
 # =============================== USER INPUT ===============================
 DRY_RUN = False              # True = only print what would be sent. Set False to go live.
+SEND_ON = False               # True = send commands to NATS. False = compute only. Switch live: send_on() / send_off()
 USER_ID = 3
 SENDER = "AUTOMATION"
 NATS_URL = "nats://192.168.1.130:4222"
@@ -70,7 +74,7 @@ TRADE_END = dtime(15, 0)
 APPLY_PARAMS = {
     "jqty1": 1, "jqty2": 1,
     "target": 5000, "stoploss": -5000, "maxloss": -5000,
-    "max_unhedge": 2, "PRNT": 1,
+    "max_unhedge": 1, "PRNT": 1,
 }
 # ==========================================================================
 
@@ -184,6 +188,17 @@ if "caps" not in globals():
 for _pf in ALL_PF:
     caps.setdefault(_pf, 0)
 
+# per-instrument switch, set from the operator console checkbox: False = never send params for that token
+if "auto_allow" not in globals():
+    auto_allow = {}
+for _t in TOKENS:
+    auto_allow.setdefault(_t, True)
+
+# portfolios the bridge has confirmed as paused (kept up to date from the replies in arequest);
+# the operator console reads it to decide when Square up is allowed
+if "paused_pf" not in globals():
+    paused_pf = set()
+
 
 class HftClient:
     """NATS client with its own asyncio loop (background thread). Requests are coroutines on that loop."""
@@ -223,6 +238,11 @@ class HftClient:
         r = json.loads(reply)
         if r.get("Status") == "ok":
             cmd_writer.write_row(int(pf), cmd, payload_str, reply_id)
+            if cmd == "pause_unpause":
+                if payload.get("Action") == "Pause":
+                    paused_pf.add(int(pf))
+                else:
+                    paused_pf.discard(int(pf))
         return r
 
     def close(self):
@@ -246,7 +266,10 @@ def _payload(d):
     return d
 
 def submit(coro):
-    """Schedule a coroutine on the NATS loop without waiting for it."""
+    """Schedule a coroutine on the NATS loop without waiting for it. Does nothing while sending is OFF."""
+    if not SEND_ON or hft is None:
+        coro.close()                 # nothing is sent; close so Python does not warn about an unawaited coroutine
+        return
     def _done(f):
         if not f.cancelled() and f.exception():
             print(f"[churning] job FAILED: {f.exception()!r}")
@@ -278,6 +301,14 @@ async def _pause_async(pf):
     async with _lock(pf):
         await hft.arequest(pf, "pause_unpause", _payload({"Action": "Pause"}))
 
+async def _unpause_async(pf):
+    async with _lock(pf):
+        await hft.arequest(pf, "pause_unpause", _payload({"Action": "UnPause"}))
+
+async def _squareup_async(pf):
+    async with _lock(pf):
+        await hft.arequest(pf, "squareup", _payload({}))
+
 async def _exit_async(pf):
     async with _lock(pf):
         await hft.arequest(pf, "pause_unpause", _payload({"Action": "Pause"}))
@@ -289,6 +320,7 @@ churn_ltp = {}                                    # token -> last Close (raw)
 zones = {t: None for t in TOKENS}                 # token -> current RSI zone
 rsis = {t: None for t in TOKENS}                  # token -> last RSI x100
 pcts = {t: None for t in TOKENS}                  # token -> last Pct-from-open x100
+off_seen = {}                                     # token -> side already logged as "would go ..." while OFF
 if "live" not in globals():                       # kept across re-pastes so a re-paste does not re-send the same side
     live = {}
 for _t in TOKENS:
@@ -389,6 +421,8 @@ def on_signal(token, zone, force=False):
     if token not in churn_ltp:
         print(f"[churning] no candle close yet for {NAME_OF[token]}, {zone} skipped")
         return
+    if not force and not auto_allow.get(token, True):
+        return                                # unticked in the operator console: no params are sent for this instrument
     if not force and not eligible(token):
         print(f"[churning] {NAME_OF[token]} -> {zone}: not in middle Pct band (Q2+Q3), skipped")
         return
@@ -396,6 +430,15 @@ def on_signal(token, zone, force=False):
         return                                # already running this side
     if not force and FAIL_COOLDOWN_S and time.time() - last_fail.get(token, 0) < FAIL_COOLDOWN_S:
         return                                # recently failed, wait out the cooldown
+    if not SEND_ON:
+        # OFF: the signal is computed, nothing is sent and nothing is marked as done (live / caps stay untouched)
+        side = ZONE_SIDE[zone]
+        if force or off_seen.get(token) != side:
+            off_seen[token] = side            # log each new would-be side once, not on every candle
+            params = make_params(token, side)
+            print(f"[churning][OFF] {NAME_OF[token]} PF {PF_OF[token]} would go {side}, NOT sent"
+                  + (f" (ival {params['ival']} range {params['lowerrange']}-{params['upperrange']})" if params else ""))
+        return
     rsi = rsis[token]
     print(f"[churning] {NAME_OF[token]} RSI {rsi / 100 if rsi is not None else '?'} -> {zone}")
     activate(token, ZONE_SIDE[zone])
@@ -421,31 +464,110 @@ def reset(x=None):
         live[t] = None
         caps[PF_OF[t]] = 0
         last_fail.pop(t, None)
+        off_seen.pop(t, None)
     print(f"[churning] state reset for {len(toks)} instrument(s)")
 
 def sell(x): on_signal(_resolve(x), "OVERBOUGHT", force=True)
 def buy(x):  on_signal(_resolve(x), "OVERSOLD", force=True)
 
 def pause_all():
+    if not SEND_ON:
+        print("[churning][OFF] pause_all NOT sent")
+        return
     for pf in ALL_PF:
         if DRY_RUN: print(f"[churning][DRY] pause {pf}")
         else: submit(_pause_async(pf))
 
+def unpause_all():
+    """Console 'Resume all': unpause every portfolio."""
+    if not SEND_ON:
+        print("[churning][OFF] unpause_all NOT sent")
+        return
+    for pf in ALL_PF:
+        if DRY_RUN: print(f"[churning][DRY] unpause {pf}")
+        else: submit(_unpause_async(pf))
+
 def exit_all():
     """Manual: pause + square up every portfolio."""
+    if not SEND_ON:
+        print("[churning][OFF] exit_all NOT sent")
+        return
     for pf in ALL_PF:
         if DRY_RUN: print(f"[churning][DRY] pause + squareup {pf}")
         else: submit(_exit_async(pf))
     for t in TOKENS: live[t] = None
 
+# ---- per-instrument / per-PF calls used by the operator console (the console does the rule checks) ----
+def set_allow(x, on):
+    """Console checkbox. on=True: automation may send params for this instrument. on=False: it never does.
+    x = symbol / token / PF. A signal that arrives while blocked is dropped; ticking it again acts on the next update."""
+    t = _resolve(x)
+    auto_allow[t] = bool(on)
+    print(f"[churning] {NAME_OF[t]} PF {PF_OF[t]} automation {'ALLOWED' if on else 'BLOCKED'}")
+
+def pause_pf(pf):
+    """Console button: pause one portfolio."""
+    if not SEND_ON:
+        print(f"[churning][OFF] pause PF {pf} NOT sent")
+        return
+    if DRY_RUN:
+        print(f"[churning][DRY] pause {pf}")
+        paused_pf.add(int(pf))
+    else:
+        submit(_pause_async(pf))
+
+def unpause_pf(pf):
+    """Console button: unpause one portfolio."""
+    if not SEND_ON:
+        print(f"[churning][OFF] unpause PF {pf} NOT sent")
+        return
+    if DRY_RUN:
+        print(f"[churning][DRY] unpause {pf}")
+        paused_pf.discard(int(pf))
+    else:
+        submit(_unpause_async(pf))
+
+def squareup_pf(pf):
+    """Console button: square up one portfolio (the console only allows it while the PF is paused)."""
+    if not SEND_ON:
+        print(f"[churning][OFF] squareup PF {pf} NOT sent")
+        return
+    if DRY_RUN: print(f"[churning][DRY] squareup {pf}")
+    else: submit(_squareup_async(pf))
+    for t in TOKENS:
+        if PF_OF[t] == pf:
+            live[t] = None                   # same as exit_all: a later signal may start this portfolio again
+
+def send_off():
+    """Keep computing signals, but send NOTHING to NATS. A swap already in flight is allowed to finish."""
+    global SEND_ON
+    SEND_ON = False
+    print("[churning] sending OFF: computing only, no messages to NATS")
+
+def send_on():
+    """Send to NATS again. Tokens currently sitting in an RSI zone are acted on right away."""
+    global SEND_ON
+    if hft is None:
+        print("[churning] cannot turn sending ON: DRY_RUN is True so there is no NATS connection. "
+              "Set DRY_RUN = False and re-paste.")
+        return
+    SEND_ON = True
+    off_seen.clear()
+    print("[churning] sending ON")
+    for t in TOKENS:
+        if zones[t] is not None:
+            on_signal(t, zones[t])
+
 def status():
+    print(f"sending {'ON' if SEND_ON else 'OFF (compute only)'}")
     mid = middle_set()
     for t in TOKENS:
         r = rsis[t]
         p = pcts[t]
         print(f"{NAME_OF[t]:24} PF {PF_OF[t]} tick {TICK_OF[t]} zone {zones[t]} rsi {r / 100 if r is not None else None} "
               f"pct {p / 100 if p is not None else None} mid {t in mid} "
-              f"side {live[t]} cap {caps[PF_OF[t]]} close {churn_ltp.get(t)}")
+              f"side {live[t]} cap {caps[PF_OF[t]]} close {churn_ltp.get(t)} "
+              f"allowed {auto_allow.get(t, True)} paused {PF_OF[t] in paused_pf}")
 
 def stop():
     h_sig.stop()
@@ -483,6 +605,8 @@ def on_candle(update, is_replay):
             zone = rsi_zone(rsi)
             rsis[tok] = rsi
             zones[tok] = zone
+            if zone is None:
+                off_seen.pop(tok, None)       # left its zone: a later re-entry is logged again while OFF
             if LOG_RSI:
                 px = churn_ltp.get(tok)
                 print(f"[rsi] {datetime.now(IST):%H:%M:%S} {NAME_OF[tok]:24} "
@@ -499,7 +623,7 @@ def on_candle(update, is_replay):
 
 h_px = listen(candles, on_price, do_replay=False)           # price first: candles ticks before the derived indicators
 h_sig = listen(indicators, on_candle, do_replay=False)
-print(f"[churning] armed ({'DRY RUN' if DRY_RUN else 'LIVE'}), {len(TOKENS)} instruments, "
+print(f"[churning] armed ({'DRY RUN' if DRY_RUN else 'LIVE'}, sending {'ON' if SEND_ON else 'OFF'}), {len(TOKENS)} instruments, "
       f"RSI >{RSI_HIGH} sell / <{RSI_LOW} buy, "
       f"mid-quartile filter {'ON' if MID_FILTER else 'OFF'}")
 if RESET_ON_START:
