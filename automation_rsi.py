@@ -1,24 +1,33 @@
-# automation.py -- each portfolio trades its OWN token and is driven by that token's RSI (from `indicators`).
-#   RSI > RSI_HIGH (overbought) -> run SELL side
-#   RSI < RSI_LOW  (oversold)   -> run BUY side
-# Instruments (PF, token) are read from the `cmd_queue` table: rows with Cmd == "subscribe",
-# PF column = portfolio number, Payload["T1"] = token. Distinct (PF, token) pairs are used.
-# Symbol names come from the `Symbol` column of the `candles` table.
-# Tick size per token comes from master["futs"]["tick"] (build_master.py, BidIntrvl paise -> rupees).
-# ival / jval / sval / ranges are always whole multiples of the token's tick.
-# Extra filter: stocks are ranked by Pct change from the day's open; Q1 (lowest 25%) and Q4 (highest 25%)
-# are ignored, only the middle 50% (Q2+Q3) may activate / flip.
-# On a flip: pause -> apply (maxqty = cap + ADD_QTY, new side, fresh range/ival/jval/sval) -> unpause.
+# automation.py -- each portfolio follows ONE underlying future's RSI (from `indicators`) but TRADES AN OPTION, always BUY side.
+#   RSI > RSI_HIGH (overbought) -> BUY the nearest-strike PUT  (PE) of that stock
+#   RSI < RSI_LOW  (oversold)   -> BUY the nearest-strike CALL (CE) of that stock
+# STOCKS: read from STOCKS_FILE (stocks.txt): a `BASKETS=4` line, then one EXACT future symbol per line,
+# `SYMBOL` or `SYMBOL,basket`, e.g. `RELIANCE 27OCT26 FUT,B1` (exactly as in master["symbol_of"]).
+# The future is only the SIGNAL source (RSI, Pct, spot price). The option is what the portfolio is subscribed to and trades.
+# "Nearest strike" = strike closest to the future's last close. Expiry = the future's expiry (or nearest, see OPT_EXPIRY).
+# A portfolio (PF) is created LAZILY: only when a stock first qualifies (RSI zone, basket middle band, allowed...)
+# and has no PF yet, it gets the next number: the highest PF found in PF_MAP_FILE / PF_SUB_FILE + 1
+# (PF_START if those files hold none). Numbers are never reused, remembered in PF_MAP_FILE.
+# The option token each PF is subscribed to is remembered in PF_SUB_FILE.
+# On a signal:
+#   - stock has no PF yet            -> NEW PF -> subscribe(option) -> pause -> apply -> unpause
+#   - PF on a different option (CE<->PE or other strike) -> old PF: pause -> squareup (optional) -> unsubscribe (optional) and it is RETIRED
+#                                       (keeps its number and its option, never reused) -> NEW PF -> subscribe(new option) -> pause -> apply -> unpause
+#   - PF already on that option      -> pause -> apply -> unpause
+# One PF = one option contract for its whole life. PF_OF[stock] always points to the newest PF of that stock.
+# Tick size per token comes from master (futs / opt). ival / jval / sval / ranges are whole multiples of the OPTION's tick.
+# Extra filter, PER BASKET: stocks of a basket are ranked by Pct change from the day's open; Q1 and Q4 are ignored.
 # Commands run ASYNC on the NATS event loop: different portfolios overlap, each portfolio stays in order.
 # SEND SWITCH: send_off() = keep computing but send NOTHING to NATS, send_on() = send again.
 # PER-INSTRUMENT SWITCH (operator console checkbox): set_allow(x, False) = never send params for that instrument.
 # PER-PF BUTTONS (operator console): pause_pf(pf), unpause_pf(pf), squareup_pf(pf).
-# Needs `master`, `cmd_queue` (PF, Cmd, Payload), `candles` (token, Symbol, Close) and
-# `indicators` (token, RSI, Pct) in the same Deephaven session.
+# Needs `master`, `candles` (token, Close) and `indicators` (token, RSI, Pct) in the same Deephaven session.
+# `candles` must ALSO contain the option tokens you may trade (subscribe the option chain), otherwise no price -> signal skipped.
 # RSI is int64 = RSI x 100. Pct is int64 = percent-from-open x 100.
 import asyncio, json, math, time, uuid
 import threading
 from datetime import datetime, timezone, timedelta, time as dtime
+import numpy as np
 import pandas as pd
 from deephaven import DynamicTableWriter, dtypes as dht
 from deephaven.constants import NULL_LONG
@@ -27,40 +36,51 @@ from deephaven.pandas import to_pandas
 
 # =============================== USER INPUT ===============================
 DRY_RUN = False              # True = only print what would be sent. Set False to go live.
-SEND_ON = False               # True = send commands to NATS. False = compute only. Switch live: send_on() / send_off()
+SEND_ON = False              # True = send commands to NATS. False = compute only. Switch live: send_on() / send_off()
 USER_ID = 3
 SENDER = "AUTOMATION"
 NATS_URL = "nats://192.168.1.130:4222"
 TIMEOUT_S = 5
 
-# Where the instruments come from
-CMD_TABLE = "cmd_queue"      # table in the Deephaven session holding the subscribe rows
-SUB_CMD = "subscribe"        # Cmd value to pick
-STRATEGY_FILTER = "Churning" # only payloads with this strategyname; None = accept every subscribe row
-SYMBOL_COL = "Symbol"        # column of `candles` holding the symbol name
-RESET_ON_START = True       # forget live sides and caps on every paste (fresh start)
-RSI_HIGH = 65               # RSI above this -> SELL
-RSI_LOW = 35                # RSI below this -> BUY
+# Where the stocks come from
+STOCKS_FILE = "/data/fo_market_data/stocks.txt"      # number of baskets and the exact future symbols are all in this file
+PF_MAP_FILE = "/data/stocks_pf.json"                 # remembers underlying token -> PF (never reused)
+PF_SUB_FILE = "/data/stocks_pf_sub.json"             # remembers PF -> option token it is subscribed to
+PF_START = 1111                                      # first portfolio number, used ONLY when the two JSON files above hold no portfolio number yet
+# sent as the subscribe payload when a PF is created / repointed; only T1 (the OPTION token) is replaced
+SUB_PAYLOAD = {"T1": 0, "gtw": 32395, "PRNT": 1, "code": "", "ival": 1, "jval": 0.75, "side": "BUY", "sval": 3, "trp": 0,
+               "jqty1": 1, "jqty2": 1, "openq": 0, "maxqty": 0, "target": 1000, "maxloss": -1000, "stoploss": -1000,
+               "lowerrange": 0, "upperrange": 10000, "max_unhedge": 1, "strategyname": "Churning",
+               "USERIDENTIFIER": 3, "user_id": 3}
+RESET_ON_START = True       # forget live legs and caps on every paste (fresh start)
+RSI_HIGH = 50               # RSI above this -> buy PUT
+RSI_LOW = 50                # RSI below this -> buy CALL
 
 MID_FILTER = True           # only trade stocks in the middle 50% (Q2+Q3) of the Pct-from-open ranking
 
-# ASSUMPTION: how the apply payload tells the bridge which side to run. Change to match your bridge.
+# Overbought -> PUT, oversold -> CALL. The "side" sent to the bridge is ALWAYS BUY.
 SIDE_FIELD = "side"
-SIDE_VALUES = {"BUY": "BUY", "SELL": "SELL"}
+SIDE_VALUES = {"PUT": "BUY", "CALL": "BUY"}
 
+# --- option selection ---
+OPT_EXPIRY = "SAME_AS_FUT"  # "SAME_AS_FUT" = option expiry = the future's expiry (falls back to nearest); "NEAREST" = nearest non-expired
+UNSUBSCRIBE_ON_RETIRE = True  # after the squareup, also unsubscribe the old PF from its option (payload = SUB_PAYLOAD with that T1; check it against your bridge)
+SQUAREUP_ON_REPOINT = True  # when a stock moves to a different option (CE<->PE...), square up the OLD portfolio (it is paused either way)
+
+# --- option sizing (percent of the OPTION premium, not of the stock price) ---
+OPT_IVAL_PCT = 0.002         # ival = 0.2% of option premium (tune!)
+OPT_RANGE_BELOW_PCT = 0.05   # lowerrange = premium * (1 - 0.5)
+OPT_RANGE_ABOVE_PCT = 0.05   # upperrange = premium * (1 + 1.0)
+TRP_PCT = 0.01   
 # True = if RSI is already in a zone when the script starts, activate immediately.
 # WARNING: every re-paste with this True adds another ADD_QTY to maxqty.
 ACT_ON_START = True
 
 ADD_QTY = 5                 # added to the cumulative maxqty on every activation / flip
 
-# range = last Close -/+ these (rupees). NOTE: same for every stock; check it suits cheap names.
-RANGE_BELOW = 100
-RANGE_ABOVE = 200
 PRICE_DIV = 100             # candle Close is paise -> 100. Use 1 if already rupees.
 
 TICK = 0.1                  # only the default argument of floor_tick; real ticks come from TICK_OF
-IVAL_PCT = 0.002            # ival  = 0.2% of close
 JVAL_FRAC = 0.75            # jval  = 0.75 x ival
 SVAL_MULT = 3               # sval  = 3 x ival
 
@@ -78,95 +98,113 @@ APPLY_PARAMS = {
 }
 # ==========================================================================
 
-for _n in (CMD_TABLE, "candles", "indicators", "master"):
+for _n in ("candles", "indicators", "master"):
     if _n not in globals():
         raise RuntimeError(f"'{_n}' not found - run the required scripts first (build_master.py for master)")
 RSI_COL = "RSI_9"           # column of `indicators` used as the signal
 PCT_COL = "Pct"             # column of `indicators`: % change from the day's open, x100
 
 IST = timezone(timedelta(hours=5, minutes=30))
-ZONE_SIDE = {"OVERBOUGHT": "SELL", "OVERSOLD": "BUY"}
+from deephaven.execution_context import get_exec_ctx
+EXEC_CTX = get_exec_ctx()                    # listeners run in threads without a context; queries there use `with EXEC_CTX:`
+ZONE_SIDE = {"OVERBOUGHT": "PUT", "OVERSOLD": "CALL"}   # zone -> which option leg we BUY
 
 
-# ---------------- load instruments from cmd_queue + names from candles ----------------
-def load_names(tokens):
-    """token -> Symbol, taken from the `candles` table. Empty dict if it cannot be read."""
-    names = {}
-    try:
-        flt = " || ".join(f"token = {t}" for t in tokens)
-        df = to_pandas(candles.where(flt).last_by("token").view(["token", SYMBOL_COL]))
-        for t, s in zip(df["token"], df[SYMBOL_COL]):
-            if s is not None and not pd.isna(s) and str(s).strip():
-                names[int(t)] = str(s).strip()
-    except Exception as e:
-        print(f"[churning] could not load {SYMBOL_COL} from candles: {e} (using t<token> names)")
-    return names
+# ---------------- stocks.txt -> future token, PF number, basket ----------------
+_f = master["futs"]                              # fut_token, TckrSymb, expiry, tick, lot
+_o = master["opt"]                               # Token, TckrSymb, expiry, strike, OptionType, tick, lot ...
 
-def load_instruments():
-    """Net subscription state: replay subscribe/unsubscribe rows in table order.
-    subscribe -> add (PF, token); unsubscribe -> remove it. Only pairs still subscribed at the end are kept."""
-    tbl = globals()[CMD_TABLE]
-    df = to_pandas(tbl.where(f"Cmd in `{SUB_CMD}`, `unsubscribe`"))
-    live_pairs = {}                              # (pf, token) -> event index of its latest subscribe
-    for i, (pf, cmd, payload) in enumerate(zip(df["PF"], df["Cmd"], df["Payload"])):
-        try:
-            p = json.loads(payload)
-        except Exception:
-            continue
-        tok = p.get("T1")
-        if tok is None or pd.isna(pf):
-            continue
-        key = (int(pf), int(tok))
-        if cmd == "unsubscribe":
-            live_pairs.pop(key, None)            # removed
-        else:
-            if STRATEGY_FILTER and p.get("strategyname") != STRATEGY_FILTER:
+def read_stocks():
+    """STOCKS_FILE: `BASKETS=n` line (number of baskets) and one exact symbol per line, `SYMBOL` or `SYMBOL,basket`
+    (SYMBOL exactly as in master, e.g. RELIANCE 27OCT26 FUT). Blank lines and # comments are ignored."""
+    rows, seen, nbaskets = [], set(), None
+    with open(STOCKS_FILE) as f:
+        for line in f:
+            parts = [p.strip() for p in line.split("#")[0].split(",")]
+            if not parts[0]:
                 continue
-            live_pairs[key] = i                  # added (or re-added)
+            if parts[0].upper().startswith("BASKETS"):
+                nbaskets = int(parts[0].split("=")[1])
+                continue
+            name = " ".join(parts[0].upper().split())
+            if name in seen:
+                print(f"[churning] {name} is listed twice in {STOCKS_FILE}, using the first")
+                continue
+            seen.add(name)
+            rows.append((name, parts[1].upper() if len(parts) > 1 and parts[1] else None))
+    if nbaskets is None and any(b is None for _, b in rows):
+        raise RuntimeError(f"{STOCKS_FILE}: add a line `BASKETS=4` (or give every stock its basket)")
+    return rows, nbaskets
 
-    # a token can only be on one PF, and a PF on one token: the most recent subscribe wins
-    keep, seen_tok, seen_pf = [], {}, {}
-    for (pf, tok), i in sorted(live_pairs.items(), key=lambda kv: -kv[1]):   # newest first
-        if tok in seen_tok:
-            print(f"[churning] token {tok} also live on PF {pf}, using newer PF {seen_tok[tok]}")
-            continue
-        if pf in seen_pf:
-            print(f"[churning] PF {pf} also live on token {tok}, using newer token {seen_pf[pf]}")
-            continue
-        seen_tok[tok], seen_pf[pf] = pf, tok
-        keep.append((pf, tok))
-    keep.sort()
-
-    names = load_names([t for _, t in keep]) if keep else {}
-    out = {}
-    for pf, tok in keep:
-        nm = names.get(tok, f"t{tok}")
-        if nm in out:
-            nm = f"{nm}_{tok}"
-        out[nm] = (pf, tok)
-    return out
-
-INSTR = load_instruments()
-if not INSTR:
-    raise RuntimeError(f"no '{SUB_CMD}' rows found in {CMD_TABLE}"
-                       + (f" with strategyname={STRATEGY_FILTER}" if STRATEGY_FILTER else ""))
-
-PF_OF = {tok: pf for pf, tok in INSTR.values()}
-NAME_OF = {tok: n for n, (pf, tok) in INSTR.items()}
-TOKENS = list(PF_OF)
-ALL_PF = list(PF_OF.values())
-print(f"[churning] loaded {len(INSTR)} instruments from {CMD_TABLE}: "
-      + ", ".join(f"{n}=PF{pf}/{t}" for n, (pf, t) in INSTR.items()))
-
-# ---- token-wise tick (rupees), from master["futs"]["tick"] built by build_master.py ----
-_f = master["futs"]
 if "tick" not in _f.columns:
     raise RuntimeError("master has no tick column - re-run the updated build_master.py")
-TICK_OF = {int(t): float(k) for t, k in zip(_f["fut_token"], _f["tick"]) if pd.notna(k) and k > 0}
-_missing = [t for t in TOKENS if t not in TICK_OF]
-if _missing:
-    raise RuntimeError(f"no tick in master for tokens {_missing}")
-print("[churning] ticks:", {NAME_OF[t]: TICK_OF[t] for t in TOKENS})
+# token -> tick (rupees) for futures and options; an equity takes the tick of its own future (same TckrSymb)
+TICK_OF = {int(t): float(k) for df_, c in ((_f, "fut_token"), (_o, "Token"))
+           for t, k in zip(df_[c], df_["tick"]) if pd.notna(k) and k > 0}
+_fut_tick = _f.dropna(subset=["tick"]).drop_duplicates("TckrSymb").set_index("TckrSymb")["tick"]   # equity tick = its future's tick
+for _tk, _sy in zip(master["eqs"]["eq_token"], master["eqs"]["TckrSymb"]):
+    if _sy in _fut_tick.index and _fut_tick[_sy] > 0:
+        TICK_OF[int(_tk)] = float(_fut_tick[_sy])
+TOKEN_OF = {s.upper(): t for t, s in master["symbol_of"].items()}   # exact symbol (equity / future / option) -> token
+
+# ---------------- option lookup: (underlying, expiry, CE/PE) -> sorted strikes + tokens ----------------
+OPT_IDX, EXPIRIES = {}, {}
+for (_s, _e, _ot), _g in _o.groupby(["TckrSymb", "expiry", "OptionType"]):
+    _g = _g.sort_values("strike")
+    OPT_IDX[(_s, _e, _ot)] = (_g["strike"].to_numpy(dtype=float), _g["Token"].to_numpy())
+    EXPIRIES.setdefault((_s, _ot), []).append(_e)
+for _k in EXPIRIES:
+    EXPIRIES[_k].sort()
+FUT_INFO = {int(t): (s, e) for t, s, e in zip(_f["fut_token"], _f["TckrSymb"], _f["expiry"])}   # fut token -> (underlying, expiry)
+
+def load_pf_map():
+    """token -> PF of the portfolios created in earlier runs (PF_MAP_FILE); empty the first time."""
+    try:
+        with open(PF_MAP_FILE) as f:
+            return {int(k): int(v) for k, v in json.load(f).items()}
+    except FileNotFoundError:
+        return {}
+
+def load_subs():
+    """pf -> option token it is subscribed to (PF_SUB_FILE); empty the first time."""
+    try:
+        with open(PF_SUB_FILE) as f:
+            return {int(k): int(v) for k, v in json.load(f).items()}
+    except FileNotFoundError:
+        return {}
+
+STOCKS, NBASKETS = read_stocks()
+PF_MAP = load_pf_map()
+_auto = [n for n, b in STOCKS if b is None]      # lines without a basket: split in file order into BASKETS parts
+BASKET = {n: (b if b is not None else f"B{_auto.index(n) * NBASKETS // len(_auto) + 1}") for n, b in STOCKS}
+
+NAME_OF, BASKET_OF = {}, {}                      # token -> master symbol;  token -> basket
+for _n, _ in STOCKS:
+    _tok = TOKEN_OF.get(_n)
+    if _tok is None:
+        print(f"[churning] {_n}: not a symbol in master, skipped")
+        continue
+    if _tok not in FUT_INFO:
+        print(f"[churning] {_n}: not a future in master, skipped (the signal source must be a future)")
+        continue
+    if _tok not in TICK_OF:
+        print(f"[churning] {_n}: no tick in master, skipped")
+        continue
+    NAME_OF[_tok] = master["symbol_of"].get(_tok, _n)
+    BASKET_OF[_tok] = BASKET[_n]
+if not NAME_OF:
+    print(f"[churning] no stock from {STOCKS_FILE} could be resolved, nothing will be tracked")
+
+TOKENS = list(NAME_OF)                           # every tracked underlying (portfolio or not)
+PF_OF = {t: PF_MAP[t] for t in TOKENS if t in PF_MAP}    # only stocks that already have a portfolio
+ALL_PF = list(PF_OF.values())                    # portfolios that exist (grows as stocks qualify)
+_sizes = {}
+for _t in TOKENS:
+    _sizes[BASKET_OF[_t]] = _sizes.get(BASKET_OF[_t], 0) + 1
+print(f"[churning] tracking {len(TOKENS)} stocks from {STOCKS_FILE}, baskets {_sizes}; "
+      f"{len(PF_OF)} already have a portfolio, the rest get one when they first qualify")
+
+print("[churning] future ticks:", {NAME_OF[t]: TICK_OF[t] for t in TOKENS})
 
 # re-run safe
 for _h in ("h_sig", "h_px"):
@@ -187,6 +225,38 @@ if "caps" not in globals():
     caps = {}
 for _pf in ALL_PF:
     caps.setdefault(_pf, 0)
+
+# pf -> option token the portfolio is currently subscribed to (persisted in PF_SUB_FILE)
+if "subscribed" not in globals():
+    subscribed = load_subs()
+
+def last_pf():
+    """Highest portfolio number found in the JSON files (PF_MAP_FILE values, PF_SUB_FILE keys) and in memory.
+    None when there is none, then the user given PF_START is used."""
+    found = list(PF_MAP.values()) + list(subscribed.keys())
+    try:
+        with open(PF_MAP_FILE) as f:
+            found += [int(v) for v in json.load(f).values()]
+    except (FileNotFoundError, ValueError):
+        pass
+    try:
+        with open(PF_SUB_FILE) as f:
+            found += [int(k) for k in json.load(f).keys()]
+    except (FileNotFoundError, ValueError):
+        pass
+    return max(found) if found else None
+
+_last = last_pf()
+print(f"[churning] last portfolio number in the JSON files: {_last}, next new portfolio gets {_last + 1}" if _last is not None
+      else f"[churning] no portfolio numbers in the JSON files, first new portfolio gets PF_START {PF_START}")
+
+# underlying token -> option token it currently trades
+if "opt_of" not in globals():
+    opt_of = {}
+
+def save_subs():
+    with open(PF_SUB_FILE, "w") as f:
+        json.dump(subscribed, f, indent=1)
 
 # per-instrument switch, set from the operator console checkbox: False = never send params for that token
 if "auto_allow" not in globals():
@@ -253,6 +323,8 @@ class HftClient:
 
 
 hft = None if DRY_RUN else HftClient(NATS_URL)
+print("[churning] NATS: " + ("DRY RUN, no connection" if DRY_RUN else f"connected to {NATS_URL}"))
+
 
 _pf_locks = {}                       # pf -> asyncio.Lock; keeps one PF's commands in order
 
@@ -275,12 +347,38 @@ def submit(coro):
             print(f"[churning] job FAILED: {f.exception()!r}")
     asyncio.run_coroutine_threadsafe(coro, hft.loop).add_done_callback(_done)
 
-last_fail = {}                       # token -> time.time() of the last failed swap
+last_fail = {}                       # underlying token -> time.time() of the last failed swap
 
-async def _swap_async(pf, token, params, prev_side):
-    """pause -> apply (maxqty = cap + ADD_QTY) -> unpause. Stops and stays paused on any failure."""
-    async with _lock(pf):
-        try:
+async def _retire_async(old_pf):
+    """The stock moves to another option: stop the old portfolio (pause, optionally square up, optionally unsubscribe).
+    It keeps its number, and subscribed[old_pf] keeps its option (the console and the numbering still use it);
+    a new portfolio takes over the stock."""
+    async with _lock(old_pf):
+        r = await hft.arequest(old_pf, "pause_unpause", _payload({"Action": "Pause"}))
+        if r.get("Status") != "ok":
+            raise RuntimeError(f"pause of old PF {old_pf} not ok, new PF skipped: {r}")
+        if SQUAREUP_ON_REPOINT:
+            r = await hft.arequest(old_pf, "squareup", _payload({}))
+            if r.get("Status") != "ok":
+                raise RuntimeError(f"squareup of old PF {old_pf} not ok, new PF skipped: {r}")
+        if UNSUBSCRIBE_ON_RETIRE:
+            r = await hft.arequest(old_pf, "unsubscribe", {**SUB_PAYLOAD, "T1": subscribed.get(old_pf, 0)})
+            if r.get("Status") != "ok":                      # the old PF is already paused and squared up: do not block the new PF
+                print(f"[churning] unsubscribe of old PF {old_pf} not ok (left paused): {r}")
+
+async def _swap_async(pf, token, opt_tok, params, prev_leg, prev_opt, old_pf=None):
+    """[retire old PF] -> [subscribe the option] -> pause -> apply (maxqty = cap + ADD_QTY) -> unpause.
+    Stops and stays paused on any failure."""
+    try:
+        if old_pf is not None:
+            await _retire_async(old_pf)
+        async with _lock(pf):
+            if subscribed.get(pf) is None:                   # new PF: subscribe it to the option
+                r = await hft.arequest(pf, "subscribe", {**SUB_PAYLOAD, "T1": opt_tok})
+                if r.get("Status") != "ok":
+                    raise RuntimeError(f"subscribe not ok, apply skipped: {r}")
+                subscribed[pf] = opt_tok
+                save_subs()
             r = await hft.arequest(pf, "pause_unpause", _payload({"Action": "Pause"}))
             if r.get("Status") != "ok":
                 raise RuntimeError(f"pause not ok, apply skipped: {r}")
@@ -292,10 +390,18 @@ async def _swap_async(pf, token, params, prev_side):
             r = await hft.arequest(pf, "pause_unpause", _payload({"Action": "UnPause"}))
             if r.get("Status") != "ok":
                 raise RuntimeError(f"unpause not ok, may still be paused: {r}")
-        except Exception as e:
-            live[token] = prev_side          # allow a retry on a later update
-            last_fail[token] = time.time()
-            print(f"[churning] {NAME_OF[token]} PF {pf} swap FAILED: {e!r}")
+    except Exception as e:
+        if old_pf is not None and subscribed.get(pf) is None:    # the new PF never reached the bridge: go back to the old one
+            PF_OF[token] = old_pf
+            PF_MAP[token] = old_pf
+            save_pf_map()
+            if pf in ALL_PF:
+                ALL_PF.remove(pf)
+            caps.pop(pf, None)
+        live[token] = prev_leg               # allow a retry on a later update
+        opt_of[token] = prev_opt
+        last_fail[token] = time.time()
+        print(f"[churning] {NAME_OF[token]} PF {pf} swap FAILED: {e!r}")
 
 async def _pause_async(pf):
     async with _lock(pf):
@@ -316,15 +422,15 @@ async def _exit_async(pf):
 
 
 # ---- state ----
-churn_ltp = {}                                    # token -> last Close (raw)
-zones = {t: None for t in TOKENS}                 # token -> current RSI zone
-rsis = {t: None for t in TOKENS}                  # token -> last RSI x100
-pcts = {t: None for t in TOKENS}                  # token -> last Pct-from-open x100
-off_seen = {}                                     # token -> side already logged as "would go ..." while OFF
-if "live" not in globals():                       # kept across re-pastes so a re-paste does not re-send the same side
+churn_ltp = {}                                    # token (future AND options) -> last Close (raw)
+zones = {t: None for t in TOKENS}                 # underlying token -> current RSI zone
+rsis = {t: None for t in TOKENS}                  # underlying token -> last RSI x100
+pcts = {t: None for t in TOKENS}                  # underlying token -> last Pct-from-open x100
+off_seen = {}                                     # underlying token -> leg already logged as "would BUY ..." while OFF
+if "live" not in globals():                       # kept across re-pastes so a re-paste does not re-send the same leg
     live = {}
 for _t in TOKENS:
-    live.setdefault(_t, None)                     # token -> side last started (BUY/SELL)
+    live.setdefault(_t, None)                     # underlying token -> leg last started (CALL/PUT)
 
 def rsi_zone(rsi_x100):
     if rsi_x100 > RSI_HIGH * 100: return "OVERBOUGHT"
@@ -334,19 +440,24 @@ def rsi_zone(rsi_x100):
 def floor_tick(x, tick=TICK):
     n = math.floor(x / tick + 1e-9)
     return round(n * tick, 2) + 1e-6      # 2.3 -> 2.300001, so x100 gives 230.0001 and truncates to 230
-
+def ceil_tick(x, tick=TICK):
+    n = math.ceil(x / tick - 1e-9)
+    return round(n * tick, 2) + 1e-6      # same +1e-6 trick as floor_tick so the bridge's x100 truncation lands on the tick
 def _on_tick(v, tick):
     """True if the bridge, which converts rupees to paise by truncation, ends up on a whole tick."""
     return int(v * 100) % int(round(tick * 100)) == 0
 
 def middle_set():
-    """Q2+Q3 by Pct from open: drop the lowest and highest quarter of stocks."""
-    ranked = sorted((p, t) for t, p in pcts.items() if p is not None)
-    n = len(ranked)
-    if n < 4:
-        return set()
-    k = n // 4                                    # size of each outer quartile
-    return {t for _, t in ranked[k:n - k]}
+    """Q2+Q3 by Pct from open, ranked INSIDE each basket: drop the lowest and highest quarter of every basket."""
+    out = set()
+    for b in set(BASKET_OF.values()):
+        ranked = sorted((pcts[t], t) for t in TOKENS if BASKET_OF[t] == b and pcts[t] is not None)
+        n = len(ranked)
+        if n < 4:
+            continue                              # too few stocks in this basket to rank
+        k = n // 4                                # size of each outer quartile
+        out |= {t for _, t in ranked[k:n - k]}
+    return out
 
 def eligible(token):
     return (not MID_FILTER) or token in middle_set()
@@ -355,66 +466,139 @@ def in_window():
     return TRADE_START <= datetime.now(IST).time() <= TRADE_END
 
 # seed prices, RSI zones and Pct from history (no commands)
-try:
-    _snap = to_pandas(candles.where(" || ".join(f"token = {t}" for t in TOKENS)).last_by("token"))
-    for _t, _c in zip(_snap["token"], _snap["Close"]):
-        churn_ltp[int(_t)] = float(_c)
-except Exception as e:
-    print(f"[churning] could not seed prices: {e}")
+if TOKENS:                                        # nothing to seed while no instrument is subscribed yet
+    try:
+        _snap = to_pandas(candles.where(f"token in {', '.join(map(str, TOKENS))}").last_by("token"))
+        for _t, _c in zip(_snap["token"], _snap["Close"]):
+            churn_ltp[int(_t)] = float(_c)
+    except Exception as e:
+        print(f"[churning] could not seed prices: {e}")
 
-try:
-    _h = to_pandas(indicators.where(" || ".join(f"token = {t}" for t in TOKENS))
-                   .last_by("token").view(["token", RSI_COL, PCT_COL]))
-    for _t, _v, _pc in zip(_h["token"], _h[RSI_COL], _h[PCT_COL]):
-        if not pd.isna(_pc) and int(_pc) != NULL_LONG:
-            pcts[int(_t)] = int(_pc)
-        if pd.isna(_v) or int(_v) == NULL_LONG:
-            continue
-        zones[int(_t)] = rsi_zone(int(_v))
-        rsis[int(_t)] = int(_v)
-except Exception as e:
-    print(f"[churning] could not replay history: {e}")
+    try:
+        _h = to_pandas(indicators.where(f"token in {', '.join(map(str, TOKENS))}")
+                       .last_by("token").view(["token", RSI_COL, PCT_COL]))
+        for _t, _v, _pc in zip(_h["token"], _h[RSI_COL], _h[PCT_COL]):
+            if not pd.isna(_pc) and int(_pc) != NULL_LONG:
+                pcts[int(_t)] = int(_pc)
+            if pd.isna(_v) or int(_v) == NULL_LONG:
+                continue
+            zones[int(_t)] = rsi_zone(int(_v))
+            rsis[int(_t)] = int(_v)
+    except Exception as e:
+        print(f"[churning] could not replay history: {e}")
 
 
-def make_params(token, side):
+# ---------------- option selection + sizing ----------------
+def pick_option(token, leg, verbose=True):
+    """Nearest-strike option of this underlying future: CALL -> CE, PUT -> PE. Returns the option token or None."""
+    sym, fexp = FUT_INFO[token]
     px = churn_ltp.get(token)
     if px is None:
         return None
-    tick = TICK_OF[token]                              # no fallback: a missing tick stops the script at startup
-    rs = px / PRICE_DIV                                # close in rupees
-    ival = max(floor_tick(rs * IVAL_PCT, tick), tick)
+    spot = px / PRICE_DIV
+    ot = "CE" if leg == "CALL" else "PE"
+    exps = EXPIRIES.get((sym, ot), [])
+    if OPT_EXPIRY == "SAME_AS_FUT" and fexp in exps:
+        exp = fexp
+    else:
+        today = pd.Timestamp(datetime.now(IST).date())
+        later = [e for e in exps if e >= today]
+        if not later:
+            return None
+        exp = later[0]
+    strikes, toks = OPT_IDX[(sym, exp, ot)]
+    i = int(np.abs(strikes - spot).argmin())
+    if verbose:
+        print(f"[churning] {NAME_OF[token]} spot {spot:.2f} -> {sym} {exp:%d%b%y} {strikes[i]:g} {ot}")
+    return int(toks[i])
+
+def opt_price(tok):
+    """Last Close (raw) of an option; falls back to a query on `candles` if no tick was seen yet."""
+    if tok in churn_ltp:
+        return churn_ltp[tok]
+    try:
+        with EXEC_CTX:
+            s = to_pandas(candles.where(f"token == {tok}").last_by("token"))
+        if len(s):
+            churn_ltp[tok] = float(s["Close"].iloc[0])
+            return churn_ltp[tok]
+    except Exception as e:
+        print(f"[churning] could not read price of option {tok}: {e}")
+    return None
+
+def make_params(opt_tok):
+    px = opt_price(opt_tok)
+    if px is None:
+        return None
+    tick = TICK_OF.get(opt_tok)
+    if tick is None:
+        print(f"[churning] option {opt_tok} has no tick in master, skipped")
+        return None
+    rs = px / PRICE_DIV                                # option premium in rupees
+    ival = max(floor_tick(rs * OPT_IVAL_PCT, tick), tick)
     jval = max(floor_tick(ival * JVAL_FRAC, tick), tick)
     sval = max(floor_tick(ival * SVAL_MULT, tick), tick)
-    lower = max(floor_tick(rs - RANGE_BELOW, tick), 0)
-    upper = floor_tick(rs + RANGE_ABOVE, tick)
-    for name, v in (("ival", ival), ("jval", jval), ("sval", sval), ("lowerrange", lower), ("upperrange", upper)):
+    trp = ceil_tick(rs * (1 + TRP_PCT / 100), tick)    # close + 0.1%
+    lower = max(floor_tick(rs * (1 - OPT_RANGE_BELOW_PCT), tick), tick)
+    upper = floor_tick(rs * (1 + OPT_RANGE_ABOVE_PCT), tick)
+    for name, v in (("ival", ival), ("jval", jval), ("sval", sval), ("trp", trp),
+                    ("lowerrange", lower), ("upperrange", upper)):
         if not _on_tick(v, tick):
-            print(f"[churning] {NAME_OF[token]} {name} {v} is not a multiple of tick {tick}, NOT sent")
+            print(f"[churning] option {opt_tok} {name} {v} is not a multiple of tick {tick}, NOT sent")
             return None
     p = dict(APPLY_PARAMS)
-    p.update({"ival": ival, "jval": jval, "sval": sval,
+    p.update({"ival": ival, "jval": jval, "sval": sval, "trp": trp,
               "lowerrange": lower, "upperrange": upper,
-              SIDE_FIELD: SIDE_VALUES[side]})
+              SIDE_FIELD: "BUY"})                      # always BUY the option
     return p
 
-def activate(token, side):
-    pf = PF_OF[token]
-    params = make_params(token, side)
-    if params is None:
-        print(f"[churning] {NAME_OF[token]} no price or invalid params, not activated")
+def save_pf_map():
+    with open(PF_MAP_FILE, "w") as f:
+        json.dump(PF_MAP, f, indent=1)
+
+def new_pf(token, why):
+    """Give the stock the next free PF number and remember it in the file."""
+    last = last_pf()
+    pf = PF_START if last is None else last + 1      # highest number in the JSON files + 1, else the user given start
+    PF_MAP[token] = pf
+    save_pf_map()
+    PF_OF[token] = pf
+    ALL_PF.append(pf)
+    caps.setdefault(pf, 0)
+    print(f"[churning] {NAME_OF[token]} {why}: created PF {pf}")
+    return pf
+
+def activate(token, leg):
+    opt = pick_option(token, leg)
+    if opt is None:
+        print(f"[churning] {NAME_OF[token]} no option found for {leg}, not activated")
         return
-    prev = live[token]
-    live[token] = side                       # mark now so an in-flight swap is not queued twice
-    print(f"[churning] {NAME_OF[token]} PF {pf} -> {side} maxqty {caps[pf] + ADD_QTY} "
+    params = make_params(opt)
+    if params is None:
+        print(f"[churning] {NAME_OF[token]} no option price or invalid params, not activated")
+        return
+    prev_leg, prev_opt = live[token], opt_of.get(token)
+    live[token] = leg                        # mark now so an in-flight swap is not queued twice
+    opt_of[token] = opt
+    nm = master["symbol_of"].get(opt, opt)
+    cur_pf = PF_OF.get(token)
+    old_pf = cur_pf if cur_pf is not None and subscribed.get(cur_pf) not in (None, opt) else None   # stock moves to another option
+    if DRY_RUN:                              # a dry run never creates a portfolio or writes the PF file
+        print(f"[churning][DRY] {NAME_OF[token]} PF {'NEW (old ' + str(old_pf) + ' retired)' if old_pf else PF_OF.get(token, 'NEW')} "
+              f"-> BUY {nm}: subscribe if needed, pause, apply {params}, unpause")
+        return
+    if old_pf is not None:
+        pf = new_pf(token, f"moves to {nm}, PF {old_pf} retired")
+    else:
+        pf = cur_pf or new_pf(token, "qualified and has no portfolio")
+    print(f"[churning] {NAME_OF[token]} PF {pf} -> BUY {nm} maxqty {caps[pf] + ADD_QTY} "
           f"ival {params['ival']} jval {params['jval']} sval {params['sval']} "
           f"range {params['lowerrange']}-{params['upperrange']}")
-    if DRY_RUN:
-        print(f"[churning][DRY] pause, apply {params}, unpause on PF {pf}")
-        return
-    submit(_swap_async(pf, token, params, prev))
+    submit(_swap_async(pf, token, opt, params, prev_leg, prev_opt, old_pf))
 
 def on_signal(token, zone, force=False):
-    """RSI of `token` entered a zone. Manual: sell(1147) / buy(48864) / sell("SYMBOL")."""
+    """RSI of the underlying `token` entered a zone. Manual: sell(1147) / buy(48864) / sell("SYMBOL").
+    sell = buy PUT, buy = buy CALL."""
     if not in_window():
         print(f"[churning] {NAME_OF[token]} -> {zone} outside trade window, ignored")
         return
@@ -427,32 +611,32 @@ def on_signal(token, zone, force=False):
         print(f"[churning] {NAME_OF[token]} -> {zone}: not in middle Pct band (Q2+Q3), skipped")
         return
     if not force and live[token] == ZONE_SIDE[zone]:
-        return                                # already running this side
+        return                                # already running this leg
     if not force and FAIL_COOLDOWN_S and time.time() - last_fail.get(token, 0) < FAIL_COOLDOWN_S:
         return                                # recently failed, wait out the cooldown
     if not SEND_ON:
         # OFF: the signal is computed, nothing is sent and nothing is marked as done (live / caps stay untouched)
-        side = ZONE_SIDE[zone]
-        if force or off_seen.get(token) != side:
-            off_seen[token] = side            # log each new would-be side once, not on every candle
-            params = make_params(token, side)
-            print(f"[churning][OFF] {NAME_OF[token]} PF {PF_OF[token]} would go {side}, NOT sent"
-                  + (f" (ival {params['ival']} range {params['lowerrange']}-{params['upperrange']})" if params else ""))
+        leg = ZONE_SIDE[zone]
+        if force or off_seen.get(token) != leg:
+            off_seen[token] = leg             # log each new would-be leg once, not on every candle
+            opt = pick_option(token, leg, verbose=False)
+            print(f"[churning][OFF] {NAME_OF[token]} PF {PF_OF.get(token, 'NEW')} would BUY "
+                  f"{master['symbol_of'].get(opt, '?')} ({leg}), NOT sent")
         return
     rsi = rsis[token]
     print(f"[churning] {NAME_OF[token]} RSI {rsi / 100 if rsi is not None else '?'} -> {zone}")
     activate(token, ZONE_SIDE[zone])
 
 def _resolve(x):
-    """Accept a Symbol (case-insensitive), a token, or a PF number."""
+    """Accept a master symbol (case-insensitive), an underlying token, or a PF number."""
     if isinstance(x, str):
-        for n, (pf, tok) in INSTR.items():
+        for tok, n in NAME_OF.items():
             if n.lower() == x.lower():
                 return tok
         raise KeyError(f"unknown symbol {x}")
-    if x in PF_OF:
+    if x in NAME_OF:
         return x
-    for pf, tok in INSTR.values():
+    for tok, pf in PF_OF.items():
         if pf == x:
             return tok
     raise KeyError(f"unknown instrument {x}")
@@ -462,13 +646,15 @@ def reset(x=None):
     toks = TOKENS if x is None else [_resolve(x)]
     for t in toks:
         live[t] = None
-        caps[PF_OF[t]] = 0
+        opt_of.pop(t, None)
+        if t in PF_OF:
+            caps[PF_OF[t]] = 0
         last_fail.pop(t, None)
         off_seen.pop(t, None)
     print(f"[churning] state reset for {len(toks)} instrument(s)")
 
-def sell(x): on_signal(_resolve(x), "OVERBOUGHT", force=True)
-def buy(x):  on_signal(_resolve(x), "OVERSOLD", force=True)
+def sell(x): on_signal(_resolve(x), "OVERBOUGHT", force=True)   # overbought -> BUY nearest PUT
+def buy(x):  on_signal(_resolve(x), "OVERSOLD", force=True)     # oversold   -> BUY nearest CALL
 
 def pause_all():
     if not SEND_ON:
@@ -483,7 +669,7 @@ def unpause_all():
     if not SEND_ON:
         print("[churning][OFF] unpause_all NOT sent")
         return
-    for pf in ALL_PF:
+    for pf in PF_OF.values():                # current portfolios only: a retired PF stays paused
         if DRY_RUN: print(f"[churning][DRY] unpause {pf}")
         else: submit(_unpause_async(pf))
 
@@ -495,7 +681,9 @@ def exit_all():
     for pf in ALL_PF:
         if DRY_RUN: print(f"[churning][DRY] pause + squareup {pf}")
         else: submit(_exit_async(pf))
-    for t in TOKENS: live[t] = None
+    for t in TOKENS:
+        live[t] = None
+        opt_of.pop(t, None)
 
 # ---- per-instrument / per-PF calls used by the operator console (the console does the rule checks) ----
 def set_allow(x, on):
@@ -503,7 +691,7 @@ def set_allow(x, on):
     x = symbol / token / PF. A signal that arrives while blocked is dropped; ticking it again acts on the next update."""
     t = _resolve(x)
     auto_allow[t] = bool(on)
-    print(f"[churning] {NAME_OF[t]} PF {PF_OF[t]} automation {'ALLOWED' if on else 'BLOCKED'}")
+    print(f"[churning] {NAME_OF[t]} PF {PF_OF.get(t, 'NEW')} automation {'ALLOWED' if on else 'BLOCKED'}")
 
 def pause_pf(pf):
     """Console button: pause one portfolio."""
@@ -535,8 +723,9 @@ def squareup_pf(pf):
     if DRY_RUN: print(f"[churning][DRY] squareup {pf}")
     else: submit(_squareup_async(pf))
     for t in TOKENS:
-        if PF_OF[t] == pf:
+        if PF_OF.get(t) == pf:
             live[t] = None                   # same as exit_all: a later signal may start this portfolio again
+            opt_of.pop(t, None)
 
 def send_off():
     """Keep computing signals, but send NOTHING to NATS. A swap already in flight is allowed to finish."""
@@ -564,10 +753,14 @@ def status():
     for t in TOKENS:
         r = rsis[t]
         p = pcts[t]
-        print(f"{NAME_OF[t]:24} PF {PF_OF[t]} tick {TICK_OF[t]} zone {zones[t]} rsi {r / 100 if r is not None else None} "
+        pf = PF_OF.get(t)
+        o = opt_of.get(t)
+        print(f"{NAME_OF[t]:24} PF {pf if pf else '-'} basket {BASKET_OF[t]} zone {zones[t]} rsi {r / 100 if r is not None else None} "
               f"pct {p / 100 if p is not None else None} mid {t in mid} "
-              f"side {live[t]} cap {caps[PF_OF[t]]} close {churn_ltp.get(t)} "
-              f"allowed {auto_allow.get(t, True)} paused {PF_OF[t] in paused_pf}")
+              f"leg {live[t]} option {master['symbol_of'].get(o, '-') if o else '-'} "
+              f"subscribed {master['symbol_of'].get(subscribed.get(pf), '-') if pf else '-'} "
+              f"cap {caps.get(pf, 0)} fut_close {churn_ltp.get(t)} "
+              f"allowed {auto_allow.get(t, True)} paused {pf in paused_pf}")
 
 def stop():
     h_sig.stop()
@@ -583,9 +776,8 @@ def on_price(update, is_replay):
     if ch is None:
         return
     for tok, close in zip(ch["token"], ch["Close"]):
-        tok = int(tok)
-        if tok in PF_OF and close != NULL_LONG and close > 0:
-            churn_ltp[tok] = float(close)
+        if close != NULL_LONG and close > 0:
+            churn_ltp[int(tok)] = float(close)      # futures AND options (options are needed for sizing)
 
 def on_candle(update, is_replay):
     cols = ["token", RSI_COL, PCT_COL]
@@ -595,7 +787,7 @@ def on_candle(update, is_replay):
     for d in parts:
         for tok, rsi, pct in zip(d["token"], d[RSI_COL], d[PCT_COL]):
             tok = int(tok)
-            if tok not in PF_OF:
+            if tok not in NAME_OF:
                 continue
             if pct != NULL_LONG:
                 pcts[tok] = int(pct)
@@ -616,15 +808,16 @@ def on_candle(update, is_replay):
     # ranks shift on every update, so re-check every stock sitting in a zone
     if not in_window():
         return
+    mid = middle_set() if MID_FILTER else None   # computed once per update, not once per stock
     for t in TOKENS:
         z = zones[t]
-        if z is not None and live[t] != ZONE_SIDE[z] and eligible(t):
+        if z is not None and live[t] != ZONE_SIDE[z] and (mid is None or t in mid):
             on_signal(t, z)
 
 h_px = listen(candles, on_price, do_replay=False)           # price first: candles ticks before the derived indicators
 h_sig = listen(indicators, on_candle, do_replay=False)
 print(f"[churning] armed ({'DRY RUN' if DRY_RUN else 'LIVE'}, sending {'ON' if SEND_ON else 'OFF'}), {len(TOKENS)} instruments, "
-      f"RSI >{RSI_HIGH} sell / <{RSI_LOW} buy, "
+      f"RSI >{RSI_HIGH} buy PUT / <{RSI_LOW} buy CALL, "
       f"mid-quartile filter {'ON' if MID_FILTER else 'OFF'}")
 if RESET_ON_START:
     reset()
@@ -633,3 +826,30 @@ if ACT_ON_START:
         if zones[t] is not None:
             print(f"[churning] {NAME_OF[t]} already in {zones[t]} at start, activating")
             on_signal(t, zones[t])
+            # ---------------- unsubscribe all ----------------
+async def _unsub_async(pf):
+    async with _lock(pf):
+        opt = subscribed.get(pf)
+        if opt is None:
+            return
+        for cmd, pl in (("pause_unpause", _payload({"Action": "Pause"})),
+                        ("squareup", _payload({})),
+                        ("unsubscribe", {**SUB_PAYLOAD, "T1": opt})):
+            r = await hft.arequest(pf, cmd, pl)
+            if r.get("Status") != "ok":
+                print(f"[churning] PF {pf} {cmd} not ok, stopped for this PF: {r}")
+                return
+
+def unsubscribe_all():
+    """Stop signals, then pause + square up + unsubscribe every current portfolio."""
+    if not SEND_ON or hft is None:
+        print("[churning] sending is OFF or DRY_RUN: run send_on() first (DRY_RUN must be False)")
+        return
+    h_sig.stop()                              # no new signals while we shut down
+    h_px.stop()
+    for pf in PF_OF.values():                 # current PFs only; retired ones were handled when retired
+        submit(_unsub_async(pf))
+    for t in TOKENS:
+        live[t] = None
+        opt_of.pop(t, None)
+    print(f"[churning] unsubscribing {len(PF_OF)} portfolio(s), watch the log")

@@ -7,7 +7,7 @@ from deephaven import DynamicTableWriter, dtypes as dht
 from deephaven.table_listener import listen
 
 # =============================== USER INPUT ===============================
-MARKET = "US"        # "NSE" or "US"
+MARKET = "NSE"        # "NSE" or "US"
 
 CONFIGS = {
     "NSE": dict(

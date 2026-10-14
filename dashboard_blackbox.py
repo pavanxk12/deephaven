@@ -1,15 +1,21 @@
 import threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from deephaven import ui, agg
+from deephaven.time import to_j_instant, to_j_zdt
 
 # ===========================================================================
 # OPERATOR CONSOLE: summary + message window + order book + net positions, ONE script, ONE dashboard.
+# ONE overall time filter (top-right of Summary) drives EVERY panel.
 #
 # Needs in your session before running:
 #   master          from build_master.py        (master["symbol_of"]: token -> symbol)
 #   strategy_events KafkaPartition, KafkaOffset, KafkaTimestamp, PF, Payload
-#   orders_trade    fills                       (token, buy_sell, fill_quantity, fill_price, response_order_number)
-#   orders_ack      order confirmations         (order_number, token_no, tcode 20073/20074/20075, volume, price, buy_sell)
+#   orders_trade    fills                       (token, buy_sell, fill_quantity, fill_price, response_order_number,
+#                                                activity_time = fill time, epoch seconds)
+#   orders_ack      order confirmations         (order_number, token_no, tcode 20073/20074/20075, volume, price, buy_sell,
+#                                                last_modified = epoch seconds)
 #   fo_market_data  live prices, one row per token (token, ltp)
 #                   if it holds repeated ticks per token, change it to fo_market_data.last_by("token") below
 #   automation.py   (same session) for the Controls panel and the per-position controls
@@ -18,6 +24,26 @@ from deephaven import ui, agg
 # ---------- settings ----------
 SYMBOL_OF = master["symbol_of"]
 PRICE_DIV = 100.0                      # NSE prices arrive in paise
+IST = ZoneInfo("Asia/Kolkata")
+TRADE_TIME = "activity_time"           # orders_trade column with the fill time, epoch seconds
+ORDER_TIME = "last_modified"           # order book column with the order's last update time, epoch seconds
+
+LOGO_PATH = "/data/fo_market_data/logo.png"           # picture shown top-left of the console (png / jpg / svg); no file = nothing shown
+LOGO_HEIGHT = "72px"                   # keep the file small (under ~100 KB): it is sent to the browser with the page
+
+
+def load_logo():
+    try:
+        import base64, mimetypes
+        mime = mimetypes.guess_type(LOGO_PATH)[0] or "image/png"
+        with open(LOGO_PATH, "rb") as f:
+            return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
+    except OSError:
+        print(f"[console] no logo at {LOGO_PATH}, showing none")
+        return None
+
+
+LOGO_SRC = load_logo()
 
 C_SEQ, C_TS, C_PF, C_TEXT = "KafkaOffset", "KafkaTimestamp", "PF", "Payload"   # strategy_events columns
 
@@ -33,7 +59,7 @@ def symbol_of(token: int) -> str:
 # TABLES (each is one lazy chain; per-row columns use update_view so nothing per-row is stored)
 # ===========================================================================
 
-# ---- messages: LOGMSG rows of strategy_events, classified ----
+# ---- messages: LOGMSG rows of strategy_events, classified (Ts kept so the time filter can use it) ----
 messages = (
     strategy_events
     .view([f"Seq = {C_SEQ}", f"Ts = {C_TS}", f"Pf = {C_PF}", f"Raw = {C_TEXT}"])
@@ -50,58 +76,78 @@ messages = (
         " ? Raw.substring(Raw.indexOf(`MSG=`) + 4, Raw.contains(`,COLOR=`) ? Raw.lastIndexOf(`,COLOR=`) : Raw.length())"
         " : Raw.substring(Raw.lastIndexOf(`LOGMSG,`) + 7)",
     ])
-    .view(["Seq", "Time", "Type", "Pf", "Msg"])
+    .view(["Seq", "Ts", "Time", "Type", "Pf", "Msg"])
 )
+
 
 # ---- net positions: one row per traded token, live LTP joined straight from fo_market_data ----
-net_positions_table = (
-    orders_trade
-    .where("fill_quantity > 0")
-    .update_view([
-        "BuyQty = buy_sell == 1 ? fill_quantity : 0L",
-        "SellQty = buy_sell == 2 ? fill_quantity : 0L",
-        "BuyVal = buy_sell == 1 ? fill_quantity * fill_price / PRICE_DIV : 0.0",
-        "SellVal = buy_sell == 2 ? fill_quantity * fill_price / PRICE_DIV : 0.0",
-    ])
-    .agg_by([agg.sum_(["BuyQty", "SellQty", "BuyVal", "SellVal"]), agg.count_("Fills")], by=["token"])
-    .natural_join(fo_market_data, on="token", joins="LtpRaw = ltp")
-    .update([
-        "Symbol = symbol_of(token)",
-        "Ltp = LtpRaw / PRICE_DIV",
-        "BuyAvg = BuyQty > 0 ? BuyVal / BuyQty : 0.0",
-        "SellAvg = SellQty > 0 ? SellVal / SellQty : 0.0",
-        "NetQty = BuyQty - SellQty",
-        "Realised = Math.min(BuyQty, SellQty) * (SellAvg - BuyAvg)",
-        "M2M = isNull(LtpRaw) ? NULL_DOUBLE : SellVal - BuyVal + NetQty * Ltp",
-        # instrument kind from the symbol text: ...CE / ...PE = option, contains FUT = future, else equity
-        "Kind = (Symbol.endsWith(`CE`) || Symbol.endsWith(`PE`)) ? `OPT` : Symbol.contains(`FUT`) ? `FUT` : `EQ`",
-    ])
-    .view(["token", "Symbol", "BuyQty", "BuyAvg", "BuyVal", "SellQty", "SellAvg", "SellVal", "NetQty", "Ltp", "Realised", "M2M", "Fills", "Kind"])
-    .sort("Symbol")
+def make_net(trades):
+    return (
+        trades
+        .where("fill_quantity > 0")
+        .update_view([
+            "BuyQty = buy_sell == 1 ? fill_quantity : 0L",
+            "SellQty = buy_sell == 2 ? fill_quantity : 0L",
+            "BuyVal = buy_sell == 1 ? fill_quantity * fill_price / PRICE_DIV : 0.0",
+            "SellVal = buy_sell == 2 ? fill_quantity * fill_price / PRICE_DIV : 0.0",
+        ])
+        .agg_by([agg.sum_(["BuyQty", "SellQty", "BuyVal", "SellVal"]), agg.count_("Fills")], by=["token"])
+        .natural_join(fo_market_data, on="token", joins="LtpRaw = ltp")
+        .update([
+            "Symbol = symbol_of(token)",
+            "Ltp = LtpRaw / PRICE_DIV",
+            "BuyAvg = BuyQty > 0 ? BuyVal / BuyQty : 0.0",
+            "SellAvg = SellQty > 0 ? SellVal / SellQty : 0.0",
+            "NetQty = BuyQty - SellQty",
+            "Realised = Math.min(BuyQty, SellQty) * (SellAvg - BuyAvg)",
+            "M2M = isNull(LtpRaw) ? NULL_DOUBLE : SellVal - BuyVal + NetQty * Ltp",
+            # instrument kind from the symbol text: ...CE / ...PE = option, contains FUT = future, else equity
+            "Kind = (Symbol.endsWith(`CE`) || Symbol.endsWith(`PE`)) ? `OPT` : Symbol.contains(`FUT`) ? `FUT` : `EQ`",
+        ])
+        .view(["token", "Symbol", "BuyQty", "BuyAvg", "BuyVal", "SellQty", "SellAvg", "SellVal",
+               "NetQty", "Ltp", "Realised", "M2M", "Fills", "Kind"])
+        .sort("Symbol")
+    )
+
+
+# whole day, never filtered: the per-position rules (no untick while open) always use this
+net_positions_table = make_net(orders_trade)
+
+# fills per order over the WHOLE day, so Remaining is always correct whatever the window is
+fills_per_order = (
+    orders_trade.agg_by([agg.sum_("FilledQty = fill_quantity")], by="response_order_number")
+    .view(["OrderId = (long) response_order_number", "FilledQty"])
 )
+
 
 # ---- order book: latest ack per order, not cancelled, still has quantity left after fills ----
-order_book_table = (
-    orders_ack
-    .view(["OrderId = (long) order_number", "PF", "tcode", "token_no", "buy_sell", "volume", "price", "last_modified"])
-    .last_by("OrderId")
-    .natural_join(
-        orders_trade.agg_by([agg.sum_("FilledQty = fill_quantity")], by="response_order_number")
-        .view(["OrderId = (long) response_order_number", "FilledQty"]),
-        on="OrderId", joins="FilledQty")
-    .update_view("Rem = volume - (isNull(FilledQty) ? 0L : FilledQty)")
-    .where("tcode != 20075 && Rem > 0")
-    .update([
-        "Symbol = symbol_of(token_no)",
-        "Side = buy_sell == 1 ? `BUY` : `SELL`",
-        "Px = price / PRICE_DIV",
-        "Status = Rem < volume ? `PART` : `OPEN`",
-        "Time = formatDateTime(epochSecondsToInstant(last_modified), timeZone(`Asia/Kolkata`)).substring(11, 19)",
-    ])
-    .view(["last_modified", "Time", "OrderId", "PF", "Side", "Symbol", "volume", "Rem", "Px", "Status"])
-    .sort("last_modified")
-)
+# conds = optional time conditions on the order's last update time (the overall time window)
+def make_order_book(conds=None):
+    t = (
+        orders_ack
+        .view(["OrderId = (long) order_number", "PF", "tcode", "token_no", "buy_sell", "volume", "price", ORDER_TIME])
+        .last_by("OrderId")
+    )
+    if conds:
+        t = t.where(conds)
+    return (
+        t
+        .natural_join(fills_per_order, on="OrderId", joins="FilledQty")
+        .update_view("Rem = volume - (isNull(FilledQty) ? 0L : FilledQty)")
+        .where("tcode != 20075 && Rem > 0")
+        .update([
+            "Symbol = symbol_of(token_no)",
+            "Side = buy_sell == 1 ? `BUY` : `SELL`",
+            "Px = price / PRICE_DIV",
+            "Status = Rem < volume ? `PART` : `OPEN`",
+            f"Time = formatDateTime(epochSecondsToInstant({ORDER_TIME}), timeZone(`Asia/Kolkata`)).substring(11, 19)",
+        ])
+        .view([ORDER_TIME, "Time", "OrderId", "PF", "Side", "Symbol", "volume", "Rem", "Px", "Status"])
+        .sort(ORDER_TIME)
+    )
 
+
+order_book_table = make_order_book()                 # whole day
 
 
 # ===========================================================================
@@ -143,10 +189,10 @@ def tile(label, text, color):
 
 
 @ui.component
-def summary_window():
-    # built here so nothing outside this panel needs to change
+def summary_window(net_tbl, book_tbl, filter_ctl=None):
+    # net_tbl / book_tbl follow the overall time window; filter_ctl = the time filter button, top-right
     totals = ui.use_memo(
-        lambda: net_positions_table.agg_by(
+        lambda: net_tbl.agg_by(
             [agg.sum_(["BuyVal", "SellVal", "Realised", "M2M", "Fills"])]
         ).view([
             "Turnover = (BuyVal + SellVal) / 1.0E7",
@@ -155,9 +201,9 @@ def summary_window():
             "RealisedPnl = Realised",
             "Unrealised = M2M - Realised",
         ]),
-        [],
+        [net_tbl],
     )
-    open_cnt = ui.use_memo(lambda: order_book_table.count_by("OpenOrders"), [])
+    open_cnt = ui.use_memo(lambda: book_tbl.count_by("OpenOrders"), [book_tbl])
 
     row = ui.use_row_data(totals)
     orow = ui.use_row_data(open_cnt)
@@ -178,21 +224,33 @@ def summary_window():
         x = val(v, key)
         return GREEN if x is None or x >= 0 else RED
 
+    tiles = ui.flex(
+        tile("TURNOVER (₹ CR)", num(v, "Turnover", ",.2f", "0.00"), ORANGE),
+        tile("FILLS", num(v, "Fills", ",.0f", "0"), "#000000"),
+        tile("OPEN ORDERS", num(o, "OpenOrders", ",.0f", "0"), "#000000"),
+        tile("GROSS M2M (₹)", num(v, "GrossM2M", "+,.0f"), pnl_color("GrossM2M")),
+        tile("REALISED (₹)", num(v, "RealisedPnl", "+,.0f", "0"), pnl_color("RealisedPnl")),
+        tile("UNREALISED (₹)", num(v, "Unrealised", "+,.0f"), pnl_color("Unrealised")),
+        wrap=True, align_items="center",
+        UNSAFE_style={"flex": "1", "minHeight": "0"},
+    )
+
+    body = [tiles]
+    if filter_ctl is not None or LOGO_SRC:
+        # thin row above the tiles: logo on the left, time filter button on the right
+        logo = ui.html.img(src=LOGO_SRC, style={"height": LOGO_HEIGHT, "display": "block"}) if LOGO_SRC else ui.html.div()
+        body.insert(0, ui.flex(logo, filter_ctl if filter_ctl is not None else ui.html.div(),
+                               justify_content="space-between", align_items="center",
+                               UNSAFE_style={"flex": "0 0 auto", "padding": "2px 8px"}))
+
     return ui.panel(
-        ui.flex(
-            tile("TURNOVER (₹ CR)", num(v, "Turnover", ",.2f", "0.00"), ORANGE),
-            tile("FILLS TODAY", num(v, "Fills", ",.0f", "0"), "#000000"),
-            tile("OPEN ORDERS", num(o, "OpenOrders", ",.0f", "0"), "#000000"),
-            tile("GROSS M2M (₹)", num(v, "GrossM2M", "+,.0f"), pnl_color("GrossM2M")),
-            tile("REALISED (₹)", num(v, "RealisedPnl", "+,.0f", "0"), pnl_color("RealisedPnl")),
-            tile("UNREALISED (₹)", num(v, "Unrealised", "+,.0f"), pnl_color("Unrealised")),
-            wrap=True, align_items="center", height="100%",
-        ),
+        ui.flex(*body, direction="column", height="100%"),
         title="Summary",
     )
 
+
 @ui.component
-def message_window():
+def message_window(msgs):
     kind, set_kind = ui.use_state("ALL")            # one of: ALL, TRADE, ORDER, EVENT, ERROR, INFO
 
     # "" = show all, otherwise the single selected type
@@ -215,14 +273,14 @@ def message_window():
         ui.flex(
             chips,
             ui.table(
-                messages,
+                msgs,
                 key=type_filter,                    # new key = the grid re-applies the filter right away
                 reverse=True,                       # newest on top, done in the browser
                 density="spacious",
                 show_search=True,
                 quick_filters={"Type": type_filter},
                 format_=MSG_FORMATS,
-                hidden_columns=["Seq"],
+                hidden_columns=["Seq", "Ts"],
                 always_fetch_columns=["Type"],
                 column_display_names={"Time": "TIME IST", "Pf": "PF", "Msg": "MESSAGE"},
                 frozen_columns=["Time", "Type"],
@@ -232,16 +290,17 @@ def message_window():
         title="Message window",
     )
 
+
 @ui.component
-def order_book():
+def order_book(book_tbl):
     return ui.panel(
         ui.table(
-            order_book_table,
+            book_tbl,
             reverse=True,
             density="spacious",
             show_search=True,
             format_=ORD_FORMATS,
-            hidden_columns=["last_modified"],
+            hidden_columns=[ORDER_TIME],
             column_display_names={"Time": "TIME IST", "OrderId": "ORDER", "volume": "QTY", "Rem": "REMAINING", "Px": "PRICE"},
             frozen_columns=["Time"],
         ),
@@ -250,7 +309,7 @@ def order_book():
 
 
 @ui.component
-def net_positions():
+def net_positions(net_tbl):
     hide_flat, set_hide_flat = ui.use_state(False)
     kind, set_kind = ui.use_state("ALL")            # one of: ALL, FUT, OPT, EQ
 
@@ -260,9 +319,9 @@ def net_positions():
             conds.append("NetQty != 0")
         if kind != "ALL":
             conds.append(f"Kind == `{kind}`")
-        return net_positions_table.where(conds) if conds else net_positions_table
+        return net_tbl.where(conds) if conds else net_tbl
 
-    shown = ui.use_memo(build, [hide_flat, kind])
+    shown = ui.use_memo(build, [hide_flat, kind, net_tbl])
 
     def kind_button(label, value):
         return ui.toggle_button(label, is_selected=kind == value, on_change=lambda _: set_kind(value))
@@ -287,6 +346,7 @@ def net_positions():
         title="Net positions",
     )
 
+
 def automation_call(name, *args):
     """Call a function of automation.py by name AT CLICK TIME. automation.py runs in this same Deephaven
     session, so its functions (send_on, send_off, pause_all, exit_all, set_allow, pause_pf, ...) are already global."""
@@ -297,12 +357,42 @@ def automation_call(name, *args):
     fn(*args)
 
 
+def owner_of(token):
+    """Automation keys everything (PF_OF, auto_allow) by the UNDERLYING future, but a net-positions row is the OPTION
+    that portfolio trades. Return the underlying token for a row, or None if no portfolio trades this instrument."""
+    pf_of = globals().get("PF_OF", {})
+    if token in pf_of:
+        return token
+    for pf, opt in globals().get("subscribed", {}).items():        # pf -> option token it is subscribed to
+        if opt == token:
+            for u, p in pf_of.items():
+                if p == pf:
+                    return u
+    name = symbol_of(token).split()[0]               # old leg of a retired PF: same stock = same checkbox
+    for u in pf_of:
+        if symbol_of(u).split()[0] == name:
+            return u
+    return None
+
+
+def pf_for_row(token):
+    """PF of a net-positions row. One PF = one option, so first the PF subscribed to exactly this option (retired
+    portfolios included, newest if several). Otherwise the current PF of the same stock."""
+    exact = [pf for pf, opt in globals().get("subscribed", {}).items() if opt == token]
+    if exact:
+        return max(exact)
+    owner = owner_of(token)
+    return globals().get("PF_OF", {}).get(owner) if owner is not None else None
+
+
 def watch_automation(redraw):
     """Effect for a component: pause / allow state lives in automation.py, so look at it every 2 s
     and call redraw() ONLY when it changed (nothing is drawn while it is idle)."""
     def sig():
         return (tuple(sorted(globals().get("paused_pf", ()))),
-                tuple(sorted(globals().get("auto_allow", {}).items())))
+                tuple(sorted(globals().get("auto_allow", {}).items())),
+                tuple(sorted(globals().get("PF_OF", {}).items())),
+                tuple(sorted(globals().get("subscribed", {}).items())))
 
     def start():
         stop = threading.Event()
@@ -372,7 +462,10 @@ def positions_grid(table):
     server cycle; nothing is stored."""
     src = ui.use_memo(lambda: table.view(POS_COLS), [table])
     data = ui.use_table_data(src)
+    full_src = ui.use_memo(lambda: net_positions_table.view(["token", "NetQty"]), [])    # whole-day net, for the rules
+    full = ui.use_table_data(full_src)
     armed, set_armed = ui.use_state(None)           # PF whose Square up is waiting for its confirm click
+    warn, set_warn = ui.use_state("")               # why the last tick / untick was refused
     _, set_version = ui.use_state(0)                # only used to force a redraw
 
     def redraw():
@@ -386,12 +479,17 @@ def positions_grid(table):
 
     d = data if isinstance(data, dict) else {}
     rows = [{c: d[c][i] for c in POS_COLS} for i in range(len(d.get("token", [])))]
+    fd = full if isinstance(full, dict) else {}
+    full_net = {int(t): int(n) for t, n in zip(fd.get("token", []), fd.get("NetQty", []))}
 
     def on_allow(token, net, on):
         if not on and net != 0:                     # rule: cannot block automation while a position is open
-            print(f"[console] cannot block automation on token {token}: net position is {net}, square up first")
+            set_warn(f"{symbol_of(token)}: cannot untick, net position is {net:+,}. Pause and Square up first.")
+        elif owner_of(token) is None:
+            set_warn(f"{symbol_of(token)}: no portfolio trades this instrument (yet), nothing to change.")
         else:
-            automation_call("set_allow", token, on)
+            set_warn("")
+            automation_call("set_allow", owner_of(token), on)
         redraw()
 
     def on_pause(pf, is_paused):
@@ -411,13 +509,16 @@ def positions_grid(table):
         redraw()
 
     def line(r):
-        token, net = int(r["token"]), int(r["NetQty"])
-        pf = pf_of.get(token)                        # None = automation does not trade this token: controls disabled
+        token = int(r["token"])
+        net = full_net.get(token, int(r["NetQty"]))           # rules use the whole-day position, not the window
+        shown_net = int(r["NetQty"])
+        owner = owner_of(token)                      # the option row -> the underlying future automation tracks
+        pf = pf_for_row(token)                       # owner's PF, else the PF of the same stock; None = stock not tracked
         has_pf = pf is not None
-        is_allowed = allowed.get(token, True)
+        is_allowed = allowed.get(owner, True) if owner is not None else True
         is_paused = has_pf and pf in paused
         return grid_row(
-            ui.checkbox(str(r["Symbol"]), is_selected=is_allowed, is_disabled=(not has_pf) or (is_allowed and net != 0),
+            ui.checkbox(str(r["Symbol"]), is_selected=is_allowed,
                         on_change=lambda on: on_allow(token, net, on),
                         UNSAFE_style={"fontSize": "14px", "height": "26px", "minHeight": "0", "paddingLeft": "6px",
                                       "whiteSpace": "nowrap"}),          # symbol stays on ONE line
@@ -425,7 +526,7 @@ def positions_grid(table):
             cell(fmt(r["BuyVal"], ",.0f"), bg=BUY_BG),
             cell(fmt(r["SellQty"], ",.0f"), bg=SELL_BG), cell(fmt(r["SellAvg"], ",.2f"), bg=SELL_BG),
             cell(fmt(r["SellVal"], ",.0f"), bg=SELL_BG),
-            cell(fmt(net, ",.0f"), color=BLUE if net > 0 else ORANGE if net < 0 else INK, bold=True),
+            cell(fmt(shown_net, ",.0f"), color=BLUE if shown_net > 0 else ORANGE if shown_net < 0 else INK, bold=True),
             cell(fmt(r["Ltp"], ",.2f")),
             cell(fmt(r["Realised"], ",.0f"), color=sign_color(r["Realised"]), bold=True),
             cell(fmt(r["M2M"], ",.0f"), color=sign_color(r["M2M"]), bold=True),
@@ -445,6 +546,7 @@ def positions_grid(table):
                  ui.html.div(), ui.html.div()),
         style={"position": "sticky", "top": "0", "background": "#ffffff", "zIndex": "2"},
     )
+
     def total(key):                                  # sum of what is shown (follows the filters), skips missing values
         return sum(r[key] for r in rows if r[key] is not None and r[key] == r[key])
 
@@ -463,7 +565,8 @@ def positions_grid(table):
         ),
         style={"position": "sticky", "bottom": "0", "background": "#eef1f4", "borderTop": "2px solid #c9d1d9", "zIndex": "2"},
     )
-    note = [] if pf_of else [ui.text("automation.py not loaded - checkboxes and buttons are disabled")]
+    note = ([] if pf_of else [ui.text("automation.py not loaded - checkboxes and buttons are disabled")]) + (
+        [ui.html.div(warn, style={"color": RED, "fontSize": "13px", "fontWeight": "600", "padding": "2px 8px"})] if warn else [])
 
     return ui.html.div(                              # outer box scrolls, inner box keeps the columns from squeezing
         *note,
@@ -491,7 +594,7 @@ def control_panel():
 
     def paused_count():
         paused = globals().get("paused_pf", set())
-        pfs = globals().get("ALL_PF", [])
+        pfs = list(globals().get("PF_OF", {}).values())     # current portfolios; retired ones stay paused
         return sum(1 for pf in pfs if pf in paused), len(pfs)
 
     n_paused, n_all = paused_count()
@@ -554,18 +657,174 @@ def control_panel():
 
 
 # ===========================================================================
-# ONE DASHBOARD: summary + controls on top, messages left, order book + net positions right
+# OVERALL TIME WINDOW: From / To (IST). Filters EVERYTHING: Summary, Messages, Order book, Net positions.
+# The button sits top-right of the Summary panel.
 # ===========================================================================
-operator_console = ui.dashboard(
-    ui.column(
-        ui.row(
-            ui.column(summary_window(), width=72),
-            ui.column(control_panel(), width=28),
-            height=20,
+import jpy
+_ZoneId = jpy.get_type("java.time.ZoneId")
+_IST_ZONE = _ZoneId.of("Asia/Kolkata")
+
+
+def to_epoch(v, end=False):
+    """value of a date picker (any date/time type) -> epoch seconds; None if nothing picked.
+    `end` = include the whole minute."""
+    if v is None:
+        return None
+    kind = str(type(v))
+    if "LocalDateTime" in kind:                      # no zone given: treat as IST
+        s = int(v.atZone(_IST_ZONE).toEpochSecond())
+    elif hasattr(v, "atStartOfDay"):                 # LocalDate: start of that day, IST
+        s = int(v.atStartOfDay(_IST_ZONE).toEpochSecond())
+    elif hasattr(v, "getEpochSecond"):               # Instant
+        s = int(v.getEpochSecond())
+    elif hasattr(v, "toEpochSecond"):                # ZonedDateTime / OffsetDateTime (what your picker gives)
+        s = int(v.toEpochSecond())
+    else:
+        s = int(to_j_instant(v).getEpochSecond())    # last resort
+    return s + (59 if end else 0)
+def ist_zdt(text):
+    """'2026-10-14 09:15' (IST) -> Java ZonedDateTime, the type the date picker works with"""
+    return to_j_zdt(text.replace(" ", "T") + ":00 Asia/Kolkata")
+
+
+# the window lives here (plain Python): the picker sets it, the console tables follow it
+if "TIME_WINDOW" not in globals():
+    TIME_WINDOW = {"v": (None, None)}                       # (from, to) epoch seconds, None = no limit
+
+
+@ui.component
+def time_picker():
+    draft_from, set_draft_from = ui.use_state(None)          # values picked in the calendar (None = nothing picked)
+    draft_to, set_draft_to = ui.use_state(None)
+    note, set_note = ui.use_state("")
+    cur, set_cur = ui.use_state(TIME_WINDOW["v"])
+    opened, set_opened = ui.use_state(False)
+
+    def put(a, b):
+        TIME_WINDOW["v"] = (a, b)
+        set_cur((a, b))
+
+    def today():
+        d = datetime.now(IST).strftime("%Y-%m-%d")
+        set_draft_from(ist_zdt(d + " 00:00"))
+        set_draft_to(None)
+        set_note("")
+        put(to_epoch(ist_zdt(d + " 00:00")), None)
+
+    def clear():
+        set_draft_from(None)
+        set_draft_to(None)
+        set_note("")
+        put(None, None)
+
+    a, b = cur
+    shown = "Whole day" if a is None and b is None else (
+        f"{datetime.fromtimestamp(a, IST):%d-%b %H:%M}" if a is not None else "start") + " to " + (
+        f"{datetime.fromtimestamp(b, IST):%d-%b %H:%M}" if b is not None else "now")
+
+    def close():
+        set_opened(False)
+
+    def apply_now():
+        a2, b2 = to_epoch(draft_from), to_epoch(draft_to, end=True)
+        if a2 is not None and b2 is not None and a2 > b2:
+            set_note("From is after To")
+        else:
+            set_note("")
+            put(a2, b2)
+            close()
+
+    def today_btn():
+        today()
+        close()
+
+    def clear_btn():
+        clear()
+        close()
+
+    pick = dict(granularity="minute", hour_cycle=24, hide_time_zone=True)      # 24-hour clock, IST, no zone label
+    dlg = ui.dialog(
+        ui.heading("Time window (IST)"),
+        ui.content(
+            ui.flex(
+                ui.date_picker(label="From (IST)", value=draft_from, on_change=set_draft_from,
+                               placeholder_value=ist_zdt("2026-01-01 09:00"), **pick),
+                ui.date_picker(label="To (IST), empty = now", value=draft_to, on_change=set_draft_to,
+                               placeholder_value=ist_zdt("2026-01-01 15:30"), **pick),
+                ui.text(note or "Filters everything: Summary, Messages, Order book and Net positions."),
+                direction="column", gap="size-150",
+            ),
         ),
-        ui.row(
-            message_window(),
-            ui.column(ui.row(order_book(), height=30), ui.row(net_positions(), height=70)),   # positions get most of the height
+        ui.button_group(
+            ui.button("Clear", variant="secondary", on_press=clear_btn),
+            ui.button("Today", variant="secondary", on_press=today_btn),
+            ui.button("Apply", variant="accent", on_press=apply_now),
         ),
     )
-)
+
+    # trigger looks like a filter: plain when the whole day is shown, blue when a window is active
+    active = a is not None or b is not None
+    btn = ui.action_button(
+        f"⏱ {shown}",
+        UNSAFE_style={"fontWeight": "700", "color": BLUE, "borderColor": BLUE} if active else {},
+    )
+    # a popup opened by this button; open / close is our own state, children are plain elements
+    return ui.dialog_trigger(btn, dlg, is_open=opened, on_open_change=set_opened)
+
+
+# ===========================================================================
+# ONE DASHBOARD: summary (with time filter) + controls, messages left, order book + net positions right
+# ===========================================================================
+@ui.component
+def console():
+    applied, set_applied = ui.use_state(TIME_WINDOW["v"])    # (from, to) epoch seconds, set by the time picker
+
+    def follow_window():                                     # look at it every second, redraw only when it changed
+        stop = threading.Event()
+
+        def loop():
+            last = TIME_WINDOW["v"]
+            while not stop.wait(1):
+                if TIME_WINDOW["v"] != last:
+                    last = TIME_WINDOW["v"]
+                    set_applied(last)
+
+        threading.Thread(target=loop, daemon=True).start()
+        return stop.set
+
+    ui.use_effect(follow_window, [])
+    a, b = applied
+
+    def trade_tbl():
+        conds = ([f"{TRADE_TIME} >= {a}"] if a is not None else []) + ([f"{TRADE_TIME} <= {b}"] if b is not None else [])
+        return make_net(orders_trade.where(conds)) if conds else net_positions_table
+
+    def msg_tbl():
+        conds = ([f"Ts >= epochSecondsToInstant({a}L)"] if a is not None else []) + (
+            [f"Ts <= epochSecondsToInstant({b}L)"] if b is not None else [])
+        return messages.where(conds) if conds else messages
+
+    def book_tbl_fn():
+        conds = ([f"{ORDER_TIME} >= {a}"] if a is not None else []) + ([f"{ORDER_TIME} <= {b}"] if b is not None else [])
+        return make_order_book(conds) if conds else order_book_table
+
+    net_tbl = ui.use_memo(trade_tbl, [a, b])
+    msgs = ui.use_memo(msg_tbl, [a, b])
+    book_tbl = ui.use_memo(book_tbl_fn, [a, b])
+
+    return ui.dashboard(
+        ui.column(
+            ui.row(
+                ui.column(summary_window(net_tbl, book_tbl, time_picker()), width=72),
+                ui.column(control_panel(), width=28),
+                height=26,                                   # slightly taller: the filter row needs ~30px
+            ),
+            ui.row(
+                message_window(msgs),
+                ui.column(ui.row(order_book(book_tbl), height=30), ui.row(net_positions(net_tbl), height=70)),
+            ),
+        )
+    )
+
+
+operator_console = console()

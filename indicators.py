@@ -7,7 +7,7 @@ from deephaven import updateby as uby
 from deephaven import agg
 
 # =============================== USER INPUT ===============================
-TIMEFRAME_MIN = 5     # 1 = use candles as-is, 5 = 5-minute bars, 15 = 15-minute bars, ...
+TIMEFRAME_MIN = 1     # 1 = use candles as-is, 5 = 5-minute bars, 15 = 15-minute bars, ...
 
 INDICATORS = [
     ("RSI", 9),       # -> RSI_9   (Wilder smoothing, int64 = RSI x 100), 9 bars of TIMEFRAME_MIN
