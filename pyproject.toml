@@ -7,7 +7,7 @@ dependencies = ["pandas", "numpy"]
 
 [project.optional-dependencies]
 runtime = ["nats-py"]      # installed in the Deephaven image; needed only by the bridge
-dev = ["pytest"]
+dev = ["pytest", "TA-Lib"]       # TA-Lib is only a checker (tests/test_talib_parity.py), never used at runtime
 
 [tool.setuptools.packages.find]
 include = ["algo*"]
