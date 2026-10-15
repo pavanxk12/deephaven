@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 CONTRACT_COLUMNS: Mapping[str, str] = {
     "token": "Token", "symbol": "Symbol", "expiry": "ExpiryDate", "inst": "InstType",
-    "opt": "OptionType", "strike": "StrikePrice", "lot": "LotSize", "tick": "TickSize",
+    "opt": "OptionType", "strike": "StrikePrice", "lot": "LotSize", "tick": "TickSize", "divisor": "Divisor",
 }
 
 
@@ -24,8 +24,9 @@ class Market:
     tz: str                        # exchange timezone (session windows, "today", contract file date)
     ltt_tz: str                    # timezone the feed's `ltt` string is written in
     ltt_fmt: str                   # strptime format of `ltt` up to the minute (seconds are parsed separately)
-    price_div: float               # raw feed / order price -> currency units (paise -> rupees = 100); the default candle
-                                   # multiplier is 1 / price_div
+    price_div: float               # raw feed / order price -> currency units (paise -> rupees = 100); used where the contract
+                                   # file has no Divisor column. Strike, tick and the default candle multiplier take the
+                                   # file's own Divisor per contract (NSE 100; US options 10000, US equities 100)
     expiry_epoch: str              # epoch of numeric contract expiries
     strike_div: float
     tick_div: float
@@ -49,11 +50,12 @@ NSE = Market(
     session=(dtime(9, 15), dtime(15, 30)), trade_window=(dtime(9, 20), dtime(15, 0)),
 )
 
-# US values below are carried over from the old scripts or are placeholders to verify against a real feed row:
-# the feed stamps IST, prices are assumed to be dollars (double), the session is the New York cash session.
+# US: expiry epoch 1970, strike / tick / price scale 10000 (from the contract file's Divisor), checked against
+# 20261014DB.db3. NOT yet checked against a live feed row: the feed's ltt format and timezone, and that its prices
+# follow the file's Divisor. The session is the New York cash session.
 US = Market(
     code="US", tz="America/New_York", ltt_tz="Asia/Kolkata", ltt_fmt="%Y-%m-%dT%H:%M",
-    price_div=1.0, expiry_epoch="1970-01-01", strike_div=1.0, tick_div=1.0,
+    price_div=10000.0, expiry_epoch="1970-01-01", strike_div=10000.0, tick_div=10000.0,
     session=(dtime(9, 30), dtime(16, 0)), trade_window=(dtime(9, 35), dtime(15, 45)),
 )
 

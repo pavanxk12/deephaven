@@ -124,6 +124,7 @@ class Candles(Plugin):
         if not isinstance(decimals, int) or isinstance(decimals, bool) or not 0 <= decimals <= 12:
             raise ValueError("decimals must be a whole number from 0 to 12")
         self.multiplier, self.decimals, self.skipped = multiplier, decimals, 0
+        self.scale_of: dict[int, float] = {}               # token -> multiplier, from the contract file (when none is given)
         self.timeframe = format_timeframe(parse_timeframe(timeframe))
         self.bucket = parse_timeframe(timeframe)
         self.build_from = build_from
@@ -138,7 +139,8 @@ class Candles(Plugin):
         symbol_of = app.master.symbol_of
         price_t = dht.double
         self.scale = self.multiplier if self.multiplier is not None else 1.0 / mk.price_div
-        app.shared["price_multiplier"] = self.scale
+        if self.multiplier is None:                         # no multiplier given: each contract's own Divisor from the file
+            self.scale_of = {t: 1.0 / d for t, d in app.master.divisor_of.items()}
         writer = DynamicTableWriter({
             "MinuteEpoch": dht.int64, "Symbol": dht.string, "token": dht.int64,
             "Open": price_t, "High": price_t, "Low": price_t, "Close": price_t, "Volume": dht.int64,
@@ -158,11 +160,14 @@ class Candles(Plugin):
         self.agg = CandleAggregator(emit, start, b)
         self._parse = LttParser(mk.ltt_fmt, mk.ltt_zone)
         self.listen(feed, self._on_update, replay=True)
-        self.log.info("%s candles, feed price x %g, market=%s ltt_tz=%s fmt=%s feed=%s tokens mapped=%d",
-                      self.timeframe, self.scale, mk.code, mk.ltt_tz, mk.ltt_fmt, mk.feed, len(symbol_of))
+        scales = sorted({round(v, 12) for v in self.scale_of.values()}) or [self.scale]
+        self.log.info("%s candles, feed price x %s%s, market=%s ltt_tz=%s fmt=%s feed=%s tokens mapped=%d",
+                      self.timeframe, " / ".join(f"{v:g}" for v in scales),
+                      "" if self.multiplier is not None else " (the contract file's Divisor)",
+                      mk.code, mk.ltt_tz, mk.ltt_fmt, mk.feed, len(symbol_of))
 
     def describe(self) -> str:
-        return f"{self.timeframe}, feed x {getattr(self, 'scale', '?'):g}, {self.rows} candles, {self.skipped} bad ticks skipped"
+        return f"{self.timeframe}, {self.rows} candles, {self.skipped} bad ticks skipped"
 
     def _tick(self, agg: CandleAggregator, tok, ltp, vol, lt) -> int | None:
         """One feed row -> the aggregator. Returns the tick's time, or None if the row was not usable.
@@ -176,7 +181,7 @@ class Candles(Plugin):
             sec = self._parse(lt)
             if sec is None:
                 return None
-            price = round(float(ltp) * self.scale, self.decimals)
+            price = round(float(ltp) * self.scale_of.get(tok, self.scale), self.decimals)
             if not good_price(price):                  # the multiplier rounded it to zero
                 return None
             agg.mark(tok, lt, vol)

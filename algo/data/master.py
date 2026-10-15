@@ -19,7 +19,7 @@ import pandas as pd
 from algo.core.config import Market
 from algo.core.plugin import Plugin
 
-CACHE_VERSION = "v3"
+CACHE_VERSION = "v4"
 
 
 # =================================================================================================
@@ -30,7 +30,7 @@ class MasterData:
     chain: pd.DataFrame      # ce_token, pe_token, TckrSymb, expiry, strike
     opt: pd.DataFrame        # Token, TckrSymb, expiry, strike, OptionType, tick, lot ...
     futs: pd.DataFrame       # fut_token, TckrSymb, expiry, tick, lot
-    eqs: pd.DataFrame        # eq_token, TckrSymb
+    eqs: pd.DataFrame        # eq_token, TckrSymb, tick, divisor
     symbol_of: dict          # token -> "NIFTY 27OCT26 25000 CE" / "NIFTY 27OCT26 FUT" / "AAPL"
 
     # ---- lookups ------------------------------------------------------------------------
@@ -41,14 +41,20 @@ class MasterData:
 
     @cached_property
     def tick_of(self) -> dict:
-        """token -> tick in currency units, for futures and options; an equity uses its own future's tick."""
-        out = {int(t): float(k) for frame, col in ((self.futs, "fut_token"), (self.opt, "Token"))
-               for t, k in zip(frame[col], frame["tick"]) if pd.notna(k) and k > 0}
+        """token -> tick in currency units. An equity uses its own tick, else its future's."""
+        out = {int(t): float(k) for frame, col in ((self.futs, "fut_token"), (self.opt, "Token"), (self.eqs, "eq_token"))
+               if "tick" in frame for t, k in zip(frame[col], frame["tick"]) if pd.notna(k) and k > 0}
         fut_tick = self.futs.dropna(subset=["tick"]).drop_duplicates("TckrSymb").set_index("TckrSymb")["tick"]
         for tok, sym in zip(self.eqs["eq_token"], self.eqs["TckrSymb"]):
-            if sym in fut_tick.index and fut_tick[sym] > 0:
+            if int(tok) not in out and sym in fut_tick.index and fut_tick[sym] > 0:
                 out[int(tok)] = float(fut_tick[sym])
         return out
+
+    @cached_property
+    def divisor_of(self) -> dict:
+        """token -> the contract file's own Divisor (how many raw units make one currency unit)."""
+        return {int(t): float(d) for frame, col in ((self.futs, "fut_token"), (self.opt, "Token"), (self.eqs, "eq_token"))
+                if "divisor" in frame for t, d in zip(frame[col], frame["divisor"]) if pd.notna(d) and d > 0}
 
     @cached_property
     def fut_info(self) -> dict:
@@ -112,17 +118,25 @@ def _col(raw: pd.DataFrame, name: str, default):
 
 
 def normalise(raw: pd.DataFrame, market: Market) -> pd.DataFrame:
-    """Raw contract rows -> Token, TckrSymb, InstType, OptionType, strike, tick, lot, expiry (currency units)."""
+    """Raw contract rows -> Token, TckrSymb, InstType, OptionType, strike, tick, lot, expiry, divisor (currency units).
+
+    Strike and tick are divided by the row's own Divisor column when the file has one (US options 10000, US equities
+    100, NSE 100); rows without a usable Divisor use the market's constants.
+    """
     c = market.contract_columns
+    div = (pd.to_numeric(raw[c["divisor"]], errors="coerce") if c.get("divisor") in raw
+           else pd.Series(float("nan"), index=raw.index))
+    div = div.where(div > 0)
     return pd.DataFrame({
         "Token": pd.to_numeric(raw[c["token"]], errors="coerce"),
         "TckrSymb": raw[c["symbol"]].astype(str).str.strip().str.upper(),
         "InstType": raw[c["inst"]].astype(str).str.strip().str.upper(),
         "OptionType": (raw[c["opt"]].astype(str).str.strip().str.upper() if c["opt"] in raw else ""),
-        "strike": (pd.to_numeric(raw[c["strike"]], errors="coerce") / market.strike_div
+        "strike": (pd.to_numeric(raw[c["strike"]], errors="coerce") / div.fillna(market.strike_div)
                    if c["strike"] in raw else float("nan")),
-        "tick": (pd.to_numeric(raw[c["tick"]], errors="coerce") / market.tick_div
+        "tick": (pd.to_numeric(raw[c["tick"]], errors="coerce") / div.fillna(market.tick_div)
                  if c["tick"] in raw else float("nan")),
+        "divisor": div.fillna(market.price_div),
         "lot": pd.to_numeric(raw[c["lot"]], errors="coerce") if c["lot"] in raw else float("nan"),
         "expiry": parse_expiry(raw[c["expiry"]], market.expiry_epoch),
     })
@@ -149,8 +163,9 @@ def classify(df: pd.DataFrame) -> MasterData:
     pe = opt[opt["OptionType"] == "PE"][["Token", "TckrSymb", "expiry", "strike"]].rename(columns={"Token": "pe_token"})
     chain = (ce.merge(pe, on=["TckrSymb", "expiry", "strike"], how="inner")
                .drop_duplicates(["TckrSymb", "expiry", "strike"]).reset_index(drop=True))
-    futs = df[is_fut][["Token", "TckrSymb", "expiry", "tick", "lot"]].rename(columns={"Token": "fut_token"}).reset_index(drop=True)
-    eqs = df[is_eq][["Token", "TckrSymb"]].rename(columns={"Token": "eq_token"}).reset_index(drop=True)
+    futs = (df[is_fut][["Token", "TckrSymb", "expiry", "tick", "lot", "divisor"]]
+            .rename(columns={"Token": "fut_token"}).reset_index(drop=True))
+    eqs = df[is_eq][["Token", "TckrSymb", "tick", "divisor"]].rename(columns={"Token": "eq_token"}).reset_index(drop=True)
     opt = opt.reset_index(drop=True)
 
     data = MasterData(chain=chain, opt=opt, futs=futs, eqs=eqs, symbol_of={})
