@@ -32,7 +32,7 @@ Once per session (or the last line of `init.py`): `import algo; algo.install(glo
 functions in the session, so the day is a few calls (`scripts/01_day.py`):
 
 ```python
-master_build()                        # contract master for today
+master_build("NSE")                    # contract master for today ("NSE" or "US")
 candles_start("1min")                 # "30s" | "1min" | "5min" | "15min"
 indicators(EMA(9), RSI(5))            # start computing these
 indicators(EMA(6))                    # ADDS EMA_6; EMA_9 and RSI_5 keep running
@@ -49,7 +49,7 @@ straddle_start(0)                     # nearest option expiry only; 1 = two near
   goes with it: the nearest future expiring on or after it, so weekly options use the monthly future and next month's
   options use next month's future. One point per minute (per candle if candles are larger than a minute).
   `straddle_start(1, symbols=["NIFTY"])` limits it.
-* `master_build(force=True)` ignores the cache, `algo_status()` shows what is running.
+* `master_build("US")` switches the exchange (it stops plugins running for the other one); `master_build(force=True)` ignores the cache, `algo_status()` shows what is running.
 
 The strategy and the console are plugins (`scripts/02_strategy.py`, `03_console.py`). Running a plugin whose name is
 already running replaces it, so re-running a call is always safe. `algo.reload()` after editing the package.

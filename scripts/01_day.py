@@ -1,5 +1,5 @@
 # Start of day, after 00_install.py. Each line is a function call; run the ones you want.
-master_build()                        # contract master for today
+master_build("NSE")                    # contract master for today; the exchange ("NSE" or "US") sets timezone, prices, session
 candles_start("1min")                 # "30s", "1min", "5min" or "15min"
 indicators(EMA(9), EMA(18), RSI(9))   # call again later to ADD more, e.g. indicators(EMA(6))
 straddle_start(0)                     # nearest option expiry only; 1 = two nearest, 2 = three nearest ...

@@ -139,8 +139,35 @@ def test_straddle_start_n_is_extra_expiries_beyond_the_nearest(session, started)
 
 def test_master_build_passes_day_and_force(session, started):
     ns, _ = session
-    ns["master_build"]("20261015", force=True)
+    ns["master_build"](day="20261015", force=True)
     assert started[-1].day == "20261015" and started[-1].force is True
+
+
+def test_master_build_takes_the_exchange(session, started):
+    ns, app = session
+    ns["master_build"]()                                   # no argument: keeps the current exchange
+    assert app_module.current().market.code == "NSE"
+    ns["master_build"]("nse")
+    assert app_module.current() is app                      # same exchange: nothing is stopped
+
+
+def test_switching_exchange_stops_what_was_running_for_the_other_one(session, no_build, monkeypatch):
+    ns, app = session
+    ns["indicators"](EMA(9))
+    assert "indicators" in app.plugins
+    monkeypatch.setattr(api, "_run", lambda plugin: None)         # do not build a real master
+    ns["master_build"]("US")
+    now = app_module.current()
+    assert now.market.code == "US" and now is not app and now.plugins == {}
+    assert app.plugins == {}                                # the NSE plugins were stopped
+    assert now.ns is ns and now.paths == app.paths
+
+
+def test_unknown_exchange_is_refused_and_changes_nothing(session, started):
+    ns, app = session
+    with pytest.raises(ValueError, match="unknown market"):
+        ns["master_build"]("LSE")
+    assert app_module.current() is app and started == []
 
 
 # ---- republish plumbing -----------------------------------------------------------------------------

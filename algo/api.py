@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 
 from algo.core.app import App, MissingDependency, connect, current
-from algo.core.config import Paths
+from algo.core.config import Paths, market_for
 from algo.data.candles import Candles
 from algo.data.indicators import LIBRARY, Indicators
 from algo.data.master import Master
@@ -36,8 +36,19 @@ def _run(plugin) -> None:
         raise RuntimeError(f"{e}. Call " + " then ".join(HINTS.get(d, d) for d in needed) + " first.") from None
 
 
-def master_build(day: str | None = None, force: bool = False) -> None:
-    """Build the contract master from today's .db3 (or `day`, e.g. "20261015"). Uses the cache unless force=True."""
+def master_build(exchange: str | None = None, day: str | None = None, force: bool = False) -> None:
+    """Build the contract master: master_build("NSE") or master_build("US"). The exchange sets the timezone, price scale,
+    session and file formats for everything after it. Naming a different exchange than the running one stops the plugins
+    that are running (they belong to the other market); no argument keeps the current exchange.
+    Reads today's .db3 (or `day`, e.g. "20261015"); uses the cache unless force=True."""
+    app = _app()
+    if exchange is not None:
+        market = market_for(exchange)
+        if market != app.market:
+            if app.plugins:
+                print(f"switching {app.market.code} -> {market.code}: stopping {', '.join(app.plugins)}")
+            app = connect(app.ns, market, app.paths)
+    print(f"exchange: {app.market.code}")
     _run(Master(day=day, force_rebuild=force))
 
 
