@@ -41,7 +41,7 @@ if "master" not in globals():
 START_MIN = int(time.time() // 60 * 60) + 60   # first full minute we build
 
 # ---- token -> symbol lookup (built once from the in-memory master) ----
-symbol_of = {}
+_cndl_sym = {}
 
 def _fexp(x):
     return "nan" if pd.isna(x) else x.strftime("%d%b%y").upper()
@@ -52,34 +52,34 @@ for _tcol, _tp in (("ce_token", "CE"), ("pe_token", "PE")):
                               _ch["TckrSymb"].tolist(),
                               _ch["expiry"].tolist(),
                               _ch["strike"].tolist()):
-        symbol_of[_t] = f"{_s} {_fexp(_e)} {_k:g} {_tp}"
+        _cndl_sym[_t] = f"{_s} {_fexp(_e)} {_k:g} {_tp}"
 
 _fu = master["futs"]
 for _t, _s, _e in zip(_fu["fut_token"].astype("int64").tolist(),
                       _fu["TckrSymb"].tolist(),
                       _fu["expiry"].tolist()):
-    symbol_of[_t] = f"{_s} {_fexp(_e)} FUT"
+    _cndl_sym[_t] = f"{_s} {_fexp(_e)} FUT"
 del _ch, _fu
 
 # equities (only present if master was built by the newer build_master.py)
 for _r in master.get("eqs", pd.DataFrame(columns=["eq_token", "TckrSymb"])).itertuples(index=False):
-    symbol_of[int(_r.eq_token)] = _r.TckrSymb
+    _cndl_sym[int(_r.eq_token)] = _r.TckrSymb
 
-minute_cache = {}   # "<date> HH:MM" -> epoch seconds of that minute (one entry per minute)
+_cndl_mc = {}   # "<date> HH:MM" -> epoch seconds of that minute (one entry per minute)
 
-def parse_ltt(s):
+def _cndl_ltt(s):
     # strptime runs once per minute; every other tick is a slice + dict lookup + int()
     s = s.strip()
     if len(s) < 5 or s[-3] != ":":   # must end with ":SS"
         return None
     key = s[:-3]
-    base = minute_cache.get(key)
+    base = _cndl_mc.get(key)
     if base is None:
         try:
             base = int(datetime.strptime(key, FMT_MIN).replace(tzinfo=LTT_TZ).timestamp())
         except Exception:
             return None
-        minute_cache[key] = base
+        _cndl_mc[key] = base
     try:
         return base + int(s[-2:])
     except Exception:
@@ -102,36 +102,36 @@ candles = cw.table.view([
 ])
 
 # ---- state (one entry per token) ----
-cur = {}         # token -> [minute, o, h, l, c, cum_vol, first_vol]
-prev_cum = {}    # token -> cumulative vol at end of last closed candle
-last_seen = {}   # token -> (ltt string, cumulative vol) of last trade seen
+_cndl_cur = {}         # token -> [minute, o, h, l, c, cum_vol, first_vol]
+_cndl_prev = {}    # token -> cumulative vol at end of last closed candle
+_cndl_seen = {}   # token -> (ltt string, cumulative vol) of last trade seen
 
-def _px(v):
+def _cndl_px(v):
     return round(v) if INT_PRICES else float(v)
 
-def _close(tok, c):
+def _cndl_close(tok, c):
     minute, o, h, l, cl, cum, first_vol = c
-    base = prev_cum.get(tok, first_vol)
-    cw.write_row(minute, symbol_of.get(tok), tok,
-                 _px(o), _px(h), _px(l), _px(cl),
+    base = _cndl_prev.get(tok, first_vol)
+    cw.write_row(minute, _cndl_sym.get(tok), tok,
+                 _cndl_px(o), _cndl_px(h), _cndl_px(l), _cndl_px(cl),
                  max(cum - base, 0))
-    prev_cum[tok] = cum
+    _cndl_prev[tok] = cum
 
-def flush(cutoff_min):
-    for tok in [t for t, c in cur.items() if c[0] < cutoff_min]:
-        _close(tok, cur.pop(tok))
+def _cndl_flush(cutoff_min):
+    for tok in [t for t, c in _cndl_cur.items() if c[0] < cutoff_min]:
+        _cndl_close(tok, _cndl_cur.pop(tok))
 
-def on_tick(tok, ltp, vol, ltt_sec):
+def _cndl_tick(tok, ltp, vol, ltt_sec):
     minute = int(ltt_sec // 60 * 60)
     if minute < START_MIN:
-        prev_cum[tok] = vol          # track cumulative volume, build no candle
+        _cndl_prev[tok] = vol          # track cumulative volume, build no candle
         return
-    c = cur.get(tok)
+    c = _cndl_cur.get(tok)
     if c is not None and minute > c[0]:
-        _close(tok, cur.pop(tok))
+        _cndl_close(tok, _cndl_cur.pop(tok))
         c = None
     if c is None:
-        cur[tok] = [minute, ltp, ltp, ltp, ltp, vol, vol]
+        _cndl_cur[tok] = [minute, ltp, ltp, ltp, ltp, vol, vol]
     elif minute == c[0]:
         if ltp > c[2]: c[2] = ltp
         if ltp < c[3]: c[3] = ltp
@@ -141,7 +141,7 @@ def on_tick(tok, ltp, vol, ltt_sec):
 
 COLS = ["token", "ltp", "vol", "ltt"]
 
-def on_update(update, is_replay):
+def _cndl_update(update, is_replay):
     latest = 0
     for ch in (update.added(COLS), update.modified(COLS)):
         if ch is None:
@@ -151,18 +151,22 @@ def on_update(update, is_replay):
                 continue
             tok = int(tok)
             key = (lt, int(vol))
-            if last_seen.get(tok) == key:        # no new trade
+            if _cndl_seen.get(tok) == key:        # no new trade
                 continue
-            sec = parse_ltt(lt)
-            if sec is None:                      # bad/empty string
+            try:
+                sec = _cndl_ltt(lt)
+                if sec is None:                      # bad/empty string
+                    continue
+                _cndl_seen[tok] = key
+                _cndl_tick(tok, float(ltp), int(vol), sec)
+            except Exception as e:                   # one bad tick must never kill the listener
+                print(f"[candles] tick skipped token={tok}: {e!r}")
                 continue
-            last_seen[tok] = key
-            on_tick(tok, float(ltp), int(vol), sec)
             if sec > latest:
                 latest = sec
     if latest:
-        flush(int((latest - 10) // 60 * 60))     # close finished minutes, 10s grace
+        _cndl_flush(int((latest - 10) // 60 * 60))     # close finished minutes, 10s grace
 
-h_data = listen(globals()[cfg["feed"]], on_update, do_replay=True)
+h_data = listen(globals()[cfg["feed"]], _cndl_update, do_replay=True)
 print(f"[candles] market={MARKET} ltt_tz={cfg['ltt_tz']} fmt={FMT_MIN} feed={cfg['feed']} "
-      f"tokens mapped={len(symbol_of)}")
+      f"tokens mapped={len(_cndl_sym)}")

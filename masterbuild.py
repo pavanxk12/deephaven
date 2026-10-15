@@ -8,15 +8,17 @@
 import os
 import glob
 import sqlite3
+import tempfile
 import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =============================== USER INPUT ===============================
-MARKET = "US"             # "NSE" or "US"
+MARKET = "NSE"             # "NSE" or "US"
 DB_DATE = None            # None = today in market tz (yyyymmdd) or e.g. "20261012"
 DB_PATH = None            # None = auto: <db_dir>/<yyyymmdd>.db3 (or *yyyymmdd*.db3); or full path
 TABLE = None              # None = auto-detect the contract table
+CACHE_DIR = None          # None = auto: first writable of [/tmp/fo_master_cache, ~/.cache/fo_master, db_dir]
 FORCE_REBUILD = False
 
 CONFIGS = {
@@ -51,9 +53,61 @@ if DB_PATH is None:
             raise FileNotFoundError(f"no .db3 for {_day} in {cfg['db_dir']}")
         DB_PATH = _hits[-1]
 
+
+def _pick_cache_dir():
+    """First writable directory from the candidates, else None (caching disabled)."""
+    cands = [CACHE_DIR] if CACHE_DIR else []
+    cands += [os.path.join(tempfile.gettempdir(), "fo_master_cache"),
+              os.path.expanduser("~/.cache/fo_master"),
+              cfg["db_dir"]]
+    for d in cands:
+        if not d:
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.access(d, os.W_OK):
+                return d
+        except OSError:
+            pass
+    return None
+
+
+_cache_dir = _pick_cache_dir()
 _st = os.stat(DB_PATH)
-MASTER_FILE = os.path.join(cfg["db_dir"],
-                           f"master_v3_{MARKET}_{_day}_{int(_st.st_mtime)}_{_st.st_size}.pkl")
+MASTER_FILE = (os.path.join(_cache_dir,
+                            f"master_v3_{MARKET}_{_day}_{int(_st.st_mtime)}_{_st.st_size}.pkl")
+               if _cache_dir else None)
+
+
+def save_cache(obj):
+    """Best-effort atomic pickle write; never raises."""
+    if not MASTER_FILE:
+        print("[master] no writable cache dir, skipping cache")
+        return
+    tmp = MASTER_FILE + ".tmp"
+    try:
+        pd.to_pickle(obj, tmp)
+        os.replace(tmp, MASTER_FILE)
+        print(f"[master] saved cache {MASTER_FILE}")
+    except OSError as e:
+        print(f"[master] cache not saved ({e})")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def load_cache():
+    """Return cached master or None (missing/corrupt/disabled)."""
+    if not MASTER_FILE or FORCE_REBUILD or not os.path.exists(MASTER_FILE):
+        return None
+    try:
+        m = pd.read_pickle(MASTER_FILE)
+        print(f"[master] loaded {MASTER_FILE}")
+        return m
+    except Exception as e:
+        print(f"[master] cache unreadable ({e}); rebuilding")
+        return None
 
 
 def parse_expiry(s):
@@ -81,10 +135,9 @@ def build_symbol_map(m):
     return sym
 
 
-if os.path.exists(MASTER_FILE) and not FORCE_REBUILD:
-    master = pd.read_pickle(MASTER_FILE)
-    print(f"[master] loaded {MASTER_FILE}")
-else:
+master = load_cache()
+
+if master is None:
     con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     try:
         tbl = TABLE
@@ -147,8 +200,8 @@ else:
 
     master = {"chain": chain, "opt": opt.reset_index(drop=True), "futs": futs, "eqs": eqs}
     master["symbol_of"] = build_symbol_map(master)
-    pd.to_pickle(master, MASTER_FILE)
-    print(f"[master] built from {DB_PATH} (table '{tbl}') and saved {MASTER_FILE}")
+    print(f"[master] built from {DB_PATH} (table '{tbl}')")
+    save_cache(master)
 
 print(f"[master] {len(master['chain'])} chain rows, {len(master['opt'])} option contracts, "
       f"{len(master['futs'])} futures, {len(master['eqs'])} equities, "

@@ -7,7 +7,7 @@ from deephaven.time import to_j_instant, to_j_zdt
 
 # ===========================================================================
 # OPERATOR CONSOLE: summary + message window + order book + net positions, ONE script, ONE dashboard.
-# ONE overall time filter (top-right of Summary) drives EVERY panel.
+# ONE overall time filter and ONE user id filter (both top-right of Summary) drive EVERY panel.
 #
 # Needs in your session before running:
 #   master          from build_master.py        (master["symbol_of"]: token -> symbol)
@@ -27,6 +27,7 @@ PRICE_DIV = 100.0                      # NSE prices arrive in paise
 IST = ZoneInfo("Asia/Kolkata")
 TRADE_TIME = "activity_time"           # orders_trade column with the fill time, epoch seconds
 ORDER_TIME = "last_modified"           # order book column with the order's last update time, epoch seconds
+PF_PER_USER = 10000                    # PF = user id * 10000 + portfolio number (31147 = user 3, portfolio 1147), so a user owns PF 30000-39999
 
 LOGO_PATH = "/data/fo_market_data/logo.png"           # picture shown top-left of the console (png / jpg / svg); no file = nothing shown
 LOGO_HEIGHT = "72px"                   # keep the file small (under ~100 KB): it is sent to the browser with the page
@@ -44,6 +45,11 @@ def load_logo():
 
 
 LOGO_SRC = load_logo()
+
+def user_cond(pf_col, u):
+    """Query condition: the PFs of user u. No division, so integer maths cannot surprise."""
+    return f"{pf_col} >= {u * PF_PER_USER} && {pf_col} < {(u + 1) * PF_PER_USER}"
+
 
 C_SEQ, C_TS, C_PF, C_TEXT = "KafkaOffset", "KafkaTimestamp", "PF", "Payload"   # strategy_events columns
 
@@ -237,7 +243,7 @@ def summary_window(net_tbl, book_tbl, filter_ctl=None):
 
     body = [tiles]
     if filter_ctl is not None or LOGO_SRC:
-        # thin row above the tiles: logo on the left, time filter button on the right
+        # thin row above the tiles: logo on the left, user id + time filter buttons on the right
         logo = ui.html.img(src=LOGO_SRC, style={"height": LOGO_HEIGHT, "display": "block"}) if LOGO_SRC else ui.html.div()
         body.insert(0, ui.flex(logo, filter_ctl if filter_ctl is not None else ui.html.div(),
                                justify_content="space-between", align_items="center",
@@ -773,21 +779,82 @@ def time_picker():
 
 
 # ===========================================================================
+# USER ID FILTER: sits next to the time filter. Empty = all users. The user id is the first digits of the PF (PF // 10000).
+# ===========================================================================
+if "USER_FILTER" not in globals():
+    USER_FILTER = {"v": None}                               # user id (int), None = all users
+
+
+@ui.component
+def user_picker():
+    draft, set_draft = ui.use_state("")
+    note, set_note = ui.use_state("")
+    cur, set_cur = ui.use_state(USER_FILTER["v"])
+    opened, set_opened = ui.use_state(False)
+
+    def put(u):
+        USER_FILTER["v"] = u
+        set_cur(u)
+
+    def apply_now():
+        text = draft.strip()
+        if text == "":
+            put(None)
+        elif text.lstrip("-").isdigit():
+            put(int(text))
+        else:
+            set_note("User id must be a number")
+            return
+        set_note("")
+        set_opened(False)
+
+    def clear_btn():
+        set_draft("")
+        set_note("")
+        put(None)
+        set_opened(False)
+
+    dlg = ui.dialog(
+        ui.heading("User id"),
+        ui.content(
+            ui.flex(
+                ui.text_field(label="User id, empty = all users", value=draft, on_change=set_draft, auto_focus=True),
+                ui.text(note or "Filters everything: Summary, Messages, Order book and Net positions (user id = first digits of the PF)."),
+                direction="column", gap="size-150",
+            ),
+        ),
+        ui.button_group(
+            ui.button("Clear", variant="secondary", on_press=clear_btn),
+            ui.button("Apply", variant="accent", on_press=apply_now),
+        ),
+    )
+    btn = ui.action_button(
+        f"{'User ' + str(cur) if cur is not None else 'All users'}",              # plain text: an emoji outside the BMP breaks the Java -> Python hand-over
+        UNSAFE_style={"fontWeight": "700", "color": BLUE, "borderColor": BLUE} if cur is not None else {},
+    )
+    return ui.dialog_trigger(btn, dlg, is_open=opened, on_open_change=set_opened)
+
+
+# ===========================================================================
 # ONE DASHBOARD: summary (with time filter) + controls, messages left, order book + net positions right
 # ===========================================================================
 @ui.component
 def console():
     applied, set_applied = ui.use_state(TIME_WINDOW["v"])    # (from, to) epoch seconds, set by the time picker
+    user, set_user = ui.use_state(USER_FILTER["v"])          # user id or None, set by the user picker
 
-    def follow_window():                                     # look at it every second, redraw only when it changed
+    def follow_window():                                     # look at both every second, redraw only when one changed
         stop = threading.Event()
 
         def loop():
-            last = TIME_WINDOW["v"]
+            last, last_user = TIME_WINDOW["v"], USER_FILTER["v"]
             while not stop.wait(1):
                 if TIME_WINDOW["v"] != last:
                     last = TIME_WINDOW["v"]
                     set_applied(last)
+                if USER_FILTER["v"] != last_user:
+                    last_user = USER_FILTER["v"]
+                    set_user(last_user)
 
         threading.Thread(target=loop, daemon=True).start()
         return stop.set
@@ -796,26 +863,30 @@ def console():
     a, b = applied
 
     def trade_tbl():
-        conds = ([f"{TRADE_TIME} >= {a}"] if a is not None else []) + ([f"{TRADE_TIME} <= {b}"] if b is not None else [])
+        conds = ([f"{TRADE_TIME} >= {a}"] if a is not None else []) + ([f"{TRADE_TIME} <= {b}"] if b is not None else []) + (
+            [user_cond("PF", user)] if user is not None else [])
         return make_net(orders_trade.where(conds)) if conds else net_positions_table
 
     def msg_tbl():
         conds = ([f"Ts >= epochSecondsToInstant({a}L)"] if a is not None else []) + (
             [f"Ts <= epochSecondsToInstant({b}L)"] if b is not None else [])
+        if user is not None:
+            conds = conds + [user_cond("Pf", user)]
         return messages.where(conds) if conds else messages
 
     def book_tbl_fn():
-        conds = ([f"{ORDER_TIME} >= {a}"] if a is not None else []) + ([f"{ORDER_TIME} <= {b}"] if b is not None else [])
+        conds = ([f"{ORDER_TIME} >= {a}"] if a is not None else []) + ([f"{ORDER_TIME} <= {b}"] if b is not None else []) + (
+            [user_cond("PF", user)] if user is not None else [])
         return make_order_book(conds) if conds else order_book_table
 
-    net_tbl = ui.use_memo(trade_tbl, [a, b])
-    msgs = ui.use_memo(msg_tbl, [a, b])
-    book_tbl = ui.use_memo(book_tbl_fn, [a, b])
+    net_tbl = ui.use_memo(trade_tbl, [a, b, user])
+    msgs = ui.use_memo(msg_tbl, [a, b, user])
+    book_tbl = ui.use_memo(book_tbl_fn, [a, b, user])
 
     return ui.dashboard(
         ui.column(
             ui.row(
-                ui.column(summary_window(net_tbl, book_tbl, time_picker()), width=72),
+                ui.column(summary_window(net_tbl, book_tbl, ui.flex(user_picker(), time_picker(), gap="size-100", align_items="center")), width=72),
                 ui.column(control_panel(), width=28),
                 height=26,                                   # slightly taller: the filter row needs ~30px
             ),
