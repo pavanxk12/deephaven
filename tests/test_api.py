@@ -7,7 +7,7 @@ from algo.core import app as app_module
 from algo.core.app import App
 from algo.core.config import NSE, Paths
 from algo.core.plugin import Plugin
-from algo.data.indicators import EMA, RSI, Indicators, resolve_timeframe
+from algo.data.indicators import EMA, RSI, Indicators, group_by_bar, resolve_timeframe
 
 
 @pytest.fixture
@@ -93,14 +93,44 @@ def test_indicators_need_candles_and_say_which_function_to_call(monkeypatch):
 
 
 def test_indicator_bar_size_must_be_a_multiple_of_the_candle_size():
-    assert resolve_timeframe(None, 30) == 30
-    assert resolve_timeframe("5min", 30) == 300 and resolve_timeframe("1min", 60) == 60
+    assert resolve_timeframe(None, 30, 30) == 30
+    assert resolve_timeframe("5min", 30, 30) == 300 and resolve_timeframe("1min", 60, 60) == 60
+    assert resolve_timeframe(None, 300, 60) == 300                      # falls back to the set default
     with pytest.raises(ValueError, match="whole multiple"):
-        resolve_timeframe("30s", 60)
+        resolve_timeframe("30s", 60, 60)
     with pytest.raises(ValueError):
-        resolve_timeframe("90s", 30)
+        resolve_timeframe("90s", 30, 30)
     with pytest.raises(ValueError, match="whole multiple"):
-        resolve_timeframe("2min", 300)
+        resolve_timeframe("2min", 300, 300)
+
+
+def test_each_indicator_can_have_its_own_bar_size(session, no_build):
+    ns, app = session
+    ns["indicators"](ns["EMA"](9), ns["EMA"](9, "5min"), ns["RSI"](5, "15 MIN"))
+    assert app["indicators"].columns() == ["EMA_9", "EMA_9_5min", "RSI_5_15min"]
+    with pytest.raises(ValueError):
+        ns["EMA"](9, "7x")
+    with pytest.raises(ValueError):
+        ns["EMA"](9, 5)
+
+
+def test_grouping_by_bar_size_puts_the_finest_first():
+    e1, e5, r5, r15 = EMA(9), EMA(9, "5min"), RSI(5, "5min"), RSI(5, "15min")
+    g = group_by_bar([r15, e5, e1, r5], default_seconds=60, candle_seconds=60)
+    assert list(g) == [60, 300, 900] and g[300] == [e5, r5] and g[60] == [e1]
+    assert group_by_bar([e1], 300, 60) == {300: [e1]}                   # the set default applies to EMA(9)
+    assert group_by_bar([], 60, 60) == {60: []}                         # Pct only
+    with pytest.raises(ValueError):
+        group_by_bar([EMA(9, "30s")], 60, 60)                           # finer than the candles
+
+
+def test_helper_columns_do_not_clash_between_bar_sizes():
+    a, b = EMA(9), EMA(9, "5min")
+    assert a.final().split("=")[0].strip() == "EMA_9" and b.final().split("=")[0].strip() == "EMA_9_5min"
+    assert "EMA_9_5min_raw" in b.final() and "EMA_9_5min_raw" not in a.final()
+    r, q = RSI(5), RSI(5, "5min")
+    assert "AvgG_RSI_5_5min" in q.final() and "AvgG_RSI_5_5min" not in r.final()
+    assert "NULL_LONG" in r.final()
 
 
 # ---- the other starters -----------------------------------------------------------------------------

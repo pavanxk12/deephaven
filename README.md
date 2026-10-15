@@ -41,8 +41,11 @@ straddle_start(0)                     # nearest option expiry only; 1 = two near
 
 * `EMA(9)`, `RSI(5)` only describe an indicator; `indicators(...)` starts the computation and each call adds to the
   running set. The result is the table **`indicator_values`** (the name `indicators` is the function).
-  `indicators()` lists the set, `indicators_remove("EMA_6")` drops one, `indicators(..., timeframe="5min")` rolls the
-  candles up to larger bars (a whole multiple of the candle size).
+  `indicators()` lists the set, `indicators_remove("EMA_6")` drops one.
+* **Bar size per indicator:** `EMA(9)` runs on the candles as they are, `EMA(9, "5min")` on 5-minute bars rolled up from
+  them (column `EMA_9_5min`), `RSI(14, "15min")` on 15-minute bars. A size must be a whole multiple of the candle size.
+  The table has one row per bar of the finest size in use; a coarser indicator shows the value of the bar that row falls
+  in (still forming, or final once closed). `indicators(..., timeframe="5min")` sets the default for those that name none.
 * `candles_start("5min")` again restarts the candles on the new size (the table starts empty). Indicators, the
   straddle and the strategy follow the new table by themselves.
 * `straddle_start(n)`: expiries are counted over everything listed, weeklies included. Each expiry uses the future that

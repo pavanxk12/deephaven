@@ -66,15 +66,16 @@ def candles_stop() -> None:
 def indicators(*specs, timeframe: str | None = None) -> None:
     """Start computing indicators, e.g. indicators(EMA(9), RSI(5)). Calling it again adds to what is already running:
         indicators(EMA(9), RSI(5))   then   indicators(EMA(6))   ->   EMA_9, RSI_5 and EMA_6 are all computed.
-    The result is the table `indicator_values`. They run on the candles as they are; `timeframe="5min"` rolls the candles
-    up to larger bars first (a whole multiple of the candle size) and applies to the whole set.
+    The result is the table `indicator_values`.
+    Bar size: each indicator can have its own, EMA(9, "5min") -> column EMA_9_5min, on 5-minute bars rolled up from the
+    candles (a whole multiple of the candle size). `timeframe="5min"` here is the default for the ones that name none.
     With no arguments it lists what is computed."""
     app = _app()
     plugin = app.get("indicators")
     if plugin is None:
         _run(Indicators(specs, timeframe))
     elif not specs and timeframe is None:
-        print("computing:", ", ".join(plugin.columns()) or "(Pct only)", "on", plugin.describe().split(":")[0])
+        print("computing:", ", ".join(plugin.columns()) or "(Pct only)", f"[{plugin.describe().split(':')[0]}]")
     else:
         plugin.add(*specs, timeframe=timeframe)
 
