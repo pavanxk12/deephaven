@@ -42,6 +42,21 @@ straddle_start(0)                     # nearest option expiry only; 1 = two near
 * `EMA(9)`, `RSI(5)` only describe an indicator; `indicators(...)` starts the computation and each call adds to the
   running set. The result is the table **`indicator_values`** (the name `indicators` is the function).
   `indicators()` lists the set, `indicators_remove("EMA_6")` drops one.
+* **Indicators, one column each:**
+
+  | call | column | notes |
+  |---|---|---|
+  | `SMA(20)` | `SMA_20` | average of the last 20 closes |
+  | `EMA(9)` | `EMA_9` | exponential, alpha 2/(n+1) |
+  | `RSI(14)` | `RSI_14` | RSI x 100, Wilder |
+  | `MACD(12, 26)` | `MACD_12_26` | EMA(12) - EMA(26) |
+  | `MACD_SIGNAL(12, 26, 9)` | `MACD_SIGNAL_12_26_9` | EMA(9) of the MACD line |
+  | `MACD_HIST(12, 26, 9)` | `MACD_HIST_12_26_9` | MACD line - signal |
+  | `ATR(14)` | `ATR_14` | Wilder smoothing of the true range (uses high, low, previous close) |
+
+  Prices come out in the unit of `Close` (paise for NSE), as whole numbers. An indicator is blank (RSI, ATR, MACD) or a
+  partial average (SMA, EMA) until it has enough bars. For several MACD lines, ask for each:
+  `indicators(MACD(), MACD_SIGNAL(), MACD_HIST())`.
 * **Bar size per indicator:** `EMA(9)` runs on the candles as they are, `EMA(9, "5min")` on 5-minute bars rolled up from
   them (column `EMA_9_5min`), `RSI(14, "15min")` on 15-minute bars. A size must be a whole multiple of the candle size.
   The table has one row per bar of the finest size in use; a coarser indicator shows the value of the bar that row falls

@@ -1,8 +1,13 @@
 """One `indicator_values` table computed from `candles` with Deephaven's incremental `update_by`.
 
-Columns: Minute (start of the bar), Symbol, token, Pct, then one int64 column per indicator:
-    RSI_<n>  RSI x 100 (Wilder smoothing)        EMA_<n>  EMA of the close, same unit as Close
-Pct = percent change from the first bar seen for the token, x 100 (+1.25% -> 125).
+Columns: Minute (start of the bar), Symbol, token, Pct, then int64 columns per indicator:
+    SMA_<n>   simple average of the last n closes          EMA_<n>   exponential average of the close
+    RSI_<n>   RSI x 100 (Wilder smoothing)                 ATR_<n>   average true range (Wilder smoothing)
+    MACD_<f>_<s>  MACD line     MACD_SIGNAL_<f>_<s>_<g>  its signal line     MACD_HIST_<f>_<s>_<g>  line - signal
+Every indicator makes exactly one column.
+Prices come out in the same unit as Close (paise for NSE). Pct = percent change from the first bar seen for the token,
+x 100 (+1.25% -> 125). Smoothed averages start from the first bar, as the EMA does; each is blank or a partial average
+until it has enough bars (see the class docs).
 
 Every indicator can have its own bar size: EMA(9) runs on the table's default bars, EMA(9, "5min") on 5-minute bars and
 is called EMA_9_5min. Bars are rolled up from the candles, so a size must be a whole multiple of the candle size.
@@ -25,8 +30,8 @@ def decay_ticks(alpha: float) -> float:
 
 
 class Indicator:
-    """One output column. Subclasses set `base` ("EMA_9") and add `update_by` operations and a final expression."""
-    needs_delta = False            # True: the bar table provides Gain / Loss (price change split in two)
+    """One output column. Subclasses set `base` ("EMA_9") and describe the calculation as `steps()`."""
+    needs_delta = False            # True: the bar table provides D (price change)
     base = ""                      # column name without the bar size
 
     def __init__(self, timeframe: str | None = None):
@@ -37,6 +42,11 @@ class Indicator:
     def column(self) -> str:
         return self.base + (f"_{self.timeframe}" if self.timeframe else "")
 
+    def steps(self) -> list[tuple[str, list]]:
+        """The calculation as ordered steps: ("ops", [update_by operations]) or ("update", ["Col = expr", ...]).
+        Step i of every indicator runs together, so a step may only use what earlier steps produced."""
+        return [("ops", self.ops())]
+
     def ops(self) -> list:
         """`update_by` operations (EMA / smoothing) producing this indicator's helper columns."""
         raise NotImplementedError
@@ -44,6 +54,24 @@ class Indicator:
     def final(self) -> str:
         """Query-language expression `Name = ...` for the output column (int64)."""
         raise NotImplementedError
+
+
+class SMA(Indicator):
+    """Simple average of the last n closes. With fewer than n bars it is the average of the bars there are."""
+
+    def __init__(self, n: int, timeframe: str | None = None):
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise ValueError("SMA length must be a whole number >= 1")
+        super().__init__(timeframe)
+        self.n = n
+        self.base = f"SMA_{n}"
+
+    def ops(self) -> list:
+        from deephaven import updateby as uby
+        return [uby.rolling_avg_tick(cols=[f"{self.column}_raw = Px"], rev_ticks=self.n)]
+
+    def final(self) -> str:
+        return f"{self.column} = Math.round({self.column}_raw)"
 
 
 class EMA(Indicator):
@@ -87,8 +115,101 @@ class RSI(Indicator):
                 f"(AvgL_{c} == 0 ? (AvgG_{c} > 0 ? 100.0 : 50.0) : 100.0 - 100.0 / (1.0 + AvgG_{c} / AvgL_{c})))")
 
 
+class _MACD(Indicator):
+    """Shared by the three MACD lines. Line = EMA(fast) - EMA(slow); signal = EMA(signal) of the line; hist = line - signal."""
+    kind = ""
+
+    def __init__(self, fast: int, slow: int, signal: int | None, timeframe: str | None):
+        names = (("fast", fast), ("slow", slow)) + ((("signal", signal),) if signal is not None else ())
+        for name, v in names:
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ValueError(f"MACD {name} must be a whole number >= 1")
+        if fast >= slow:
+            raise ValueError("MACD fast must be shorter than slow")
+        super().__init__(timeframe)
+        self.fast, self.slow, self.signal = fast, slow, signal
+        tail = f"_{signal}" if signal is not None else ""
+        self.base = f"{self.kind}_{fast}_{slow}{tail}"
+
+    def _fast_slow(self) -> list:
+        from deephaven import updateby as uby
+        c = self.column
+        return [uby.ema_tick(decay_ticks(2.0 / (self.fast + 1)), [f"{c}_f = Px"]),
+                uby.ema_tick(decay_ticks(2.0 / (self.slow + 1)), [f"{c}_s = Px"])]
+
+    def steps(self) -> list[tuple[str, list]]:
+        if self.signal is None:
+            return [("ops", self._fast_slow())]
+        from deephaven import updateby as uby
+        c = self.column
+        return [("ops", self._fast_slow()),
+                ("update", [f"{c}_m = {c}_f - {c}_s"]),
+                ("ops", [uby.ema_tick(decay_ticks(2.0 / (self.signal + 1)), [f"{c}_g = {c}_m"])])]
+
+
+class MACD(_MACD):
+    """MACD line = EMA(fast) - EMA(slow). Blank until `slow` bars."""
+    kind = "MACD"
+
+    def __init__(self, fast: int = 12, slow: int = 26, timeframe: str | None = None):
+        super().__init__(fast, slow, None, timeframe)
+
+    def final(self) -> str:
+        c = self.column
+        return f"{c} = Cnt < {self.slow} ? NULL_LONG : Math.round({c}_f - {c}_s)"
+
+
+class MACD_SIGNAL(_MACD):
+    """The MACD signal line: EMA(signal) of the MACD line. Blank until `slow + signal - 1` bars."""
+    kind = "MACD_SIGNAL"
+
+    def __init__(self, fast: int = 12, slow: int = 26, signal: int = 9, timeframe: str | None = None):
+        super().__init__(fast, slow, signal, timeframe)
+
+    def final(self) -> str:
+        c = self.column
+        return f"{c} = Cnt < {self.slow + self.signal - 1} ? NULL_LONG : Math.round({c}_g)"
+
+
+class MACD_HIST(_MACD):
+    """The MACD histogram: MACD line - signal line. Blank until `slow + signal - 1` bars."""
+    kind = "MACD_HIST"
+
+    def __init__(self, fast: int = 12, slow: int = 26, signal: int = 9, timeframe: str | None = None):
+        super().__init__(fast, slow, signal, timeframe)
+
+    def final(self) -> str:
+        c = self.column
+        return f"{c} = Cnt < {self.slow + self.signal - 1} ? NULL_LONG : Math.round({c}_m - {c}_g)"
+
+
+class ATR(Indicator):
+    """Average true range: Wilder smoothing (alpha 1/n) of max(high-low, |high-prev close|, |low-prev close|).
+    The first bar's true range is high-low. Blank until n bars."""
+    needs_delta = True            # previous close = Px - D
+
+    def __init__(self, n: int = 14, timeframe: str | None = None):
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise ValueError("ATR length must be a whole number >= 1")
+        super().__init__(timeframe)
+        self.n = n
+        self.base = f"ATR_{n}"
+
+    def steps(self) -> list[tuple[str, list]]:
+        from deephaven import updateby as uby
+        c = self.column
+        tr = (f"{c}_tr = isNull(D) ? Hi - Lo : "
+              f"Math.max(Hi - Lo, Math.max(Math.abs(Hi - (Px - D)), Math.abs(Lo - (Px - D))))")
+        return [("update", [tr]),
+                ("ops", [uby.ema_tick(decay_ticks(1.0 / self.n), [f"{c}_atr = {c}_tr"])])]
+
+    def final(self) -> str:
+        return f"{self.column} = Cnt < {self.n} ? NULL_LONG : Math.round({self.column}_atr)"
+
+
 # Every indicator listed here is also exposed as a function in the session by `algo.install` (EMA(9), RSI(14), ...).
-LIBRARY: dict[str, type] = {"EMA": EMA, "RSI": RSI}
+LIBRARY: dict[str, type] = {"SMA": SMA, "EMA": EMA, "RSI": RSI, "MACD": MACD, "MACD_SIGNAL": MACD_SIGNAL,
+                            "MACD_HIST": MACD_HIST, "ATR": ATR}
 
 
 # =================================================================================================
@@ -122,13 +243,16 @@ def group_by_bar(indicators, default_seconds: int, candle_seconds: int) -> dict[
 # the query
 # =================================================================================================
 def _bars(candles, bar_seconds: int, candle_seconds: int):
-    """Minute (bar start), Symbol, token, Px (close), Op (open), One: the candles, or rolled up into larger bars."""
+    """Minute (bar start), Symbol, token, Px (close), Op (open), Hi, Lo, One: the candles, or rolled up into larger bars."""
+    cols = ["Minute", "Symbol", "token", "Px = Close * 1.0", "Op = Open * 1.0", "Hi = High * 1.0", "Lo = Low * 1.0", "One = 1"]
     if bar_seconds == candle_seconds:
-        return candles.view(["Minute", "Symbol", "token", "Px = Close * 1.0", "Op = Open * 1.0", "One = 1"])
+        return candles.view(cols)
     from deephaven import agg
-    return (candles.view([f"Minute = lowerBin(Minute, {bar_seconds} * SECOND)", "Symbol", "token", "Open", "Close"])
-            .agg_by([agg.first("Open"), agg.last("Close")], by=["Minute", "Symbol", "token"])
-            .view(["Minute", "Symbol", "token", "Px = Close * 1.0", "Op = Open * 1.0", "One = 1"]))
+    return (candles.view([f"Minute = lowerBin(Minute, {bar_seconds} * SECOND)", "Symbol", "token",
+                          "Open", "High", "Low", "Close"])
+            .agg_by([agg.first("Open"), agg.max_("High"), agg.min_("Low"), agg.last("Close")],
+                    by=["Minute", "Symbol", "token"])
+            .view(cols))
 
 
 def _compute(bars, indicators, with_pct: bool):
@@ -136,7 +260,7 @@ def _compute(bars, indicators, with_pct: bool):
     from deephaven import updateby as uby
     need_delta = any(i.needs_delta for i in indicators)
 
-    # bar count + running price sum per token (+ price change for RSI)
+    # bar count + running price sum per token (+ price change for RSI / ATR)
     first = [uby.cum_sum(["Cnt = One", "PxSum = Px"])]
     if need_delta:
         first.append(uby.delta(["D = Px"]))
@@ -145,18 +269,25 @@ def _compute(bars, indicators, with_pct: bool):
     helpers = []
     if with_pct:
         helpers.append("OpenFirst = Cnt == 1 ? Op : NULL_DOUBLE")
-    if need_delta:
+    if any(i.base.startswith("RSI") for i in indicators):
         helpers += ["Gain = isNull(D) ? NULL_DOUBLE : Math.max(D, 0.0)",
                     "Loss = isNull(D) ? NULL_DOUBLE : Math.max(-D, 0.0)"]
     if helpers:
         t = t.update(helpers)
 
-    # day-open carry-forward and every smoothing operation in one pass
-    ops = [uby.forward_fill(["DayOpen = OpenFirst"])] if with_pct else []
-    for ind in indicators:
-        ops += ind.ops()
-    if ops:
-        t = t.update_by(ops, by="token")
+    # the indicators' steps, run together step by step; the day-open carry-forward rides along in step 0
+    plans = [ind.steps() for ind in indicators]
+    for k in range(max([len(p) for p in plans] + [1 if with_pct else 0])):
+        ops = [uby.forward_fill(["DayOpen = OpenFirst"])] if (with_pct and k == 0) else []
+        updates = []
+        for plan in plans:
+            if k < len(plan):
+                kind, payload = plan[k]
+                (ops if kind == "ops" else updates).extend(payload)
+        if updates:
+            t = t.update(updates)
+        if ops:
+            t = t.update_by(ops, by="token")
 
     out = ["Minute", "Symbol", "token"]
     if with_pct:
@@ -253,7 +384,7 @@ class Indicators(Plugin):
         table = build_indicator_table(self.app.table("candles"), candle_s, default_s, self.indicators)
         self.app.publish("indicators", table, ns_name=self.TABLE_VAR)
         self.default_seconds = default_s
-        self.log.info("`%s`: Pct%s (default bars %s)", self.TABLE_VAR, "".join(", " + i.column for i in self.indicators),
+        self.log.info("`%s`: Pct%s (default bars %s)", self.TABLE_VAR, "".join(", " + c for c in self.columns()),
                       format_timeframe(default_s))
 
     def columns(self) -> list[str]:
@@ -261,4 +392,4 @@ class Indicators(Plugin):
 
     def describe(self) -> str:
         d = format_timeframe(getattr(self, "default_seconds", 0) or 60)
-        return f"default bars {d}: Pct" + "".join(", " + i.column for i in self.indicators)
+        return f"default bars {d}: Pct" + "".join(", " + c for c in self.columns())
