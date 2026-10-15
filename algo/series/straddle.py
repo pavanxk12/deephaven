@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 
 from algo.core import log
+from algo.core.nulls import NULL_LONG
 from algo.core.plugin import Plugin
 
 _log = log.get("straddle")
@@ -213,8 +214,8 @@ class Straddle(Plugin):
         app.publish("straddle_series", self._writer.table)
 
         self._scale = mk.price_div
+        self.listen(app.table("candles"), self._on_candles, replay=False)        # live prices first, as before the backfill
         self._backfill(app.table("candles"))
-        self.listen(app.table("candles"), self._on_candles, replay=False)
         self.spawn(self._loop)
         self.log.info("backfilled %d rows, now live: `straddle_series`", self.rows)
 
@@ -223,7 +224,6 @@ class Straddle(Plugin):
 
     # ---- inputs ------------------------------------------------------------------------------
     def _on_candles(self, update, is_replay) -> None:
-        from deephaven.constants import NULL_LONG
         ch = update.added(["token", "Close"])
         if ch is None:
             return
@@ -234,7 +234,6 @@ class Straddle(Plugin):
                 self.engine.set_price(tok, float(close) / self._scale, now_ts)
 
     def _backfill(self, candles) -> None:
-        from deephaven.constants import NULL_LONG
         from deephaven.pandas import to_pandas
 
         mk, eng = self.app.market, self.engine

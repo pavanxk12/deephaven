@@ -1,7 +1,7 @@
 import pandas as pd
 
 from algo.core.config import NSE
-from algo.data.master import MasterData, classify, normalise, parse_expiry
+from algo.data.master import MasterData, normalise, parse_expiry
 from tests.conftest import raw_contracts, secs
 
 

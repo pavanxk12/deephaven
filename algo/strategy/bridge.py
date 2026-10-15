@@ -43,8 +43,11 @@ class Bridge(Plugin):
     name = "bridge"
     requires = ("book",)
 
-    def __init__(self, cfg: BridgeConfig = BridgeConfig(), transport_factory: Callable[[], Transport] | None = None):
-        super().__init__()
+    def __init__(self, cfg: BridgeConfig = BridgeConfig(), transport_factory: Callable[[], Transport] | None = None,
+                 name: str = "bridge", book: str = "book"):
+        super().__init__(name)
+        self.requires = (book,)
+        self.book_name = book
         self.cfg = cfg
         self._transport_factory = transport_factory       # tests inject a fake transport
         self.transport: Transport | None = None
@@ -61,7 +64,7 @@ class Bridge(Plugin):
     def start(self) -> None:
         from deephaven import DynamicTableWriter, dtypes as dht
 
-        self.book = self.app["book"].state
+        self.book = self.app[self.book_name].state
         shared = self.app.shared
         if "cmd_writer" not in shared:                    # audit table survives restarts of this plugin
             w = DynamicTableWriter({"PF": dht.int64, "Cmd": dht.string, "Payload": dht.string, "ReplyId": dht.string})

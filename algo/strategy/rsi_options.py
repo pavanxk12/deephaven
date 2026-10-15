@@ -13,6 +13,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from algo.core.nulls import NULL_LONG
 from algo.core.plugin import Plugin
 from algo.strategy.config import RsiOptionsConfig
 from algo.strategy.picker import OptionPicker
@@ -35,23 +36,7 @@ class RsiOptions(Plugin):
         app, cfg = self.app, self.cfg
         for w in cfg.warnings():
             self.log.warning(w)
-        self.master, self.market = app.master, app.market
-        self.book = app[cfg.book].state
-        self.bridge = app[cfg.bridge]
-        self.today = pd.Timestamp(datetime.now(self.market.zone).date())
-
-        self.inst = self._universe()
-        self.tokens = list(self.inst)
-        self.basket_of = {t: i.basket for t, i in self.inst.items()}
-        self.book.track(self.tokens)
-
-        self.ltp: dict[int, float] = {}                       # token (futures AND options) -> last Close, raw
-        self.zones = {t: None for t in self.tokens}           # RSI zone
-        self.rsis = {t: None for t in self.tokens}            # last RSI x 100
-        self.pcts = {t: None for t in self.tokens}            # last Pct-from-open x 100
-        self.off_seen: dict[int, str] = {}                    # leg already logged as "would BUY" while sending is off
-        self.picker = OptionPicker(self.master, cfg, self.market.price_div, self.opt_price)
-
+        self._setup(app.master, app.market, app[cfg.book].state, app[cfg.bridge], app.paths.market_data)
         self._seed()
         self._unregister = [self.bridge.on_enable(self._on_enable), self.bridge.on_halt(self._on_halt)]
         self._h_px = self.listen(app.table("candles"), self._on_price)
@@ -68,6 +53,24 @@ class RsiOptions(Plugin):
                     self.log.info("%s already in %s at start, activating", self.inst[t].name, self.zones[t])
                     self.on_signal(t, self.zones[t])
 
+    def _setup(self, master, market, book, bridge, data_dir: str) -> None:
+        """All state, no Deephaven: what the signal logic needs."""
+        cfg = self.cfg
+        self.master, self.market, self.book, self.bridge = master, market, book, bridge
+        self.today = pd.Timestamp(datetime.now(market.zone).date())
+
+        self.inst = self._universe(data_dir)
+        self.tokens = list(self.inst)
+        self.basket_of = {t: i.basket for t, i in self.inst.items()}
+        self.book.track(self.tokens)
+
+        self.ltp: dict[int, float] = {}                       # token (futures AND options) -> last Close, raw
+        self.zones = {t: None for t in self.tokens}           # RSI zone
+        self.rsis = {t: None for t in self.tokens}            # last RSI x 100
+        self.pcts = {t: None for t in self.tokens}            # last Pct-from-open x 100
+        self.off_seen: dict[int, str] = {}                    # leg already logged as "would BUY" while sending is off
+        self.picker = OptionPicker(self.master, cfg, self.market.price_div, self.opt_price)
+
     def on_stop(self) -> None:
         for undo in getattr(self, "_unregister", []):
             undo()
@@ -77,13 +80,13 @@ class RsiOptions(Plugin):
         return (f"{len(self.inst)} instruments, RSI >{self.cfg.rsi_high} PUT / <{self.cfg.rsi_low} CALL, "
                 f"{sum(1 for t in self.tokens if self.book.live.get(t))} live")
 
-    def _universe(self) -> dict[int, Instrument]:
+    def _universe(self, data_dir: str) -> dict[int, Instrument]:
         cfg = self.cfg
         if cfg.universe == "single":
             inst = resolve_single(cfg.underlying, self.master, self.today)
             self.log.info("signal source: %s (token %s)", next(iter(inst.values())).name, next(iter(inst)))
             return inst
-        path = f"{self.app.paths.market_data}/{cfg.stocks_file}"
+        path = f"{data_dir}/{cfg.stocks_file}"
         with open(path) as f:
             inst = resolve_stocks(f.read(), self.master)
         sizes: dict[str, int] = {}
@@ -99,7 +102,6 @@ class RsiOptions(Plugin):
         """Prices, RSI zones and Pct from history; sends nothing."""
         if not self.tokens:
             return
-        from deephaven.constants import NULL_LONG
         from deephaven.pandas import to_pandas
         flt = f"token in {', '.join(map(str, self.tokens))}"
         cfg = self.cfg
@@ -232,7 +234,6 @@ class RsiOptions(Plugin):
 
     # ---- listeners ------------------------------------------------------------------------------
     def _on_price(self, update, is_replay) -> None:
-        from deephaven.constants import NULL_LONG
         ch = update.added(["token", "Close"])
         if ch is None:
             return
@@ -241,7 +242,6 @@ class RsiOptions(Plugin):
                 self.ltp[int(tok)] = float(close)              # futures AND options (options are needed for sizing)
 
     def _on_indicators(self, update, is_replay) -> None:
-        from deephaven.constants import NULL_LONG
         cfg = self.cfg
         cols = ["token", cfg.rsi_col, cfg.pct_col]
         parts = [d for d in (update.added(cols), update.modified(cols)) if d is not None]

@@ -132,8 +132,8 @@ def test_operator_actions_when_sending(tmp_path):
     book.track([10, 20])
     p1, p2 = book.create(10), book.create(20)
     b.pause_all()
-    for _ in range(100):
-        if len(fake.sent) >= 2:
+    for _ in range(200):
+        if book.paused == {p1, p2}:
             break
         time.sleep(0.01)
     assert {s for s, _, _ in fake.sent} == {f"cmd.hft.{p1}", f"cmd.hft.{p2}"} and book.paused == {p1, p2}

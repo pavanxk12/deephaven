@@ -23,8 +23,15 @@ from algo.strategy.bridge import Bridge
 from algo.strategy.config import BridgeConfig, RsiOptionsConfig
 from algo.strategy.rsi_options import RsiOptions
 
+def __getattr__(name):                      # the console needs deephaven.ui, so it is imported on first use
+    if name in ("Console", "ConsoleConfig"):
+        from algo import ui
+        return getattr(ui, name)
+    raise AttributeError(f"module 'algo' has no attribute {name!r}")
+
+
 __all__ = [
     "App", "MissingDependency", "connect", "current", "reload", "MARKETS", "NSE", "US", "Market", "Paths", "Plugin",
     "Master", "Candles", "Indicators", "Indicator", "RSI", "EMA", "Eod", "History", "Straddle", "StraddleConfig",
-    "Book", "Bridge", "BridgeConfig", "RsiOptions", "RsiOptionsConfig",
+    "Book", "Bridge", "BridgeConfig", "RsiOptions", "RsiOptionsConfig", "Console", "ConsoleConfig",
 ]
