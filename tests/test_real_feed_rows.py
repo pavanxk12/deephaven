@@ -31,10 +31,10 @@ def test_every_real_ltt_parses_and_precedes_its_kafka_message(token, ltt, kafka)
     assert 0 <= arrived - sec <= 3600            # a trade is never after the message that carries it
 
 
-def test_the_wrong_zone_would_put_the_trades_in_the_future():
-    wrong = LttParser(US.ltt_fmt, IST)           # reading the text as IST
-    arrived = datetime.fromisoformat(ROWS[2][2]).replace(tzinfo=IST).timestamp()
-    assert wrong(ROWS[2][1]) - arrived > 3600 * 5
+def test_the_wrong_zone_would_make_a_one_second_old_trade_look_5_hours_old():
+    wrong = LttParser(US.ltt_fmt, IST)           # reading the text as IST instead of UTC
+    arrived = datetime.fromisoformat(ROWS[2][2]).replace(tzinfo=IST).timestamp()      # token 3: a 1-second-old trade
+    assert arrived - wrong(ROWS[2][1]) > 3600 * 5
 
 
 def test_the_trade_times_are_new_york_pre_market():
