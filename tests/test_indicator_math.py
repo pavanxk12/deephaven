@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from algo.data.indicators import ATR, EMA, MACD, MACD_HIST, MACD_SIGNAL, RSI, SMA, build_indicator_table
+from algo.data.indicators import ATR, EMA, MACD, MACD_HIST, MACD_SIGNAL, PCT, RSI, SMA, build_indicator_table
 from tests import pandas_engine as eng
 
 pytestmark = pytest.mark.usefixtures("fake_engine")
@@ -105,7 +105,7 @@ def tok_df(df, tok):
     return df[df.token == tok].reset_index(drop=True)
 
 
-ALL = lambda: [SMA(5), EMA(9), RSI(14), MACD(12, 26), MACD_SIGNAL(12, 26, 9), MACD_HIST(12, 26, 9), ATR(14)]  # noqa: E731
+ALL = lambda: [SMA(5), EMA(9), RSI(14), MACD(12, 26), MACD_SIGNAL(12, 26, 9), MACD_HIST(12, 26, 9), ATR(14), PCT()]  # noqa: E731
 
 
 # ---- every indicator, several tokens, all at once ------------------------------------------------------
@@ -128,13 +128,13 @@ def test_all_indicators_on_several_tokens_match_the_reference():
         same(of(out, tok, "MACD_SIGNAL_12_26_9"), s)
         same(of(out, tok, "MACD_HIST_12_26_9"), h)
         same(of(out, tok, "ATR_14"), ref_atr(t, 14))
-        same(of(out, tok, "Pct"), 100 * (c - t.Open.iloc[0]) / t.Open.iloc[0])
+        same(of(out, tok, "PCT_OPEN"), 100 * (c - t.Open.iloc[0]) / t.Open.iloc[0])
 
 
 def test_the_output_is_one_row_per_candle_with_the_expected_columns():
     df = candles({1: 30, 2: 30})
     out = run(df, [EMA(9), RSI(5)])
-    assert list(out.columns) == ["Minute", "Symbol", "token", "Pct", "EMA_9", "RSI_5"]
+    assert list(out.columns) == ["Minute", "Symbol", "token", "EMA_9", "RSI_5"]          # no hidden extra column
     assert list(out.Symbol) == [f"SYM{t}" for t in df.token]
 
 
@@ -152,7 +152,7 @@ def test_adding_an_indicator_does_not_change_the_others():
     df = candles({1: 70, 2: 70})
     few = run(df, [EMA(9), RSI(14)])
     many = run(df, ALL() + [EMA(21)])
-    for col in ("EMA_9", "RSI_14", "Pct"):
+    for col in ("EMA_9", "RSI_14"):
         same(few[col].to_numpy(dtype=float), many[col].to_numpy(dtype=float))
 
 
@@ -186,11 +186,12 @@ def test_rsi_and_atr_converge_to_the_textbook_wilder_values():
 def test_a_flat_price_gives_rsi_50_and_zero_atr_without_dividing_by_zero():
     df = candles({1: 40})
     df["Open"] = df["High"] = df["Low"] = df["Close"] = 123.45
-    out = run(df, [RSI(14), ATR(14), EMA(9), SMA(5), MACD(), MACD_SIGNAL(), MACD_HIST()])
+    out = run(df, [RSI(14), ATR(14), EMA(9), SMA(5), MACD(), MACD_SIGNAL(), MACD_HIST(), PCT(), PCT("5min"), PCT(3)])
     assert set(of(out, 1, "RSI_14")[14:]) == {50.0} and np.isnan(of(out, 1, "RSI_14")[:14]).all()
     assert set(of(out, 1, "ATR_14")[13:]) == {0.0}
     same(of(out, 1, "EMA_9"), np.full(40, 123.45))
-    assert set(of(out, 1, "Pct")) == {0.0}
+    assert set(of(out, 1, "PCT_OPEN")) == {0.0}
+    assert set(of(out, 1, "PCT_5min")[5:]) == {0.0} and set(of(out, 1, "PCT_3")[3:]) == {0.0}
     assert np.nanmax(np.abs(of(out, 1, "MACD_12_26")[25:])) < 1e-9
 
 
@@ -208,7 +209,7 @@ def test_a_single_bar_and_very_short_histories_are_blank_not_wrong():
     assert len(out) == 4
     assert np.isnan(of(out, 1, "RSI_14")).all() and np.isnan(of(out, 1, "MACD_12_26")).all() and np.isnan(of(out, 1, "ATR_14")).all()
     assert of(out, 1, "SMA_5")[0] == df.Close.iloc[0] and of(out, 1, "EMA_9")[0] == df.Close.iloc[0]
-    assert of(out, 1, "Pct")[0] == pytest.approx(100 * (df.Close.iloc[0] - df.Open.iloc[0]) / df.Open.iloc[0])
+    assert of(out, 1, "PCT_OPEN")[0] == pytest.approx(100 * (df.Close.iloc[0] - df.Open.iloc[0]) / df.Open.iloc[0])
 
 
 def test_an_instrument_with_a_gap_still_lines_up():
@@ -223,7 +224,7 @@ def test_an_instrument_with_a_gap_still_lines_up():
 def test_coarser_bars_are_rolled_up_and_joined_onto_the_finer_rows():
     df = candles({1: 61, 2: 47})
     out = run(df, [EMA(9), EMA(9, "5min"), RSI(5, "15min")])
-    assert list(out.columns) == ["Minute", "Symbol", "token", "Pct", "EMA_9", "EMA_9_5min", "RSI_5_15min"]
+    assert list(out.columns) == ["Minute", "Symbol", "token", "EMA_9", "EMA_9_5min", "RSI_5_15min"]
     assert len(out) == len(df)
     for tok in (1, 2):
         t = tok_df(df, tok)
@@ -263,3 +264,82 @@ def test_only_the_requested_tokens_are_computed():
     full = run(df, [EMA(9), RSI(5)])
     for tok in (2, 3):
         same(of(out, tok, "EMA_9"), of(full, tok, "EMA_9"))
+
+
+# ---- PCT: from the open, by time, by bars ----------------------------------------------------------------------
+def ref_pct_time(t, seconds):
+    """Percent change against the close of the latest bar that started at or before (this bar - seconds); NaN when none."""
+    minutes, close = t.Minute.to_numpy(), t.Close.to_numpy(float)
+    out = np.full(len(t), np.nan)
+    for i, m in enumerate(minutes):
+        j = np.searchsorted(minutes, m - seconds, side="right") - 1
+        if j >= 0:
+            out[i] = 100 * (close[i] - close[j]) / close[j]
+    return out
+
+
+def ref_pct_bars(c, n):
+    c = c.to_numpy(float)
+    out = np.full(len(c), np.nan)
+    out[n:] = 100 * (c[n:] - c[:-n]) / c[:-n]
+    return out
+
+
+def test_pct_from_open_by_time_and_by_bars_on_several_tokens():
+    df = candles({1: 90, 2: 60, 3: 75}, start_by_token={1: 0, 2: 300, 3: 1200})
+    out = run(df, [PCT(), PCT("5min"), PCT("10min"), PCT("90s"), PCT(5), PCT(1)])
+    assert list(out.columns) == ["Minute", "Symbol", "token", "PCT_OPEN", "PCT_5min", "PCT_10min", "PCT_90s", "PCT_5", "PCT_1"]
+    for tok in (1, 2, 3):
+        t = tok_df(df, tok)
+        same(of(out, tok, "PCT_OPEN"), 100 * (t.Close - t.Open.iloc[0]) / t.Open.iloc[0])
+        same(of(out, tok, "PCT_5min"), ref_pct_time(t, 300))
+        same(of(out, tok, "PCT_10min"), ref_pct_time(t, 600))
+        same(of(out, tok, "PCT_90s"), ref_pct_time(t, 90))
+        same(of(out, tok, "PCT_5"), ref_pct_bars(t.Close, 5))
+        same(of(out, tok, "PCT_1"), ref_pct_bars(t.Close, 1))
+
+
+def test_pct_is_blank_until_there_is_a_bar_that_old():
+    df = candles({1: 30})
+    out = run(df, [PCT("5min"), PCT(5)])
+    assert np.isnan(of(out, 1, "PCT_5min")[:5]).all() and not np.isnan(of(out, 1, "PCT_5min")[5:]).any()
+    assert np.isnan(of(out, 1, "PCT_5")[:5]).all() and not np.isnan(of(out, 1, "PCT_5")[5:]).any()
+
+
+def test_a_time_lookback_and_a_bar_lookback_differ_when_bars_are_missing():
+    """Ten missing minutes: 5 bars back is further than 5 minutes back; the time version uses the last bar it really had."""
+    df = candles({1: 60})
+    df = df.drop(index=range(30, 40)).reset_index(drop=True)
+    out = run(df, [PCT("5min"), PCT(5)])
+    same(of(out, 1, "PCT_5min"), ref_pct_time(df, 300))
+    same(of(out, 1, "PCT_5"), ref_pct_bars(df.Close, 5))
+    assert not np.allclose(of(out, 1, "PCT_5min")[30:34], of(out, 1, "PCT_5")[30:34])        # the four rows whose lookback crosses the gap
+    same(of(out, 1, "PCT_5min")[40:], of(out, 1, "PCT_5")[40:])                                # past the gap the two agree again
+
+
+def test_pct_does_not_change_the_other_columns_and_adds_nothing_unasked():
+    df = candles({1: 50, 2: 50})
+    without, with_pct = run(df, [EMA(9), RSI(5)]), run(df, [EMA(9), RSI(5), PCT("5min")])
+    for col in ("EMA_9", "RSI_5"):
+        same(without[col].to_numpy(dtype=float), with_pct[col].to_numpy(dtype=float))
+    assert "PCT_5min" not in without.columns and "Pct" not in without.columns
+
+
+def test_pct_on_coarser_bars_uses_the_coarser_closes():
+    df = candles({1: 90})
+    out = run(df, [EMA(9), PCT("10min", timeframe="5min"), PCT(2, timeframe="5min")])
+    t = df.copy()
+    t["bin"] = (t.Minute // 300) * 300
+    bars = t.groupby("bin").agg(Minute=("bin", "first"), Close=("Close", "last")).reset_index(drop=True)
+    for col, ref in (("PCT_10min_5min", ref_pct_time(bars, 600)), ("PCT_2_5min", ref_pct_bars(bars.Close, 2))):
+        series = pd.Series(ref, index=((t.groupby("bin").size().index)))
+        same(of(out, 1, col), t.bin.map(series).to_numpy(dtype=float))
+
+
+def test_pct_from_open_can_run_next_to_a_pct_by_time_for_two_markets_worth_of_tokens():
+    df = candles({10: 40, 20: 40, 30: 40, 40: 40})
+    out = run(df, [PCT(), PCT("5min"), EMA(5)])
+    for tok in (10, 20, 30, 40):
+        alone = run(df[df.token == tok], [PCT(), PCT("5min"), EMA(5)])
+        for col in ("PCT_OPEN", "PCT_5min", "EMA_5"):
+            same(of(out, tok, col), alone[col].to_numpy(dtype=float))

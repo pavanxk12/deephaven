@@ -298,13 +298,13 @@ ignored; a bad argument (`indicators(9)`, an impossible bar size) raises and **l
  update_by(by = token)    cum_sum  Cnt = One  (+ PxSum = Px only if EMA)              (engine, one pass per token)
                           delta    D = Px     only if RSI / ATR
    v
- update_view              Gain, Loss (RSI), OpenFirst (Pct)                            (lazy formulas, no memory per row)
+ update_view              Gain, Loss (RSI)                                             (lazy formulas, no memory per row)
    v
  steps, step by step      step i of EVERY indicator runs together:
                             "ops"    -> one update_by  (ema_tick, rolling_avg_tick, forward_fill)
                             "update" -> one update_view (ATR true range, MACD line)
    v
- view                     Minute, Symbol, token, Pct, then each indicator's final expression
+ view                     Minute, Symbol, token, then each indicator's final expression
    v
  (coarser groups)         each coarser bar size is computed the same way, then natural_join on (token, bar start)
 ```
@@ -323,11 +323,13 @@ mix. All the operations are in a single `update_by` per step, so adding an indic
 | `MACD_SIGNAL(f, s, g)` | `MACD_SIGNAL_f_s_g` | EMA(g) of the MACD line | s + g - 1 bars |
 | `MACD_HIST(f, s, g)` | `MACD_HIST_f_s_g` | MACD line - signal | s + g - 1 bars |
 | `ATR(n)` | `ATR_n` | Wilder smoothing of true range = max(H-L, abs(H-prevC), abs(L-prevC)); first bar H-L; prevC = Px - D | n bars |
-| (always) | `Pct` | 100 * (Px - first bar's Open) / first bar's Open, per token | the first bar |
+| `PCT()` | `PCT_OPEN` | 100 * (Px - first bar's Open) / first bar's Open, per token | the first bar |
+| `PCT("5min")` | `PCT_5min` | 100 * (Px - close of the latest bar at or before now - 5 min) / that close; as-of join on (token, time) | a bar that old exists |
+| `PCT(5)` | `PCT_5` | 100 * (Px - close 5 bars earlier) / that close; join on (token, bar number - 5) | 5 bars |
 
 `ema_tick(decay_ticks)`: the engine weight per bar is `exp(-1/decay_ticks)`, and `decay_ticks(alpha) = -1/ln(1-alpha)`
 makes that equal `1 - alpha`. A blank is a Deephaven null. Every division has a guard or a denominator that cannot be zero
-(`Cnt >= 1`, `AvgL == 0` test, `DayOpen == 0` test).
+(`Cnt >= 1`, `AvgL == 0` test, and a zero or missing reference price gives a blank in PCT).
 
 ### Stored versus lazy (this is the memory)
 
@@ -336,7 +338,7 @@ makes that equal `1 - alpha`. A blank is a Deephaven null. Every division has a 
 | `Cnt` | stored (long) | always |
 | `PxSum` | stored (double) | an EMA is computed |
 | `D` | stored (double) | RSI or ATR is computed |
-| `DayOpen` | stored (double) | `Pct` (always, in the finest group) |
+| `DayOpen_PCT_OPEN` | stored (double) | `PCT()` |
 | each indicator's smoothing state (`EMA_9_raw`, `AvgG_`, `AvgL_`, `MACD_.._f/_s/_g`, `ATR_.._atr`, `SMA_.._raw`) | stored (double) | that indicator |
 | `Px Op One Hi Lo`, `Gain Loss`, `OpenFirst`, ATR true range, MACD line, every final expression | **lazy** (`view` / `update_view`) | evaluated when read, no memory per row |
 | `Symbol` | reference into the small symbol table | |
@@ -371,7 +373,7 @@ makes that equal `1 - alpha`. A blank is a Deephaven null. Every division has a 
 ```
 
 The old tables are released when their listeners are stopped (nothing else holds them). Restarting candles loses the candles
-built so far; indicators then restart from the first new bar (EMA/SMA start as running averages, RSI/ATR/MACD blank, `Pct`
+built so far; indicators then restart from the first new bar (EMA/SMA start as running averages, RSI/ATR/MACD blank, `PCT_OPEN`
 measured from the first new bar). Run `eod_save()` first if you need the day (see the README, "End of day").
 
 ---

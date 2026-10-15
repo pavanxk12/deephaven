@@ -8,6 +8,7 @@ underlying such as NIFTY with the strike taken from the synthetic future.
 """
 from __future__ import annotations
 
+import itertools
 import time
 from datetime import datetime
 
@@ -36,10 +37,10 @@ class RsiOptions(Plugin):
         app, cfg = self.app, self.cfg
         for w in cfg.warnings():
             self.log.warning(w)
-        missing = [c for c in (cfg.rsi_col, cfg.pct_col) if c not in app.table("indicators").column_names]
+        missing = [c for c in self._columns() if c not in app.table("indicators").column_names]
         if missing:
-            raise RuntimeError(f"indicator_values has no {missing}: call indicators(RSI(...)) first "
-                               f"(this strategy reads {cfg.rsi_col}; change rsi_col to use another)")
+            raise RuntimeError(f"indicator_values has no {missing}: call indicators(RSI(...)" + (", PCT()" if cfg.pct_col in missing else "")
+                               + f") first (this strategy reads {', '.join(self._columns())}; change rsi_col / pct_col to use others)")
         self._setup(app.master, app.market, app[cfg.book].state, app[cfg.bridge], app.paths.market_data)
         self._seed()
         self._unregister = [self.bridge.on_enable(self._on_enable), self.bridge.on_halt(self._on_halt)]
@@ -113,6 +114,10 @@ class RsiOptions(Plugin):
             self.log.warning("no stock from %s could be resolved, nothing will be tracked", path)
         return inst
 
+    def _columns(self) -> list[str]:
+        """The indicator columns this strategy reads: the RSI, and the percent-from-open only when the basket filter is on."""
+        return [self.cfg.rsi_col] + ([self.cfg.pct_col] if self.cfg.mid_filter else [])
+
     # ---- state seeding ------------------------------------------------------------------------
     def _seed(self) -> None:
         """Prices, RSI zones and Pct from history; sends nothing."""
@@ -129,9 +134,10 @@ class RsiOptions(Plugin):
         except Exception as e:
             self.log.warning("could not seed prices: %s", e)
         try:
-            h = to_pandas(self.app.table("indicators").where(flt).last_by("token").view(["token", cfg.rsi_col, cfg.pct_col]))
-            for t, rsi, pct in zip(h["token"], h[cfg.rsi_col], h[cfg.pct_col]):
-                if not is_null(pct):
+            h = to_pandas(self.app.table("indicators").where(flt).last_by("token").view(["token", *self._columns()]))
+            nothing = [None] * len(h)
+            for t, rsi, pct in zip(h["token"], h[cfg.rsi_col], h[cfg.pct_col] if cfg.mid_filter else nothing):
+                if cfg.mid_filter and not is_null(pct):
                     self.pcts[int(t)] = float(pct)
                 if is_null(rsi):
                     continue
@@ -264,16 +270,16 @@ class RsiOptions(Plugin):
 
     def _on_indicators(self, update, is_replay) -> None:
         cfg = self.cfg
-        cols = ["token", cfg.rsi_col, cfg.pct_col]
+        cols = ["token", *self._columns()]
         parts = [d for d in (update.added(cols), update.modified(cols)) if d is not None]
         if not parts:
             return
         for d in parts:
-            for tok, rsi, pct in zip(d["token"], d[cfg.rsi_col], d[cfg.pct_col]):
+            for tok, rsi, pct in zip(d["token"], d[cfg.rsi_col], d[cfg.pct_col] if cfg.mid_filter else itertools.repeat(None)):
                 tok = int(tok)
                 if tok not in self.inst:
                     continue
-                if not is_null(pct):
+                if cfg.mid_filter and not is_null(pct):
                     self.pcts[tok] = float(pct)
                 if is_null(rsi):
                     continue

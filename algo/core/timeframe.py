@@ -25,5 +25,21 @@ def parse_timeframe(value) -> int:
     return seconds
 
 
+MAX_LOOKBACK_SECONDS = 6 * 3600
+
+
+def parse_duration(value) -> int:
+    """A time span written with a unit: "90s", "5min", "2h" -> seconds. Unlike a bar size it need not line up with anything."""
+    if not isinstance(value, str):
+        raise ValueError(f"write the time span with a unit, e.g. \"5min\", \"90s\", \"2h\" (got {value!r})")
+    m = _PATTERN.match(value)
+    if not m or m.group(2).lower() not in _UNIT:
+        raise ValueError(f"cannot read time span {value!r}; use e.g. \"5min\", \"90s\", \"2h\"")
+    seconds = int(m.group(1)) * _UNIT[m.group(2).lower()]
+    if not 1 <= seconds <= MAX_LOOKBACK_SECONDS:
+        raise ValueError(f"time span {value!r} must be between 1 second and {MAX_LOOKBACK_SECONDS // 3600} hours")
+    return seconds
+
+
 def format_timeframe(seconds: int) -> str:
     return f"{seconds}s" if seconds % 60 else f"{seconds // 60}min"

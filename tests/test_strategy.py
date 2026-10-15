@@ -153,7 +153,10 @@ class Update:
         self.rows = rows
 
     def added(self, cols):
-        return {"token": [r[0] for r in self.rows], cols[1]: [r[1] for r in self.rows], cols[2]: [r[2] for r in self.rows]}
+        out = {"token": [r[0] for r in self.rows], cols[1]: [r[1] for r in self.rows]}
+        if len(cols) > 2:                                          # the percent column is only asked for when the basket filter is on
+            out[cols[2]] = [r[2] for r in self.rows]
+        return out
 
     def modified(self, cols):
         return None
@@ -165,7 +168,7 @@ def test_indicator_update_triggers_a_signal_once_per_zone_entry(master, tmp_path
     assert col == "RSI_9"
     s._on_indicators(Update([(RELIANCE_FUT, 70.0, 0.25)]), False)
     s._on_indicators(Update([(RELIANCE_FUT, 72.0, 0.3)]), False)        # still overbought: already running that leg
-    assert len(bridge.swaps) == 1 and s.pcts[RELIANCE_FUT] == 0.3
+    assert len(bridge.swaps) == 1
     s._on_indicators(Update([(RELIANCE_FUT, 50.0, 0.3)]), False)        # back to neutral: no new order
     assert len(bridge.swaps) == 1 and s.zones[RELIANCE_FUT] is None
 
@@ -215,3 +218,13 @@ def test_nifty_single_underlying_uses_the_synthetic_future(master, tmp_path):
     s.on_signal(nifty_fut, "OVERSOLD")
     (swap,) = bridge.swaps
     assert sym(s, swap["option"]) == "NIFTY 30JAN30 25100 CE" and swap["pf"] == 1555
+
+
+def test_the_percent_column_is_read_only_when_the_basket_filter_is_on(master, tmp_path):
+    s, _, bridge = build(master, tmp_path)
+    assert s._columns() == ["RSI_9"]                                       # filter off: no percent column needed
+    s._on_indicators(Update([(RELIANCE_FUT, 50.0)]), False)                 # a two-column update is fine
+    s.cfg = s.cfg.with_(mid_filter=True)
+    assert s._columns() == ["RSI_9", "PCT_OPEN"]
+    s._on_indicators(Update([(RELIANCE_FUT, 50.0, 0.3)]), False)
+    assert s.pcts[RELIANCE_FUT] == 0.3

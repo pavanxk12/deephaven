@@ -26,8 +26,8 @@ def _lower_bin(value, size):
     return value - value % size
 
 
-_NS = {"_max": max, "_abs": abs, "_isnull": _isnull, "_lower_bin": _lower_bin, "NAN": NAN}
-_FUNCS = {"Math.max": "_max", "Math.abs": "_abs", "isNull": "_isnull", "lowerBin": "_lower_bin"}
+_NS = {"_max": max, "_abs": abs, "_isnull": _isnull, "_lower_bin": _lower_bin, "_minus": lambda a, b: a - b, "NAN": NAN}
+_FUNCS = {"Math.max": "_max", "Math.abs": "_abs", "isNull": "_isnull", "lowerBin": "_lower_bin", "minus": "_minus"}
 _CONSTS = {"NULL_DOUBLE": "NAN", "NULL_LONG": "NAN", "SECOND": "1", "MINUTE": "60"}
 
 
@@ -222,6 +222,31 @@ class PT:
             hit = right.get(tuple(r[lk] for lk, _ in keys))
             for j in joins:
                 cols[j].append(hit[j] if hit is not None else NAN)
+        return PT(self.df.assign(**cols))
+
+    def aj(self, other, on, joins):
+        """As-of join: on = [exact keys..., "left >= right"]; each left row takes the right row with the greatest `right`
+        that is <= `left` among rows with equal exact keys (NaN when there is none)."""
+        on = [on] if isinstance(on, str) else list(on)
+        joins = [joins] if isinstance(joins, str) else list(joins)
+        exact = [(_spec(o)[0], _spec(o)[1] or _spec(o)[0]) for o in on[:-1]]
+        left_col, right_col = re.fullmatch(r"\s*(\w+)\s*>=\s*(\w+)\s*", on[-1]).groups()
+        out = [(_spec(j)[0], _spec(j)[1] or _spec(j)[0]) for j in joins]
+        by_key = {}
+        for r in other.df.to_dict("records"):
+            by_key.setdefault(tuple(r[rk] for _, rk in exact), []).append(r)
+        for rows in by_key.values():
+            rows.sort(key=lambda r: r[right_col])
+        cols = {name: [] for name, _ in out}
+        for r in self.df.to_dict("records"):
+            best = None
+            for cand in by_key.get(tuple(r[lk] for lk, _ in exact), []):
+                if cand[right_col] <= r[left_col]:
+                    best = cand
+                else:
+                    break
+            for name, src in out:
+                cols[name].append(best[src] if best is not None else NAN)
         return PT(self.df.assign(**cols))
 
     def where_in(self, other, col):

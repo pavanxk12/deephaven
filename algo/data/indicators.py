@@ -1,12 +1,13 @@
 """One `indicator_values` table computed from `candles` with Deephaven's incremental `update_by`.
 
-Columns: Minute (start of the bar), Symbol, token, Pct, then one double column per indicator:
+Columns: Minute (start of the bar), Symbol, token, then one double column per indicator you ask for:
     SMA_<n>   simple average of the last n closes          EMA_<n>   exponential average of the close
     RSI_<n>   RSI, 0 to 100 (Wilder smoothing)             ATR_<n>   average true range (Wilder smoothing)
     MACD_<f>_<s>  MACD line     MACD_SIGNAL_<f>_<s>_<g>  its signal line     MACD_HIST_<f>_<s>_<g>  line - signal
+    PCT_OPEN  percent change from the first bar's open;  PCT_5min  against the close 5 minutes earlier;  PCT_5  against 5 bars earlier
 Every indicator makes exactly one column.
-Prices come out in the unit of the candles (proper currency units). Pct = percent change from the first bar seen for
-the token (+1.25 = +1.25%). A blank is a Deephaven null, never a number. Smoothed averages start from the first bar, as the EMA does; each is blank or a partial average
+Prices come out in the unit of the candles (proper currency units); percentages are 1.25 = +1.25%. A blank is a
+Deephaven null, never a number. Smoothed averages start from the first bar, as the EMA does; each is blank or a partial average
 until it has enough bars (see the class docs).
 
 Every indicator can have its own bar size: EMA(9) runs on the table's default bars, EMA(9, "5min") on 5-minute bars and
@@ -21,7 +22,7 @@ from __future__ import annotations
 import math
 
 from algo.core.plugin import Plugin
-from algo.core.timeframe import format_timeframe, parse_timeframe
+from algo.core.timeframe import format_timeframe, parse_duration, parse_timeframe
 
 
 def decay_ticks(alpha: float) -> float:
@@ -46,8 +47,9 @@ class Indicator:
         return self.base + (f"_{self.timeframe}" if self.timeframe else "")
 
     def steps(self) -> list[tuple[str, list]]:
-        """The calculation as ordered steps: ("ops", [update_by operations]) or ("update", ["Col = expr", ...]).
-        Step i of every indicator runs together, so a step may only use what earlier steps produced."""
+        """The calculation as ordered steps: ("ops", [update_by operations]), ("update", ["Col = expr", ...]) or
+        ("join", fn(table, bars) -> table). Step i of every indicator runs together, so a step may only use what earlier
+        steps produced."""
         return [("ops", self.ops())]
 
     def ops(self) -> list:
@@ -213,9 +215,58 @@ class ATR(Indicator):
         return f"{self.column} = Cnt < {self.n} ? NULL_DOUBLE : {self.column}_atr"
 
 
+class PCT(Indicator):
+    """Percent change of the close (1.25 = +1.25%).
+
+        PCT()         from the first bar's open, per instrument          -> PCT_OPEN
+        PCT("5min")   against the close 5 minutes earlier (by time)      -> PCT_5min   (also "90s", "2h", up to 6 hours)
+        PCT(5)        against the close 5 bars earlier                    -> PCT_5
+
+    A time lookback uses the latest bar that started at or before (this bar - lookback), so an instrument that did not trade in
+    between is compared with the last price it really had; the resolution is the bar size. Blank until such a bar exists."""
+
+    def __init__(self, lookback=None, timeframe: str | None = None):
+        super().__init__(timeframe)
+        if lookback is None:
+            self.kind, self.n, self.base = "open", 0, "PCT_OPEN"
+        elif isinstance(lookback, bool):
+            raise ValueError('PCT lookback is a whole number of bars (PCT(5)) or a time span (PCT("5min")), or nothing for the open')
+        elif isinstance(lookback, int):
+            if lookback < 1:
+                raise ValueError("PCT lookback in bars must be 1 or more")
+            self.kind, self.n, self.base = "bars", lookback, f"PCT_{lookback}"
+        elif isinstance(lookback, str):
+            self.kind, self.n = "time", parse_duration(lookback)
+            self.base = f"PCT_{format_timeframe(self.n)}"
+        else:
+            raise ValueError(f"PCT lookback must be a number of bars or a time span like \"5min\", got {lookback!r}")
+
+    def steps(self) -> list[tuple[str, object]]:
+        from deephaven import updateby as uby
+        c = self.column
+        if self.kind == "open":
+            return [("update", [f"OpenFirst_{c} = Cnt == 1 ? Op : NULL_DOUBLE"]),
+                    ("ops", [uby.forward_fill([f"DayOpen_{c} = OpenFirst_{c}"])])]
+        if self.kind == "bars":
+            def join(t, bars):
+                ref = t.view(["token", "Cnt", f"PxAgo_{c} = Px"])
+                return t.natural_join(ref, on=["token", f"CntAgo_{c} = Cnt"], joins=[f"PxAgo_{c}"])
+            return [("update", [f"CntAgo_{c} = Cnt - {self.n}"]), ("join", join)]
+
+        def join(t, bars):                                        # as-of join: the latest bar at or before (Minute - lookback)
+            ref = bars.view(["token", "Minute", f"PxAgo_{c} = Px"])
+            return t.aj(ref, on=["token", f"Lag_{c} >= Minute"], joins=[f"PxAgo_{c}"])
+        return [("update", [f"Lag_{c} = minus(Minute, {self.n} * SECOND)"]), ("join", join)]
+
+    def final(self) -> str:
+        c = self.column
+        ref = f"DayOpen_{c}" if self.kind == "open" else f"PxAgo_{c}"
+        return f"{c} = (isNull({ref}) || {ref} == 0) ? NULL_DOUBLE : 100.0 * (Px - {ref}) / {ref}"
+
+
 # Every indicator listed here is also exposed as a function in the session by `algo.install` (EMA(9), RSI(14), ...).
 LIBRARY: dict[str, type] = {"SMA": SMA, "EMA": EMA, "RSI": RSI, "MACD": MACD, "MACD_SIGNAL": MACD_SIGNAL,
-                            "MACD_HIST": MACD_HIST, "ATR": ATR}
+                            "MACD_HIST": MACD_HIST, "ATR": ATR, "PCT": PCT}
 
 
 # =================================================================================================
@@ -264,9 +315,11 @@ def _bars(candles, bar_seconds: int, candle_seconds: int, hilo: bool = False):
             .view(cols))
 
 
-def _compute(bars, indicators, with_pct: bool):
-    """Add the indicator columns (and Pct) to a bar table."""
+def _compute(bars, indicators):
+    """Add the indicator columns to a bar table."""
     from deephaven import updateby as uby
+    if not indicators:
+        return bars.view(["Minute", "Symbol", "token"])
     need_delta = any(i.needs_delta for i in indicators)
 
     # bar count per token, plus only what some indicator uses: the running price sum (EMA), the price change (RSI, ATR)
@@ -277,33 +330,31 @@ def _compute(bars, indicators, with_pct: bool):
     t = bars.update_by(first, by="token")
 
     # plain formulas are lazy (update_view): they are evaluated when read and take no memory per row
-    helpers = []
-    if with_pct:
-        helpers.append("OpenFirst = Cnt == 1 ? Op : NULL_DOUBLE")
     if any(i.needs_gain_loss for i in indicators):
-        helpers += ["Gain = isNull(D) ? NULL_DOUBLE : Math.max(D, 0.0)",
-                    "Loss = isNull(D) ? NULL_DOUBLE : Math.max(-D, 0.0)"]
-    if helpers:
-        t = t.update_view(helpers)
+        t = t.update_view(["Gain = isNull(D) ? NULL_DOUBLE : Math.max(D, 0.0)",
+                           "Loss = isNull(D) ? NULL_DOUBLE : Math.max(-D, 0.0)"])
 
-    # the indicators' steps, run together step by step; the day-open carry-forward rides along in step 0
+    # the indicators' steps, run together step by step: formulas, then joins, then the smoothing operations
     plans = [ind.steps() for ind in indicators]
-    for k in range(max([len(p) for p in plans] + [1 if with_pct else 0])):
-        ops = [uby.forward_fill(["DayOpen = OpenFirst"])] if (with_pct and k == 0) else []
-        updates = []
+    for k in range(max(len(p) for p in plans)):
+        ops, updates, joins = [], [], []
         for plan in plans:
             if k < len(plan):
                 kind, payload = plan[k]
-                (ops if kind == "ops" else updates).extend(payload)
+                if kind == "ops":
+                    ops.extend(payload)
+                elif kind == "update":
+                    updates.extend(payload)
+                else:
+                    joins.append(payload)
         if updates:
             t = t.update_view(updates)
+        for join in joins:
+            t = join(t, bars)
         if ops:
             t = t.update_by(ops, by="token")
 
-    out = ["Minute", "Symbol", "token"]
-    if with_pct:
-        out.append("Pct = (isNull(DayOpen) || DayOpen == 0) ? NULL_DOUBLE : 100.0 * (Px - DayOpen) / DayOpen")
-    return t.view(out + [i.final() for i in indicators])
+    return t.view(["Minute", "Symbol", "token"] + [i.final() for i in indicators])
 
 
 def build_indicator_table(candles, candle_seconds: int, default_seconds: int, indicators, token_table=None):
@@ -313,20 +364,16 @@ def build_indicator_table(candles, candle_seconds: int, default_seconds: int, in
         candles = candles.where_in(token_table, "token")
     groups = group_by_bar(indicators, default_seconds, candle_seconds)
     (driver_s, driver_inds), *coarser = groups.items()
-    table = _compute(_bars(candles, driver_s, candle_seconds, any(i.needs_hilo for i in driver_inds)), driver_inds,
-                     with_pct=True)
+    table = _compute(_bars(candles, driver_s, candle_seconds, any(i.needs_hilo for i in driver_inds)), driver_inds)
     if not coarser:
         return table
-    bins = []
     for bar_s, inds in coarser:
         cols = [i.column for i in inds]
-        g = (_compute(_bars(candles, bar_s, candle_seconds, any(i.needs_hilo for i in inds)), inds, with_pct=False)
+        g = (_compute(_bars(candles, bar_s, candle_seconds, any(i.needs_hilo for i in inds)), inds)
              .view(["Minute", "token"] + cols))
-        bins.append(f"Bin_{bar_s}")
         table = (table.update_view(f"Bin_{bar_s} = lowerBin(Minute, {bar_s} * SECOND)")
                  .natural_join(g, on=["token", f"Bin_{bar_s} = Minute"], joins=cols))
-    names = ["Minute", "Symbol", "token", "Pct"] + [i.column for i in indicators]
-    return table.view(names)
+    return table.view(["Minute", "Symbol", "token"] + [i.column for i in indicators])
 
 
 class Indicators(Plugin):
@@ -414,7 +461,7 @@ class Indicators(Plugin):
         table = build_indicator_table(self.app.table("candles"), candle_s, default_s, self.indicators, token_table)
         self.app.publish("indicators", table, ns_name=self.TABLE_VAR)
         self.default_seconds = default_s
-        self.log.info("`%s`: Pct%s (default bars %s, %s)", self.TABLE_VAR, "".join(", " + c for c in self.columns()),
+        self.log.info("`%s`: %s (default bars %s, %s)", self.TABLE_VAR, ", ".join(self.columns()) or "no indicators",
                       format_timeframe(default_s),
                       "all instruments" if tokens is None else f"{len(tokens)} instruments")
 
@@ -423,4 +470,4 @@ class Indicators(Plugin):
 
     def describe(self) -> str:
         d = format_timeframe(getattr(self, "default_seconds", 0) or 60)
-        return f"default bars {d}: Pct" + "".join(", " + c for c in self.columns())
+        return f"default bars {d}: " + (", ".join(self.columns()) or "none")

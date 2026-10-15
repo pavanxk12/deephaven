@@ -10,7 +10,7 @@ algo/
                config.py (Market NSE/US, Paths)                    log.py   nulls.py
   data/        master.py     contract master from the dated .db3, cached      -> master
                candles.py    1-minute candles from the tick table             -> candles
-               indicators.py RSI / EMA / Pct via update_by                    -> indicators
+               indicators.py SMA / EMA / RSI / MACD / ATR / PCT via update_by                    -> indicators
                store.py      end-of-day save, history load
   series/      straddle.py   V / D straddle series                            -> straddle_series
   strategy/    book.py       portfolio numbers, caps, paused, allow (state files)
@@ -55,10 +55,17 @@ straddle_start(0)                     # nearest option expiry only; 1 = two near
   | `MACD_SIGNAL(12, 26, 9)` | `MACD_SIGNAL_12_26_9` | EMA(9) of the MACD line |
   | `MACD_HIST(12, 26, 9)` | `MACD_HIST_12_26_9` | MACD line - signal |
   | `ATR(14)` | `ATR_14` | Wilder smoothing of the true range (uses high, low, previous close) |
+  | `PCT()` | `PCT_OPEN` | percent change from the first bar's open |
+  | `PCT("5min")` | `PCT_5min` | percent change against the close 5 minutes earlier (any span from 1 s to 6 h: `"90s"`, `"10min"`, `"2h"`) |
+  | `PCT(5)` | `PCT_5` | percent change against the close 5 bars earlier |
 
   Prices come out in the unit of `Close` (paise for NSE), as whole numbers. An indicator is blank (RSI, ATR, MACD) or a
   partial average (SMA, EMA) until it has enough bars. For several MACD lines, ask for each:
   `indicators(MACD(), MACD_SIGNAL(), MACD_HIST())`.
+  `PCT` is opt-in like the others: nothing is added to the table unless you ask. A time lookback compares with the latest bar
+  that started at or before (this bar - lookback), so a quiet instrument is compared with the last price it really had; a bar
+  lookback counts bars. Both are blank until such a bar exists. The stock strategy reads `PCT_OPEN` for its basket ranking, so
+  run `indicators(PCT())` before it (only needed while `mid_filter` is on).
 * **Bar size per indicator:** `EMA(9)` runs on the candles as they are, `EMA(9, "5min")` on 5-minute bars rolled up from
   them (column `EMA_9_5min`), `RSI(14, "15min")` on 15-minute bars. A size must be a whole multiple of the candle size.
   The table has one row per bar of the finest size in use; a coarser indicator shows the value of the bar that row falls
@@ -86,7 +93,7 @@ anywhere downstream, so there is one place where the scale can be wrong. Volume 
   decimals on the way in (so 24567 x 0.01 is stored as 245.67, not 245.67000000000002); averages are not rounded.
 * Orders are the one place prices become integers again: sizes are floored/ceiled to the instrument's tick with a small
   nudge so the bridge's truncation (x100, int) lands on the tick.
-* RSI is 0 to 100, `Pct` is a percent (1.25 = +1.25%), a blank is a Deephaven null.
+* RSI is 0 to 100, `PCT_...` columns are percents (1.25 = +1.25%), a blank is a Deephaven null.
 * The code assumes `fo_market_data.ltp` is in the exchange's minor unit (NSE: paise). Set the multiplier to match the real feed.
 * Bad input is dropped, never stored: NaN, infinity, null, zero or negative prices, negative volume, unparseable times.
   Dropped rows are counted (`app.status()` shows how many).
@@ -195,8 +202,8 @@ All the numbers that sat in the USER INPUT blocks are fields of `RsiOptionsConfi
 
 * `RsiOptionsConfig.stocks()` still has `rsi_high = rsi_low = 50` and `reset_on_start = True` as in the old script.
   The plugin warns about the first at start and about cleared caps at the second.
-* `Pct` is measured from the first bar `candles` built (candles start at the next full minute after `Candles` starts),
-  so after a late start it is not the real day open.
+* `PCT()` (percent from the open) is measured from the first bar `candles` built (candles start at the next full minute
+  after `Candles` starts), so after a late start it is not the real day open.
 * US: checked against the 2026-10-14 contract file and a real feed export (tokens 1-8): strikes / ticks / equity prices use the
   file's `Divisor`, `ltt` is text `yyyy-mm-dd HH:MM:SS` in UTC. Not yet checked: the live option prices against their divisor
   (10000), and the US option tick (the file lists 0.0001; sizing refuses anything under 0.01). The straddle works for US

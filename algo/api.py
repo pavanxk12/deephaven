@@ -84,7 +84,7 @@ def indicators(*specs, timeframe: str | None = None, symbols=None, kind: str | N
     if plugin is None:
         _run(Indicators(specs, timeframe, symbols=symbols, kind=kind))
     elif not specs and timeframe is None and symbols is None and kind is None:
-        print("computing:", ", ".join(plugin.columns()) or "(Pct only)", f"[{plugin.describe().split(':')[0]}]")
+        print("computing:", ", ".join(plugin.columns()) or "(none)", f"[{plugin.describe().split(':')[0]}]")
     else:
         plugin.add(*specs, timeframe=timeframe, symbols=symbols, kind=kind)
 

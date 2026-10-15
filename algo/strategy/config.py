@@ -47,10 +47,10 @@ class RsiOptionsConfig:
 
     # ---- signal ----
     rsi_col: str = "RSI_9"
-    pct_col: str = "Pct"
+    pct_col: str = "PCT_OPEN"             # percent from the open, from indicators(PCT()); only read when mid_filter is on
     rsi_high: float = 50                   # RSI above this -> buy PUT
     rsi_low: float = 50                    # RSI below this -> buy CALL
-    mid_filter: bool = True                # trade only the middle 50% of each basket by Pct-from-open
+    mid_filter: bool = True                # trade only the middle 50% of each basket by percent-from-open (needs indicators(PCT()))
 
     # ---- option choice ----
     expiry_rule: str = "same_as_fut"       # "same_as_fut" (falls back to nearest) | "index" (expiry_index-th non-expired)

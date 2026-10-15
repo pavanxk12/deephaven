@@ -7,7 +7,7 @@ import types
 import pytest
 
 from algo.data import indicators as ind
-from algo.data.indicators import (ATR, EMA, MACD, MACD_HIST, MACD_SIGNAL, RSI, SMA, build_indicator_table,
+from algo.data.indicators import (PCT, ATR, EMA, MACD, MACD_HIST, MACD_SIGNAL, RSI, SMA, build_indicator_table,
                                   decay_ticks)
 
 
@@ -38,6 +38,9 @@ class Rec:
 
     def natural_join(self, other, on=None, joins=None):
         return self._next("natural_join", on, joins)
+
+    def aj(self, other, on=None, joins=None):
+        return self._next("aj", on, joins)
 
 
 @pytest.fixture
@@ -77,7 +80,7 @@ def test_bad_arguments_are_refused(make):
 
 
 def test_library_exposes_every_indicator_as_a_function():
-    assert list(ind.LIBRARY) == ["SMA", "EMA", "RSI", "MACD", "MACD_SIGNAL", "MACD_HIST", "ATR"]
+    assert list(ind.LIBRARY) == ["SMA", "EMA", "RSI", "MACD", "MACD_SIGNAL", "MACD_HIST", "ATR", "PCT"]
 
 
 def test_decay_ticks_reproduces_the_smoothing_factor():
@@ -135,8 +138,8 @@ def test_steps_run_in_order_across_indicators(fake_uby):
 
 def test_output_columns_are_one_per_indicator_in_order(fake_uby):
     view = run([SMA(3), MACD(3, 6), MACD_HIST(3, 6, 2)])[-1]
-    assert view[0] == "view" and view[1][:3] == ["Minute", "Symbol", "token"] and view[1][3].startswith("Pct = ")
-    assert [c.split(" =")[0] for c in view[1][4:]] == ["SMA_3", "MACD_3_6", "MACD_HIST_3_6_2"]
+    assert view[0] == "view" and view[1][:3] == ["Minute", "Symbol", "token"]
+    assert [c.split(" =")[0] for c in view[1][3:]] == ["SMA_3", "MACD_3_6", "MACD_HIST_3_6_2"]       # no hidden extra column
 
 
 def test_rsi_alone_adds_gain_and_loss(fake_uby):
@@ -156,7 +159,7 @@ def test_mixed_bar_sizes_join_the_coarser_group_on_the_bar_start(fake_uby):
     joins = [c for c in calls if c[0] == "natural_join"]
     assert [j[1] for j in joins] == [["token", "Bin_300 = Minute"], ["token", "Bin_900 = Minute"]]
     assert joins[0][2] == ["EMA_9_5min"] and joins[1][2] == ["RSI_5_15min"]
-    assert calls[-1][1] == ["Minute", "Symbol", "token", "Pct", "EMA_9", "EMA_9_5min", "RSI_5_15min"]
+    assert calls[-1][1] == ["Minute", "Symbol", "token", "EMA_9", "EMA_9_5min", "RSI_5_15min"]
 
 
 def test_a_table_does_not_carry_columns_no_indicator_uses(fake_uby):
@@ -174,3 +177,21 @@ def test_plain_formulas_are_lazy_so_they_take_no_memory_per_row(fake_uby):
     calls = run([RSI(5), ATR(5), MACD_SIGNAL(3, 6, 2)])
     assert "update" not in {c[0] for c in calls}                    # no stored update(): only update_view and update_by
     assert {"update_view", "update_by"} <= {c[0] for c in calls}
+
+
+def test_pct_is_built_from_the_right_pieces(fake_uby):
+    open_ = str(run([PCT()]))
+    assert "OpenFirst_PCT_OPEN" in open_ and "DayOpen_PCT_OPEN" in open_ and "aj" not in {c[0] for c in run([PCT()])}
+    timed = run([PCT("5min")])
+    assert "aj" in {c[0] for c in timed} and "Lag_PCT_5min = minus(Minute, 300 * SECOND)" in str(timed)
+    bars = run([PCT(5)])
+    assert "natural_join" in {c[0] for c in bars} and "CntAgo_PCT_5 = Cnt - 5" in str(bars)
+    assert "PxSum" not in str(timed) and "Gain" not in str(timed) and "delta" not in str(timed)       # nothing it does not use
+
+
+def test_pct_names_and_arguments():
+    assert [p.column for p in (PCT(), PCT("5min"), PCT("90s"), PCT("2h"), PCT(5), PCT("10 MIN", timeframe="5min"))] == \
+        ["PCT_OPEN", "PCT_5min", "PCT_90s", "PCT_120min", "PCT_5", "PCT_10min_5min"]
+    for bad in (0, -3, True, 2.5, "5", "five minutes", "0s", "7h", ["5min"]):
+        with pytest.raises(ValueError):
+            PCT(bad)
