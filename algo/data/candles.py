@@ -122,6 +122,7 @@ class Candles(Plugin):
 
     COLS = ["token", "ltp", "vol", "ltt"]
     GRACE_S = 10          # a minute is closed this many seconds after its end
+    SLOW_BATCH_MS = 250   # a feed batch that takes longer than this holds up every table in the update cycle: say so
 
     def __init__(self, timeframe: str = "1min", multiplier: float | None = None, *, symbols=None, kind: str | None = None,
                  build_from: int | None = None, decimals: int = 6):
@@ -142,6 +143,7 @@ class Candles(Plugin):
         self.build_from = build_from
         self.agg: CandleAggregator | None = None
         self.rows = 0
+        self.batches, self.last_ms, self.max_ms, self._last_slow_log = 0, 0.0, 0.0, 0.0
         self.tokens: np.ndarray | None = None
         self._scale_arr = np.empty(0)
         self._allowed: np.ndarray | None = None
@@ -189,7 +191,8 @@ class Candles(Plugin):
 
     def describe(self) -> str:
         scope = "all instruments" if self.tokens is None else f"{len(self.tokens)} instruments"
-        return f"{self.timeframe}, {scope}, {self.rows} candles, {self.skipped} bad ticks skipped"
+        return (f"{self.timeframe}, {scope}, {self.rows} candles, {self.skipped} bad ticks skipped, "
+                f"feed batch {self.last_ms:.1f} ms (max {self.max_ms:.1f}, {self.batches} batches)")
 
     def _build_lookups(self, max_token: int) -> None:
         """Dense arrays indexed by token: the scale of each contract and (when restricted) which tokens are wanted."""
@@ -266,6 +269,7 @@ class Candles(Plugin):
             return None
 
     def _on_update(self, update, is_replay) -> None:
+        started = time.perf_counter()
         agg, latest = self.agg, 0
         for ch in (update.added(self.COLS), update.modified(self.COLS)):
             if ch is None:
@@ -276,3 +280,16 @@ class Candles(Plugin):
                     latest = sec
         if latest:
             agg.flush(int((latest - self.GRACE_S) // self.bucket * self.bucket))
+        self._time_batch((time.perf_counter() - started) * 1000.0)
+
+    def _time_batch(self, ms: float) -> None:
+        """Keep the last / slowest batch time for `algo_status()`; warn (at most once a minute) when one is slow."""
+        self.batches += 1
+        self.last_ms = ms
+        if ms > self.max_ms:
+            self.max_ms = ms
+        if ms > self.SLOW_BATCH_MS and time.monotonic() - self._last_slow_log > 60:
+            self._last_slow_log = time.monotonic()
+            self.log.warning("a feed batch took %.0f ms (limit %d ms): it holds up every table in the update cycle. "
+                             "Narrow the instruments (symbols= / kind=) or move the candle loop to a vectorised / compiled version",
+                             ms, self.SLOW_BATCH_MS)

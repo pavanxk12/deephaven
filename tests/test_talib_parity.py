@@ -12,7 +12,7 @@ talib = pytest.importorskip("talib")
 
 from algo.data.indicators import ATR, EMA, MACD, MACD_HIST, MACD_SIGNAL, RSI, SMA  # noqa: E402
 from tests.test_indicator_math import candles, of, run, same, tok_df  # noqa: E402,F401
-from tests.test_indicator_math import fake_engine  # noqa: E402,F401
+from tests.test_indicator_math import fake_engine  # noqa: E402,F401  (used through pytestmark)
 
 pytestmark = pytest.mark.usefixtures("fake_engine")
 
@@ -27,7 +27,7 @@ def arrays(df, tok):
     return t.High.to_numpy(float), t.Low.to_numpy(float), t.Close.to_numpy(float)
 
 
-def test_sma_is_identical_once_the_window_is_full(data, fake_engine):
+def test_sma_is_identical_once_the_window_is_full(data):
     out = run(data, [SMA(20)])
     for tok in (1, 2):
         _, _, c = arrays(data, tok)
@@ -35,7 +35,7 @@ def test_sma_is_identical_once_the_window_is_full(data, fake_engine):
 
 
 @pytest.mark.parametrize("n", [5, 14, 50])
-def test_ema_agrees_after_the_seed_has_decayed(n, data, fake_engine):
+def test_ema_agrees_after_the_seed_has_decayed(n, data):
     out = run(data, [EMA(n)])
     for tok in (1, 2):
         _, _, c = arrays(data, tok)
@@ -43,7 +43,7 @@ def test_ema_agrees_after_the_seed_has_decayed(n, data, fake_engine):
 
 
 @pytest.mark.parametrize("n", [5, 14])
-def test_rsi_agrees_with_talib(n, data, fake_engine):
+def test_rsi_agrees_with_talib(n, data):
     out = run(data, [RSI(n)])
     for tok in (1, 2):
         _, _, c = arrays(data, tok)
@@ -51,14 +51,14 @@ def test_rsi_agrees_with_talib(n, data, fake_engine):
 
 
 @pytest.mark.parametrize("n", [5, 14])
-def test_atr_agrees_with_talib(n, data, fake_engine):
+def test_atr_agrees_with_talib(n, data):
     out = run(data, [ATR(n)])
     for tok in (1, 2):
         h, l, c = arrays(data, tok)
         same(of(out, tok, f"ATR_{n}")[-300:], talib.ATR(h, l, c, n)[-300:], tol=1e-7)
 
 
-def test_macd_line_signal_and_histogram_agree_with_talib(data, fake_engine):
+def test_macd_line_signal_and_histogram_agree_with_talib(data):
     out = run(data, [MACD(12, 26), MACD_SIGNAL(12, 26, 9), MACD_HIST(12, 26, 9)])
     for tok in (1, 2):
         _, _, c = arrays(data, tok)
@@ -68,7 +68,7 @@ def test_macd_line_signal_and_histogram_agree_with_talib(data, fake_engine):
         same(of(out, tok, "MACD_HIST_12_26_9")[-300:], hist[-300:], tol=1e-7)
 
 
-def test_the_early_bars_differ_only_by_the_seed(data, fake_engine):
+def test_the_early_bars_differ_only_by_the_seed(data):
     """Documented difference: the first bars of EMA / RSI differ from TA-Lib's SMA-seeded values, and the gap shrinks."""
     out = run(data, [EMA(14)])
     _, _, c = arrays(data, 1)
