@@ -1,10 +1,10 @@
 """One `indicators` table computed from `candles` with Deephaven's incremental `update_by`.
 
-Columns: Minute, Symbol, token, Pct, then one int64 column per indicator:
+Table `indicator_values` — columns: Minute, Symbol, token, Pct, then one int64 column per indicator:
     RSI_<n>  RSI x 100 (Wilder smoothing)        EMA_<n>  EMA of the close, same unit as Close
 Pct = percent change from the first bar seen for the token, x 100 (+1.25% -> 125).
 
-Indicators are computed on `timeframe` -minute bars rolled up from the 1-minute candles. To add an indicator, write
+Indicators run on the candles as they are, or on larger bars rolled up from them (a whole multiple of the candle size). To add an indicator, write
 an `Indicator` subclass (two small methods) and pass an instance to `Indicators([...])`.
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 
 from algo.core.plugin import Plugin
+from algo.core.timeframe import format_timeframe, parse_timeframe
 
 
 def decay_ticks(alpha: float) -> float:
@@ -81,19 +82,32 @@ class RSI(Indicator):
                 f"(AvgL_{n} == 0 ? (AvgG_{n} > 0 ? 100.0 : 50.0) : 100.0 - 100.0 / (1.0 + AvgG_{n} / AvgL_{n})))")
 
 
-DEFAULT = (RSI(9), EMA(9), EMA(18))
+# Every indicator listed here is also exposed as a function in the session by `algo.install` (EMA(9), RSI(14), ...).
+# To add one: write the class above and add it to this dict.
+LIBRARY: dict[str, type] = {"EMA": EMA, "RSI": RSI}
 
 
-def build_indicator_table(candles, timeframe: int, indicators):
+def resolve_timeframe(requested: str | None, candle_seconds: int) -> int:
+    """Seconds of the bars the indicators run on: the candle size by default, else a whole multiple of it."""
+    if requested is None:
+        return candle_seconds
+    seconds = parse_timeframe(requested)
+    if seconds < candle_seconds or seconds % candle_seconds:
+        raise ValueError(f"indicator bars of {requested} cannot be built from {format_timeframe(candle_seconds)} candles: "
+                         f"use a whole multiple of {format_timeframe(candle_seconds)}")
+    return seconds
+
+
+def build_indicator_table(candles, bar_seconds: int, candle_seconds: int, indicators):
     """candles table -> indicators table (pure Deephaven query; no side effects)."""
     from deephaven import agg
     from deephaven import updateby as uby
 
-    # 1) resample (skipped for 1-minute bars): Minute becomes the bucket start
-    if timeframe == 1:
+    # 1) resample (skipped when the bars are the candles): Minute becomes the bucket start
+    if bar_seconds == candle_seconds:
         t = candles.view(["Minute", "Symbol", "token", "Px = Close * 1.0", "Op = Open * 1.0", "One = 1"])
     else:
-        t = (candles.view([f"Minute = lowerBin(Minute, {timeframe} * MINUTE)", "Symbol", "token", "Open", "Close"])
+        t = (candles.view([f"Minute = lowerBin(Minute, {bar_seconds} * SECOND)", "Symbol", "token", "Open", "Close"])
              .agg_by([agg.first("Open"), agg.last("Close")], by=["Minute", "Symbol", "token"])
              .view(["Minute", "Symbol", "token", "Px = Close * 1.0", "Op = Open * 1.0", "One = 1"]))
 
@@ -124,23 +138,82 @@ def build_indicator_table(candles, timeframe: int, indicators):
 
 
 class Indicators(Plugin):
+    """Computes every registered indicator in one table, republished when the set changes.
+
+    The Deephaven variable is `indicator_values` (the name `indicators` is the session function that adds to it).
+    `add()` / `remove()` rebuild the table over the whole day; plugins that listen to it follow through
+    `app.on_publish("indicators", ...)`. If `candles` is restarted (new bar size, say) the table is rebuilt on it.
+    """
     name = "indicators"
     requires = ("candles",)
+    TABLE_VAR = "indicator_values"
 
-    def __init__(self, indicators=DEFAULT, timeframe: int = 1):
+    def __init__(self, indicators=(), timeframe: str | None = None):
+        """timeframe: bar size the indicators run on ("5min"); None = the candle size."""
         super().__init__()
-        if not isinstance(timeframe, int) or timeframe < 1:
-            raise ValueError("timeframe must be a positive integer (minutes)")
-        cols = [i.column for i in indicators]
-        if len(set(cols)) != len(cols):
-            raise ValueError(f"duplicate indicator columns: {cols}")
-        self.indicators, self.timeframe = list(indicators), timeframe
+        if timeframe is not None:
+            parse_timeframe(timeframe)
+        self.timeframe = timeframe
+        self.indicators: list[Indicator] = []
+        self._merge(indicators)
+
+    def _merge(self, specs) -> list[str]:
+        """Add the specs that are not already computed; returns the new column names."""
+        added = []
+        have = {i.column for i in self.indicators}
+        for spec in specs:
+            if not isinstance(spec, Indicator):
+                raise TypeError(f"{spec!r} is not an indicator: write EMA(9) or RSI(14), not the bare number")
+            if spec.column in have:
+                self.log.info("%s is already computed", spec.column)
+                continue
+            have.add(spec.column)
+            self.indicators.append(spec)
+            added.append(spec.column)
+        return added
 
     def start(self) -> None:
-        table = build_indicator_table(self.app.table("candles"), self.timeframe, self.indicators)
-        self.app.publish("indicators", table)
-        self.log.info("built on %d-min bars with Pct, %s", self.timeframe,
-                      ", ".join(i.column for i in self.indicators))
+        self.follow("candles", lambda _t: self._build())
+        self._build()
+
+    def add(self, *specs, timeframe: str | None = None) -> list[str]:
+        """Start computing more indicators alongside the existing ones. Returns the new columns."""
+        before = (list(self.indicators), self.timeframe)
+        try:
+            if timeframe is not None and timeframe != self.timeframe:
+                resolve_timeframe(timeframe, self.app.shared["candle_seconds"])          # validate before changing anything
+                self.log.warning("bar size changes from %s to %s: every indicator is recomputed on the new bars",
+                                 self.timeframe or "the candle size", timeframe)
+                self.timeframe = timeframe
+            added = self._merge(specs)
+            if added or self.timeframe != before[1]:
+                self._build()
+        except Exception:
+            self.indicators, self.timeframe = before
+            raise
+        return added
+
+    def remove(self, *columns: str) -> None:
+        gone = [c for c in columns if any(i.column == c for i in self.indicators)]
+        for c in columns:
+            if c not in gone:
+                self.log.warning("%s is not computed", c)
+        if gone:
+            self.indicators = [i for i in self.indicators if i.column not in gone]
+            self._build()
+
+    def _build(self) -> None:
+        candle_s = self.app.shared["candle_seconds"]
+        bar_s = resolve_timeframe(self.timeframe, candle_s)
+        table = build_indicator_table(self.app.table("candles"), bar_s, candle_s, self.indicators)
+        self.app.publish("indicators", table, ns_name=self.TABLE_VAR)
+        self.bar_seconds = bar_s
+        self.log.info("`%s` on %s bars: Pct%s", self.TABLE_VAR, format_timeframe(bar_s),
+                      "".join(", " + i.column for i in self.indicators))
+
+    def columns(self) -> list[str]:
+        return [i.column for i in self.indicators]
 
     def describe(self) -> str:
-        return f"{self.timeframe}-min bars: " + ", ".join(i.column for i in self.indicators)
+        return (f"{format_timeframe(getattr(self, 'bar_seconds', 0) or 60)} bars: Pct"
+                + "".join(", " + i.column for i in self.indicators))

@@ -1,7 +1,8 @@
-"""1-minute candles built from the live tick table (`fo_market_data`).
+"""Candles of 30s / 1min / 5min / 15min built from the live tick table (`fo_market_data`).
 
 `LttParser` and `CandleAggregator` are pure Python (unit tested); `Candles` is the Deephaven plugin around them.
-Output table `candles`: Minute, Symbol, token, Open, High, Low, Close, Volume (one row per token per closed minute).
+Output table `candles`: Minute (start of the bar), Symbol, token, Open, High, Low, Close, Volume
+(one row per token per closed bar).
 """
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from algo.core.plugin import Plugin
+from algo.core.timeframe import format_timeframe, parse_timeframe
 
 CandleSink = Callable[[int, int, float, float, float, float, int], None]
 # (token, minute_epoch, open, high, low, close, volume)
@@ -49,15 +51,15 @@ class LttParser:
 
 
 class CandleAggregator:
-    """Ticks -> closed 1-minute candles.
+    """Ticks -> closed candles of `bucket` seconds (30, 60, 300, ...), aligned to the epoch.
 
-    A candle is emitted once a later minute arrives for the token, or via `flush(cutoff)` once the clock has moved
+    A candle is emitted once a later bar arrives for the token, or via `flush(cutoff)` once the clock has moved
     past it. Volume per candle is the difference of the feed's cumulative volume. Late ticks are ignored.
-    Ticks before `start_min` build no candle (only cumulative volume is tracked).
+    Ticks before `start_min` (epoch seconds of the first bar) build no candle (only cumulative volume is tracked).
     """
 
-    def __init__(self, emit: CandleSink, start_min: int):
-        self.emit, self.start_min = emit, start_min
+    def __init__(self, emit: CandleSink, start_min: int, bucket: int = 60):
+        self.emit, self.start_min, self.bucket = emit, start_min, bucket
         self._cur: dict[int, list] = {}        # token -> [minute, o, h, l, c, cum_vol, first_vol]
         self._prev_cum: dict[int, int] = {}    # token -> cumulative volume at the end of the last closed candle
         self._seen: dict[int, tuple] = {}      # token -> (ltt, vol) of the last trade seen
@@ -69,7 +71,7 @@ class CandleAggregator:
         self._seen[token] = (ltt, vol)
 
     def tick(self, token: int, price: float, vol: int, ltt_sec: int) -> None:
-        minute = int(ltt_sec // 60 * 60)
+        minute = int(ltt_sec // self.bucket * self.bucket)
         if minute < self.start_min:
             self._prev_cum[token] = vol
             return
@@ -89,7 +91,7 @@ class CandleAggregator:
         # minute < c[0]: late / out-of-order tick, ignored
 
     def flush(self, cutoff_min: int) -> None:
-        """Close every candle whose minute is before `cutoff_min`."""
+        """Close every candle whose bar starts before `cutoff_min`."""
         for token in [t for t, c in self._cur.items() if c[0] < cutoff_min]:
             self._close(token, self._cur.pop(token))
 
@@ -107,9 +109,12 @@ class Candles(Plugin):
     COLS = ["token", "ltp", "vol", "ltt"]
     GRACE_S = 10          # a minute is closed this many seconds after its end
 
-    def __init__(self, build_from: int | None = None):
-        """build_from: epoch second of the first minute to build; None = the next full minute."""
+    def __init__(self, timeframe: str = "1min", build_from: int | None = None):
+        """timeframe: "30s", "1min", "5min", "15min". build_from: epoch second of the first bar to build;
+        None = the next full bar."""
         super().__init__()
+        self.timeframe = format_timeframe(parse_timeframe(timeframe))
+        self.bucket = parse_timeframe(timeframe)
         self.build_from = build_from
         self.agg: CandleAggregator | None = None
         self.rows = 0
@@ -125,6 +130,7 @@ class Candles(Plugin):
             "MinuteEpoch": dht.int64, "Symbol": dht.string, "token": dht.int64,
             "Open": price_t, "High": price_t, "Low": price_t, "Close": price_t, "Volume": dht.int64,
         })
+        app.shared["candle_seconds"] = self.bucket          # read by plugins that follow `candles`, before they are told
         app.publish("candles", writer.table.view([
             "Minute = epochSecondsToInstant(MinuteEpoch)",
             "Symbol", "token", "Open", "High", "Low", "Close", "Volume",
@@ -136,15 +142,16 @@ class Candles(Plugin):
             writer.write_row(minute, symbol_of.get(token), token, px(o), px(h), px(l), px(c), vol)
             self.rows += 1
 
-        start = self.build_from if self.build_from is not None else int(time.time() // 60 * 60) + 60
-        self.agg = CandleAggregator(emit, start)
+        b = self.bucket
+        start = self.build_from if self.build_from is not None else int(time.time() // b * b) + b
+        self.agg = CandleAggregator(emit, start, b)
         self._parse = LttParser(mk.ltt_fmt, mk.ltt_zone)
         self.listen(feed, self._on_update, replay=True)
-        self.log.info("market=%s ltt_tz=%s fmt=%s feed=%s tokens mapped=%d",
-                      mk.code, mk.ltt_tz, mk.ltt_fmt, mk.feed, len(symbol_of))
+        self.log.info("%s candles, market=%s ltt_tz=%s fmt=%s feed=%s tokens mapped=%d",
+                      self.timeframe, mk.code, mk.ltt_tz, mk.ltt_fmt, mk.feed, len(symbol_of))
 
     def describe(self) -> str:
-        return f"{self.rows} candles written"
+        return f"{self.timeframe}, {self.rows} candles written"
 
     def _on_update(self, update, is_replay) -> None:
         agg, latest = self.agg, 0
@@ -169,4 +176,4 @@ class Candles(Plugin):
                 if sec > latest:
                     latest = sec
         if latest:
-            agg.flush(int((latest - self.GRACE_S) // 60 * 60))
+            agg.flush(int((latest - self.GRACE_S) // self.bucket * self.bucket))

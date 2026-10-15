@@ -28,6 +28,7 @@ class Plugin:
         self._handles: list = []
         self._threads: list[threading.Thread] = []
         self._halt = threading.Event()
+        self._undo: list[Callable[[], None]] = []
         self.log = log.get(self.name)
 
     # ---- to implement -------------------------------------------------------------------
@@ -68,6 +69,11 @@ class Plugin:
         self._handles.append(handle)
         return handle
 
+    def follow(self, table_name: str, callback: Callable) -> None:
+        """Call `callback(new_table)` whenever another plugin republishes `table_name` (e.g. candles restarted with a
+        new bar size). Unregistered automatically when this plugin stops."""
+        self._undo.append(self.app.on_publish(table_name, callback))
+
     def stop_listener(self, handle) -> None:
         try:
             handle.stop()
@@ -102,6 +108,12 @@ class Plugin:
             except Exception:
                 pass
         self._handles.clear()
+        for undo in self._undo:
+            try:
+                undo()
+            except Exception:
+                pass
+        self._undo.clear()
         try:
             self.on_stop()
         except Exception:

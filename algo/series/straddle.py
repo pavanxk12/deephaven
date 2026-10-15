@@ -6,8 +6,8 @@ the `candles` table and writes `straddle_series`.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, replace
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -22,13 +22,12 @@ _log = log.get("straddle")
 @dataclass(frozen=True)
 class StraddleConfig:
     symbols: tuple[str, ...] | None = None      # None = every symbol with a future and options
-    expiry_index: int = 0                       # 0 = nearest option expiry, 1 = next, ...
-    expiry_override: tuple[tuple[str, str], ...] = ()     # (("NIFTY", "2026-10-13"), ...)
+    expiries: int = 1                           # how many of the nearest option expiries: 1 = nearest only, 2 = nearest + next, ...
     window: int = 5                             # +/- strikes around ATM that are searched
     shift_threshold: int = 3                    # re-centre the window when ATM drifts more than this
     min_search: int = 2                         # search +/- this many strikes around the previous minimum
-    max_age_s: float | None = 180               # ignore a price older than this (None = no guard)
-    offset_s: int = 2                           # sample this long after each minute boundary
+    max_age_s: float | None = 180               # ignore a price older than this (None = no guard); at least 3 sample periods
+    offset_s: int = 2                           # sample this long after each sample boundary
 
 
 @dataclass(frozen=True)
@@ -39,8 +38,21 @@ class SeriesDef:
     pe: tuple[int, ...]
 
 
+def reference_future(fut_expiries: list, option_expiry) -> int:
+    """Index (into the future expiries, sorted) of the future that goes with an option expiry: the nearest future that
+    expires on or after it, else the last one. Weekly options therefore use the monthly future, and next month's options
+    use next month's future."""
+    for i, e in enumerate(fut_expiries):
+        if e >= option_expiry:
+            return i
+    return len(fut_expiries) - 1
+
+
 def build_series(master, cfg: StraddleConfig, today: pd.Timestamp, log=None) -> dict:
-    """{(symbol, 'YYYY-MM-DD'): SeriesDef} for the chosen symbols and expiry."""
+    """{(symbol, 'YYYY-MM-DD'): SeriesDef} for the chosen symbols and the `cfg.expiries` nearest option expiries.
+
+    Expiries are counted over everything listed (weeklies included). Each uses the future that matches it.
+    """
     say = log.info if log else (lambda *a: None)
     futs = master.futs[master.futs["expiry"] >= today].sort_values("expiry")
     chain = master.chain[master.chain["expiry"] >= today]
@@ -53,26 +65,26 @@ def build_series(master, cfg: StraddleConfig, today: pd.Timestamp, log=None) -> 
             if s.upper() not in all_syms:
                 say("%s: no future or no options in master, skipped", s)
 
-    near_fut = futs.groupby("TckrSymb")["fut_token"].first()
+    fut_by_sym = {s: g for s, g in futs.groupby("TckrSymb")}
     by_sym = {s: g for s, g in chain.groupby("TckrSymb")}
-    override = dict(cfg.expiry_override)
-    defs = {}
+    defs, on_later_future = {}, 0
     for s in use:
         c = by_sym[s]
-        exps = sorted(pd.Timestamp(e) for e in c["expiry"].unique())
-        if s in override:
-            exp = pd.Timestamp(override[s])
-            if exp not in exps:
-                say("%s: expiry %s not in file, skipped", s, exp.date())
+        f = fut_by_sym[s]
+        fut_exps = [pd.Timestamp(e) for e in f["expiry"]]
+        fut_tokens = [int(t) for t in f["fut_token"]]
+        for exp in sorted(pd.Timestamp(e) for e in c["expiry"].unique())[:cfg.expiries]:
+            cc = c[c["expiry"] == exp].sort_values("strike")
+            if len(cc) < 2 * cfg.window + 1:
                 continue
-        else:
-            exp = exps[min(cfg.expiry_index, len(exps) - 1)]
-        cc = c[c["expiry"] == exp].sort_values("strike")
-        if len(cc) < 2 * cfg.window + 1:
-            continue
-        defs[(s, exp.strftime("%Y-%m-%d"))] = SeriesDef(
-            fut=int(near_fut[s]), strikes=cc["strike"].to_numpy(dtype=float),
-            ce=tuple(int(x) for x in cc["ce_token"]), pe=tuple(int(x) for x in cc["pe_token"]))
+            k = reference_future(fut_exps, exp)
+            if fut_exps[k] != exp:
+                on_later_future += 1
+            defs[(s, exp.strftime("%Y-%m-%d"))] = SeriesDef(
+                fut=fut_tokens[k], strikes=cc["strike"].to_numpy(dtype=float),
+                ce=tuple(int(x) for x in cc["ce_token"]), pe=tuple(int(x) for x in cc["pe_token"]))
+    if on_later_future:
+        say("%d of %d series reference a later (monthly) future than their own expiry", on_later_future, len(defs))
     return defs
 
 
@@ -208,6 +220,11 @@ class Straddle(Plugin):
         self.engine = StraddleEngine(defs, cfg)
         self.log.info("%d series, %d tokens needed in candles", len(defs), len(self.engine.needed))
 
+        self.bucket = app.shared.get("candle_seconds", 60)
+        self.cadence = max(self.bucket, 60)                    # one point per minute, or per candle if candles are larger
+        if cfg.max_age_s is not None:
+            self.engine.cfg = replace(cfg, max_age_s=max(cfg.max_age_s, 3 * self.cadence))
+        self.follow("candles", self._restart)
         s = dht.string
         d = dht.double
         self._writer = DynamicTableWriter(dict(zip(StraddleEngine.COLUMNS, (s, s, s, d, d, d, d, d, d, d, d, d, d, d, d))))
@@ -217,7 +234,11 @@ class Straddle(Plugin):
         self.listen(app.table("candles"), self._on_candles, replay=False)        # live prices first, as before the backfill
         self._backfill(app.table("candles"))
         self.spawn(self._loop)
-        self.log.info("backfilled %d rows, now live: `straddle_series`", self.rows)
+        self.log.info("backfilled %d rows, now live: `straddle_series` (one point per %ds)", self.rows, self.cadence)
+
+    def _restart(self, _table) -> None:
+        """candles was restarted: build the series again on the new table."""
+        self.app.run(Straddle(self.cfg))
 
     def describe(self) -> str:
         return f"{len(self.engine.defs)} series, {self.rows} rows" if self.engine else ""
@@ -241,20 +262,23 @@ class Straddle(Plugin):
         df = df[df["token"].isin(eng.needed) & (df["Close"] != NULL_LONG) & (df["Close"] > 0)].sort_values("Ts")
         start, end = mk.session
         for ts, g in df.groupby("Ts"):
+            close = float(ts) + self.bucket                                         # candle close time
             for t, c in zip(g["token"], g["Close"]):
-                eng.set_price(int(t), float(c) / self._scale, float(ts) + 60)     # candle close time
-            t_s = float(ts) + 60 + self.cfg.offset_s                                 # simulated "now"
+                eng.set_price(int(t), float(c) / self._scale, close)
+            if close % self.cadence:                                                 # not a sample boundary
+                continue
+            t_s = close + self.cfg.offset_s                                          # simulated "now"
             when = datetime.fromtimestamp(t_s, mk.zone)
             if start <= when.time() <= end:
                 self._write(eng.sample(when, t_s))
 
     # ---- live ---------------------------------------------------------------------------------
     def _loop(self) -> None:
-        mk = self.app.market
+        mk, cad = self.app.market, self.cadence
         while not self.halted.is_set():
-            now = datetime.now(mk.zone)
-            nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=1, seconds=self.cfg.offset_s)
-            if self.halted.wait(max(0.5, (nxt - now).total_seconds())):
+            now_ts = time.time()
+            nxt = (now_ts // cad + 1) * cad + self.cfg.offset_s              # next boundary + offset
+            if self.halted.wait(max(0.5, nxt - now_ts)):
                 return
             now = datetime.now(mk.zone)
             start, end = mk.session

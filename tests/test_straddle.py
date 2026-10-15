@@ -86,3 +86,40 @@ def test_build_series_uses_nearest_expiry_and_needs_enough_strikes(master):
     assert list(only) == [("NIFTY", "2030-01-30")]
     d = only[("NIFTY", "2030-01-30")]
     assert d.fut == 1 and list(d.strikes) == [24900.0, 25000.0, 25100.0] and len(d.ce) == len(d.pe) == 3
+
+
+def keys(defs):
+    return sorted(defs)
+
+
+def test_expiries_count_weeklies_and_use_the_matching_future(master_weekly):
+    today = pd.Timestamp("2030-01-01")
+    one = build_series(master_weekly, StraddleConfig(window=1, expiries=1, symbols=("NIFTY",)), today)
+    assert keys(one) == [("NIFTY", "2030-01-09")]
+    assert one[("NIFTY", "2030-01-09")].fut == 1                    # weekly option -> the monthly future (Jan)
+
+    five = build_series(master_weekly, StraddleConfig(window=1, expiries=5, symbols=("NIFTY",)), today)
+    assert keys(five) == [("NIFTY", "2030-01-09"), ("NIFTY", "2030-01-16"), ("NIFTY", "2030-01-23"),
+                          ("NIFTY", "2030-01-30"), ("NIFTY", "2030-02-27")]
+    assert [five[k].fut for k in keys(five)] == [1, 1, 1, 1, 2]    # Feb options -> the Feb future
+    assert five[("NIFTY", "2030-02-27")].ce != five[("NIFTY", "2030-01-30")].ce
+
+
+def test_more_expiries_than_exist_just_gives_what_there_is(master_weekly):
+    today = pd.Timestamp("2030-01-01")
+    d = build_series(master_weekly, StraddleConfig(window=1, expiries=50, symbols=("RELIANCE",)), today)
+    assert keys(d) == [("RELIANCE", "2030-01-30")]
+
+
+def test_expired_expiries_are_not_counted(master_weekly):
+    d = build_series(master_weekly, StraddleConfig(window=1, expiries=1, symbols=("NIFTY",)), pd.Timestamp("2030-01-10"))
+    assert keys(d) == [("NIFTY", "2030-01-16")]
+
+
+def test_reference_future_choice():
+    from algo.series.straddle import reference_future
+    e = [pd.Timestamp("2030-01-30"), pd.Timestamp("2030-02-27")]
+    assert reference_future(e, pd.Timestamp("2030-01-09")) == 0
+    assert reference_future(e, pd.Timestamp("2030-01-30")) == 0
+    assert reference_future(e, pd.Timestamp("2030-02-05")) == 1
+    assert reference_future(e, pd.Timestamp("2030-04-01")) == 1                    # beyond the last future: the last one

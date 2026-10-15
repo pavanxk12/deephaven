@@ -36,11 +36,17 @@ class RsiOptions(Plugin):
         app, cfg = self.app, self.cfg
         for w in cfg.warnings():
             self.log.warning(w)
+        missing = [c for c in (cfg.rsi_col, cfg.pct_col) if c not in app.table("indicators").column_names]
+        if missing:
+            raise RuntimeError(f"indicator_values has no {missing}: call indicators(RSI(...)) first "
+                               f"(this strategy reads {cfg.rsi_col}; change rsi_col to use another)")
         self._setup(app.master, app.market, app[cfg.book].state, app[cfg.bridge], app.paths.market_data)
         self._seed()
         self._unregister = [self.bridge.on_enable(self._on_enable), self.bridge.on_halt(self._on_halt)]
         self._h_px = self.listen(app.table("candles"), self._on_price)
         self._h_sig = self.listen(app.table("indicators"), self._on_indicators)
+        self.follow("candles", self._reattach_px)              # the tables are rebuilt when candles or indicators change
+        self.follow("indicators", self._reattach_sig)
 
         self.log.info("armed (%s, sending %s), %d instruments, RSI >%s buy PUT / <%s buy CALL, mid-quartile filter %s",
                       "DRY RUN" if self.bridge.cfg.dry_run else "LIVE", "ON" if self.bridge.sending else "OFF",
@@ -70,6 +76,16 @@ class RsiOptions(Plugin):
         self.pcts = {t: None for t in self.tokens}            # last Pct-from-open x 100
         self.off_seen: dict[int, str] = {}                    # leg already logged as "would BUY" while sending is off
         self.picker = OptionPicker(self.master, cfg, self.market.price_div, self.opt_price)
+
+    def _reattach_px(self, table) -> None:
+        self.stop_listener(self._h_px)
+        self._h_px = self.listen(table, self._on_price)
+        self.log.info("following the restarted candles table")
+
+    def _reattach_sig(self, table) -> None:
+        self.stop_listener(self._h_sig)
+        self._h_sig = self.listen(table, self._on_indicators)
+        self.log.info("following the rebuilt indicator table")
 
     def on_stop(self) -> None:
         for undo in getattr(self, "_unregister", []):

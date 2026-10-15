@@ -28,22 +28,31 @@ server, so they are kept small and in one place per plugin.
 
 ## A day
 
-```python
-# scripts/01_day.py
-import algo
-app = algo.connect(globals(), market="NSE")
-app.run(algo.Master())
-app.run(algo.Candles())
-app.run(algo.Indicators())
-app.run(algo.Straddle())
-app.run(algo.Eod(auto_at=dtime(15, 35)))
-```
-Then `scripts/02_strategy.py` (Book, Bridge, RsiOptions; sending starts **off**) and `scripts/03_console.py`.
-`app.status()` lists what is running. Running a plugin whose name is already running replaces it (its listeners and
-threads are stopped first), so re-pasting a script is always safe.
+Once per session (or the last line of `init.py`): `import algo; algo.install(globals(), "NSE")`. That puts plain
+functions in the session, so the day is a few calls (`scripts/01_day.py`):
 
-Other calls: `app["bridge"].send_on()`, `app["rsi_stocks"].status()`, `app["rsi_stocks"].sell("SYMBOL")`,
-`app["eod"].save()`, `app.stop("straddle")`, `algo.reload()` after editing the package.
+```python
+master_build()                        # contract master for today
+candles_start("1min")                 # "30s" | "1min" | "5min" | "15min"
+indicators(EMA(9), RSI(5))            # start computing these
+indicators(EMA(6))                    # ADDS EMA_6; EMA_9 and RSI_5 keep running
+straddle_start(0)                     # nearest option expiry only; 1 = two nearest, 2 = three nearest, ...
+```
+
+* `EMA(9)`, `RSI(5)` only describe an indicator; `indicators(...)` starts the computation and each call adds to the
+  running set. The result is the table **`indicator_values`** (the name `indicators` is the function).
+  `indicators()` lists the set, `indicators_remove("EMA_6")` drops one, `indicators(..., timeframe="5min")` rolls the
+  candles up to larger bars (a whole multiple of the candle size).
+* `candles_start("5min")` again restarts the candles on the new size (the table starts empty). Indicators, the
+  straddle and the strategy follow the new table by themselves.
+* `straddle_start(n)`: expiries are counted over everything listed, weeklies included. Each expiry uses the future that
+  goes with it: the nearest future expiring on or after it, so weekly options use the monthly future and next month's
+  options use next month's future. One point per minute (per candle if candles are larger than a minute).
+  `straddle_start(1, symbols=["NIFTY"])` limits it.
+* `master_build(force=True)` ignores the cache, `algo_status()` shows what is running.
+
+The strategy and the console are plugins (`scripts/02_strategy.py`, `03_console.py`). Running a plugin whose name is
+already running replaces it, so re-running a call is always safe. `algo.reload()` after editing the package.
 
 ## Adding things
 

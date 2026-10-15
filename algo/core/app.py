@@ -34,6 +34,7 @@ class App:
         self.plugins: dict[str, Plugin] = {}
         self.tables: dict[str, Any] = {}
         self.shared: dict[str, Any] = {}              # objects that must survive a plugin restart
+        self._publish_cbs: dict[str, list] = {}
         self.ctx = self._capture_context()
 
     # ---- plugins ---------------------------------------------------------------------
@@ -76,10 +77,23 @@ class App:
         return self.plugins.get(name)
 
     # ---- tables ------------------------------------------------------------------------
-    def publish(self, name: str, table) -> None:
-        """Make a table visible to other plugins and to the Deephaven IDE (as a top-level variable)."""
+    def publish(self, name: str, table, ns_name: str | None = None) -> None:
+        """Make a table visible to other plugins (as `name`) and to the Deephaven IDE (as a top-level variable,
+        `ns_name` or `name`). Republishing an existing name tells the subscribers, so listeners can move to the new table."""
+        replaced = name in self.tables
         self.tables[name] = table
-        self.ns[name] = table
+        self.ns[ns_name or name] = table
+        if replaced:
+            for cb in list(self._publish_cbs.get(name, [])):
+                try:
+                    cb(table)
+                except Exception:
+                    log.get("app").exception("republish callback for %s failed", name)
+
+    def on_publish(self, name: str, callback):
+        """Call `callback(new_table)` whenever table `name` is republished. Returns an unregister function."""
+        self._publish_cbs.setdefault(name, []).append(callback)
+        return lambda: self._publish_cbs[name].remove(callback) if callback in self._publish_cbs.get(name, []) else None
 
     def table(self, name: str):
         for source in (self.tables, self.ns):

@@ -72,3 +72,32 @@ def test_duplicate_trades_are_detected():
     assert agg.is_new(1, "t", 5)
     agg.mark(1, "t", 5)
     assert not agg.is_new(1, "t", 5) and agg.is_new(1, "t", 6)
+
+
+def test_30_second_candles():
+    out, emit = collect()
+    agg = CandleAggregator(emit, start_min=0, bucket=30)
+    for sec, price, vol in ((60, 10, 100), (75, 12, 110), (91, 9, 130), (130, 11, 140)):
+        agg.tick(1, price, vol, sec)
+    # bars start at 60, 90, 120: the first two are closed by the arrival of later bars
+    assert [(c[1], c[2], c[3], c[4], c[5]) for c in out] == [(60, 10, 12, 10, 12), (90, 9, 9, 9, 9)]
+    agg.flush(150)
+    assert out[2][1] == 120
+
+
+def test_5_minute_candles_align_to_the_epoch():
+    out, emit = collect()
+    agg = CandleAggregator(emit, start_min=0, bucket=300)
+    for sec, price in ((299, 1), (300, 2), (450, 5), (599, 3), (600, 7)):
+        agg.tick(1, price, 10, sec)
+    assert [(c[1], c[2], c[3], c[4], c[5]) for c in out] == [(0, 1, 1, 1, 1), (300, 2, 5, 2, 3)]
+
+
+def test_flush_uses_the_bar_start():
+    out, emit = collect()
+    agg = CandleAggregator(emit, start_min=0, bucket=300)
+    agg.tick(1, 1, 1, 310)
+    agg.flush(300)                                     # the bar starting at 300 is not before 300
+    assert out == []
+    agg.flush(600)
+    assert len(out) == 1
