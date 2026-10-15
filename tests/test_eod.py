@@ -14,7 +14,6 @@ import pytest
 pytest.importorskip("pyarrow")
 
 import algo
-from algo import api
 from algo.core import app as app_module
 from algo.core.config import Paths
 from algo.data.store import Eod, History, Store, normalise_day, save_tables
