@@ -80,14 +80,19 @@ def test_chain_pairs_are_real_pairs(loaded):
 
 def test_each_straddle_expiry_uses_a_future_that_does_not_expire_before_it(loaded):
     _, m, mk = loaded
-    if not len(m.futs):
-        pytest.skip("this file has no futures (US): the straddle needs an equity-underlying mode")
+    if not len(m.futs):                              # no futures at all (US): every series must use the symbol's spot
+        today = pd.Timestamp(re.search(r"(20\d{6})", os.path.basename(DB)).group(1))
+        defs = build_series(m, StraddleConfig(expiries=2), today)
+        assert defs and {s.ref_kind for s in defs.values()} == {"SPOT"}
+        assert all(m.symbol_of[s.ref] == sym for (sym, _), s in defs.items())
+        assert {sym for sym, _ in defs} == set(m.chain.TckrSymb) & set(m.spot_of)
+        return
     today = pd.Timestamp(re.search(r"(20\d{6})", os.path.basename(DB)).group(1))
     for n in (0, 1, 2):
         defs = build_series(m, StraddleConfig(expiries=n + 1), today)
         assert defs
         for (sym, exp), s in defs.items():
-            fut_sym, fut_exp = m.fut_info[s.fut]
+            fut_sym, fut_exp = m.fut_info[s.ref]
             assert fut_sym == sym
             later = m.futs[(m.futs.TckrSymb == sym) & (m.futs.expiry >= pd.Timestamp(exp))]
             if len(later):

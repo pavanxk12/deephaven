@@ -89,6 +89,14 @@ class MasterData:
         return out
 
     @cached_property
+    def spot_of(self) -> dict:
+        """underlying symbol -> token of its cash / spot instrument (the first, if a symbol is listed twice)."""
+        out: dict = {}
+        for tok, sym in zip(self.eqs["eq_token"].astype("int64").tolist(), self.eqs["TckrSymb"].tolist()):
+            out.setdefault(sym, tok)
+        return out
+
+    @cached_property
     def fut_info(self) -> dict:
         """future token -> (underlying symbol, expiry)."""
         return {int(t): (s, e) for t, s, e in zip(self.futs["fut_token"], self.futs["TckrSymb"], self.futs["expiry"])}

@@ -68,7 +68,8 @@ straddle_start(0)                     # nearest option expiry only; 1 = two near
 * `straddle_start(n)`: expiries are counted over everything listed, weeklies included. Each expiry uses the future that
   goes with it: the nearest future expiring on or after it, so weekly options use the monthly future and next month's
   options use next month's future. One point per minute (per candle if candles are larger than a minute).
-  `straddle_start(1, symbols=["NIFTY"])` limits it.
+  `straddle_start(1, symbols=["NIFTY"])` limits it. **A symbol with no future uses its spot (cash) price as the reference**
+  (US stocks and ETFs); a symbol with neither is skipped and named in the log (US SPX, SPXW).
 * `master_build("US")` switches the exchange (it stops plugins running for the other one); `master_build(force=True)` ignores the cache, `algo_status()` shows what is running.
 
 The strategy and the console are plugins (`scripts/02_strategy.py`, `03_console.py`). Running a plugin whose name is
@@ -170,5 +171,5 @@ All the numbers that sat in the USER INPUT blocks are fields of `RsiOptionsConfi
   so after a late start it is not the real day open.
 * US: checked against the 2026-10-14 contract file and a real feed export (tokens 1-8): strikes / ticks / equity prices use the
   file's `Divisor`, `ltt` is text `yyyy-mm-dd HH:MM:SS` in UTC. Not yet checked: the live option prices against their divisor
-  (10000), the US option tick (the file lists 0.0001; sizing refuses anything under 0.01), and there are no US futures, so the
-  straddle and the strategy still need an equity-underlying mode.
+  (10000), and the US option tick (the file lists 0.0001; sizing refuses anything under 0.01). The straddle works for US
+  stocks and ETFs through the spot fallback; the strategy still needs the same fallback.

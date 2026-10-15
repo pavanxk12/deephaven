@@ -13,7 +13,7 @@ NOW = WHEN.timestamp()
 
 def series(n=11):
     strikes = np.arange(24500.0, 24500.0 + 100 * n, 100.0)
-    return SeriesDef(fut=1, strikes=strikes, ce=tuple(range(100, 100 + n)), pe=tuple(range(200, 200 + n)))
+    return SeriesDef(ref=1, strikes=strikes, ce=tuple(range(100, 100 + n)), pe=tuple(range(200, 200 + n)))
 
 
 def engine(cfg=StraddleConfig(), n=11):
@@ -85,7 +85,7 @@ def test_build_series_uses_nearest_expiry_and_needs_enough_strikes(master):
     only = build_series(master, StraddleConfig(window=1, symbols=("nifty", "nope")), today)
     assert list(only) == [("NIFTY", "2030-01-30")]
     d = only[("NIFTY", "2030-01-30")]
-    assert d.fut == 1 and list(d.strikes) == [24900.0, 25000.0, 25100.0] and len(d.ce) == len(d.pe) == 3
+    assert d.ref == 1 and list(d.strikes) == [24900.0, 25000.0, 25100.0] and len(d.ce) == len(d.pe) == 3
 
 
 def keys(defs):
@@ -96,12 +96,12 @@ def test_expiries_count_weeklies_and_use_the_matching_future(master_weekly):
     today = pd.Timestamp("2030-01-01")
     one = build_series(master_weekly, StraddleConfig(window=1, expiries=1, symbols=("NIFTY",)), today)
     assert keys(one) == [("NIFTY", "2030-01-09")]
-    assert one[("NIFTY", "2030-01-09")].fut == 1                    # weekly option -> the monthly future (Jan)
+    assert one[("NIFTY", "2030-01-09")].ref == 1                    # weekly option -> the monthly future (Jan)
 
     five = build_series(master_weekly, StraddleConfig(window=1, expiries=5, symbols=("NIFTY",)), today)
     assert keys(five) == [("NIFTY", "2030-01-09"), ("NIFTY", "2030-01-16"), ("NIFTY", "2030-01-23"),
                           ("NIFTY", "2030-01-30"), ("NIFTY", "2030-02-27")]
-    assert [five[k].fut for k in keys(five)] == [1, 1, 1, 1, 2]    # Feb options -> the Feb future
+    assert [five[k].ref for k in keys(five)] == [1, 1, 1, 1, 2]    # Feb options -> the Feb future
     assert five[("NIFTY", "2030-02-27")].ce != five[("NIFTY", "2030-01-30")].ce
 
 
@@ -123,3 +123,68 @@ def test_reference_future_choice():
     assert reference_future(e, pd.Timestamp("2030-01-30")) == 0
     assert reference_future(e, pd.Timestamp("2030-02-05")) == 1
     assert reference_future(e, pd.Timestamp("2030-04-01")) == 1                    # beyond the last future: the last one
+
+
+# ---- no future: fall back to the spot ----------------------------------------------------------------------------
+def spot_master():
+    """FUTS has a future and a spot (the future wins), SPOTONLY has options and a spot, BARE has only options."""
+    import pandas as pd
+    from algo.core.config import NSE
+    from algo.data.master import classify, normalise
+    from tests.conftest import secs
+    e = secs("2030-01-30")
+    rows, tok = [], 1000
+    for sym in ("FUTS", "SPOTONLY", "BARE"):
+        for strike in (900, 1000, 1100):
+            for ot in ("CE", "PE"):
+                rows.append(dict(Token=tok, Symbol=sym, ExpiryDate=e, InstType="OPTSTK", OptionType=ot,
+                                 StrikePrice=strike * 100, LotSize=1, TickSize=5))
+                tok += 1
+    rows.append(dict(Token=1, Symbol="FUTS", ExpiryDate=e, InstType="FUTSTK", OptionType="XX", StrikePrice=0, LotSize=1, TickSize=5))
+    rows.append(dict(Token=2, Symbol="FUTS", ExpiryDate=None, InstType="EQ", OptionType="XX", StrikePrice=0, LotSize=1, TickSize=5))
+    rows.append(dict(Token=3, Symbol="SPOTONLY", ExpiryDate=None, InstType="EQ", OptionType="XX", StrikePrice=0, LotSize=1, TickSize=5))
+    return classify(normalise(pd.DataFrame(rows), NSE))
+
+
+def test_a_symbol_without_a_future_uses_its_spot_and_a_symbol_with_one_keeps_the_future():
+    m = spot_master()
+    defs = build_series(m, StraddleConfig(window=1), pd.Timestamp("2030-01-01"))
+    assert sorted(defs) == [("FUTS", "2030-01-30"), ("SPOTONLY", "2030-01-30")]
+    assert (defs[("FUTS", "2030-01-30")].ref, defs[("FUTS", "2030-01-30")].ref_kind) == (1, "FUT")      # the future wins
+    assert (defs[("SPOTONLY", "2030-01-30")].ref, defs[("SPOTONLY", "2030-01-30")].ref_kind) == (3, "SPOT")
+
+
+def test_a_symbol_with_neither_is_skipped_and_named_in_the_log(caplog):
+    import logging
+    m = spot_master()
+    with caplog.at_level(logging.INFO, logger="algo.straddle"):
+        build_series(m, StraddleConfig(window=1), pd.Timestamp("2030-01-01"), logging.getLogger("algo.straddle"))
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "BARE" in text and "1 of 2 series use the spot" in text
+    build_series(m, StraddleConfig(window=1, symbols=("BARE", "SPOTONLY")), pd.Timestamp("2030-01-01"))   # asking for it by name does not raise
+
+
+def test_after_the_future_has_expired_the_spot_takes_over():
+    m = spot_master()
+    defs = build_series(m, StraddleConfig(window=1, symbols=("FUTS",)), pd.Timestamp("2030-01-30"))
+    assert defs[("FUTS", "2030-01-30")].ref_kind == "FUT"              # expires today: still counts
+    m.futs = m.futs.iloc[0:0]                                          # no future at all
+    m.__dict__.pop("fut_info", None)
+    defs = build_series(m, StraddleConfig(window=1, symbols=("FUTS",)), pd.Timestamp("2030-01-01"))
+    assert (defs[("FUTS", "2030-01-30")].ref, defs[("FUTS", "2030-01-30")].ref_kind) == (2, "SPOT")
+
+
+def test_the_engine_prices_the_atm_strike_from_the_spot():
+    m = spot_master()
+    defs = build_series(m, StraddleConfig(window=1, symbols=("SPOTONLY",)), pd.Timestamp("2030-01-01"))
+    d = defs[("SPOTONLY", "2030-01-30")]
+    e = StraddleEngine(defs, StraddleConfig(window=1))
+    assert 3 in e.needed and set(d.ce) <= e.needed                       # the spot is subscribed like any other leg
+    now = NOW
+    e.set_price(3, 1000.0, now)                                         # spot at 1000 -> ATM strike 1000
+    for i in range(3):
+        e.set_price(d.ce[i], 20.0, now)
+        e.set_price(d.pe[i], 25.0, now)
+    (row,) = e.sample(WHEN, now)
+    r = dict(zip(StraddleEngine.COLUMNS, row))
+    assert r["Fut"] == 1000.0 and r["ATMStrike"] == 1000.0 and r["V"] == 45.0

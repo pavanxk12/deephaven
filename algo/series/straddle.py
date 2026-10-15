@@ -32,10 +32,11 @@ class StraddleConfig:
 
 @dataclass(frozen=True)
 class SeriesDef:
-    fut: int
+    ref: int            # token whose price decides the at-the-money strike: the future, or the spot when there is no future
     strikes: np.ndarray
     ce: tuple[int, ...]
     pe: tuple[int, ...]
+    ref_kind: str = "FUT"
 
 
 def reference_future(fut_expiries: list, option_expiry) -> int:
@@ -51,38 +52,52 @@ def reference_future(fut_expiries: list, option_expiry) -> int:
 def build_series(master, cfg: StraddleConfig, today: pd.Timestamp, log=None) -> dict:
     """{(symbol, 'YYYY-MM-DD'): SeriesDef} for the chosen symbols and the `cfg.expiries` nearest option expiries.
 
-    Expiries are counted over everything listed (weeklies included). Each uses the future that matches it.
+    Expiries are counted over everything listed (weeklies included). The at-the-money reference is the future that matches
+    each expiry; **a symbol with no (unexpired) future falls back to its spot**; a symbol with neither is skipped.
     """
     say = log.info if log else (lambda *a: None)
     futs = master.futs[master.futs["expiry"] >= today].sort_values("expiry")
     chain = master.chain[master.chain["expiry"] >= today]
-    all_syms = sorted(set(futs["TckrSymb"]) & set(chain["TckrSymb"]))
+    spot = master.spot_of
+    with_future = set(futs["TckrSymb"])
+    optioned = set(chain["TckrSymb"])
+    all_syms = sorted(optioned & (with_future | set(spot)))
+    unusable = sorted(optioned - set(all_syms))
+    if unusable:
+        say("no future and no spot for %d symbol(s), skipped: %s", len(unusable), ", ".join(unusable[:12]))
     if cfg.symbols is None:
         use = all_syms
     else:
         use = [s.upper() for s in cfg.symbols if s.upper() in all_syms]
         for s in cfg.symbols:
             if s.upper() not in all_syms:
-                say("%s: no future or no options in master, skipped", s)
+                say("%s: no options, or no future and no spot, in master: skipped", s)
 
     fut_by_sym = {s: g for s, g in futs.groupby("TckrSymb")}
     by_sym = {s: g for s, g in chain.groupby("TckrSymb")}
-    defs, on_later_future = {}, 0
+    defs, on_later_future, on_spot = {}, 0, 0
     for s in use:
         c = by_sym[s]
-        f = fut_by_sym[s]
-        fut_exps = [pd.Timestamp(e) for e in f["expiry"]]
-        fut_tokens = [int(t) for t in f["fut_token"]]
+        f = fut_by_sym.get(s)
+        fut_exps = [pd.Timestamp(e) for e in f["expiry"]] if f is not None else []
+        fut_tokens = [int(t) for t in f["fut_token"]] if f is not None else []
         for exp in sorted(pd.Timestamp(e) for e in c["expiry"].unique())[:cfg.expiries]:
             cc = c[c["expiry"] == exp].sort_values("strike")
             if len(cc) < 2 * cfg.window + 1:
                 continue
-            k = reference_future(fut_exps, exp)
-            if fut_exps[k] != exp:
-                on_later_future += 1
+            if fut_exps:
+                k = reference_future(fut_exps, exp)
+                ref, kind = fut_tokens[k], "FUT"
+                if fut_exps[k] != exp:
+                    on_later_future += 1
+            else:
+                ref, kind = spot[s], "SPOT"
+                on_spot += 1
             defs[(s, exp.strftime("%Y-%m-%d"))] = SeriesDef(
-                fut=fut_tokens[k], strikes=cc["strike"].to_numpy(dtype=float),
+                ref=ref, ref_kind=kind, strikes=cc["strike"].to_numpy(dtype=float),
                 ce=tuple(int(x) for x in cc["ce_token"]), pe=tuple(int(x) for x in cc["pe_token"]))
+    if on_spot:
+        say("%d of %d series use the spot as reference (no future)", on_spot, len(defs))
     if on_later_future:
         say("%d of %d series reference a later (monthly) future than their own expiry", on_later_future, len(defs))
     return defs
@@ -110,7 +125,7 @@ class StraddleEngine:
         self.defs, self.cfg = defs, cfg
         self.px: dict[int, tuple[float, float]] = {}        # token -> (price, timestamp)
         self._state: dict[tuple, _State] = {}
-        self.needed = {t for d in defs.values() for t in (d.fut, *d.ce, *d.pe)}
+        self.needed = {t for d in defs.values() for t in (d.ref, *d.ce, *d.pe)}
 
     def set_price(self, token: int, price: float, ts: float) -> None:
         """Remember a price; a missing, NaN, infinite or non-positive price is ignored, so it can never be traded on."""
@@ -145,7 +160,7 @@ class StraddleEngine:
     def _sample_one(self, key, d: SeriesDef, st: _State, stamp: str, now_ts: float):
         cfg = self.cfg
         get = lambda tok: self._price(tok, now_ts)       # noqa: E731
-        fut = get(d.fut)
+        fut = get(d.ref)                                   # the future, or the spot when the symbol has no future
         if not fut:
             return None
         strikes, n = d.strikes, len(d.strikes)
