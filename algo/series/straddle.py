@@ -5,6 +5,7 @@ the `candles` table and writes `straddle_series`.
 """
 from __future__ import annotations
 
+import itertools
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -126,11 +127,22 @@ class StraddleEngine:
         self.px: dict[int, tuple[float, float]] = {}        # token -> (price, timestamp)
         self._state: dict[tuple, _State] = {}
         self.needed = {t for d in defs.values() for t in (d.ref, *d.ce, *d.pe)}
+        self._mask = np.zeros(max(self.needed, default=0) + 1, dtype=bool)         # dense lookup: is this token a leg of some series?
+        self._mask[list(self.needed)] = True
 
     def set_price(self, token: int, price: float, ts: float) -> None:
         """Remember a price; a missing, NaN, infinite or non-positive price is ignored, so it can never be traded on."""
         if good_price(price):
             self.px[token] = (float(price), ts)
+
+    def set_prices(self, tokens, prices, ts: float) -> None:
+        """Many prices at once (a whole candle batch). Same rules as `set_price`, applied to the arrays in one pass:
+        tokens that are not legs of any series, and null / NaN / infinite / non-positive prices, are dropped."""
+        tokens = np.asarray(tokens, dtype=np.int64)
+        prices = np.asarray(prices, dtype=np.float64)
+        ok = np.isfinite(prices) & (prices > 0) & (tokens >= 0) & (tokens < len(self._mask))
+        ok[ok] &= self._mask[tokens[ok]]
+        self.px.update(zip(tokens[ok].tolist(), zip(prices[ok].tolist(), itertools.repeat(ts))))
 
     def sample(self, when: datetime, now_ts: float) -> list[tuple]:
         """Run every series once for time `when`. Returns the output rows (series that could not be computed are skipped)."""
@@ -218,6 +230,39 @@ class StraddleEngine:
                 float(alt_cost), float(st.altcum), float(best_v + st.altcum), float(synth))
 
 
+def replay(engine: "StraddleEngine", ts, token, close, bucket: int, cadence: int, offset_s: int, session, zone, write) -> int:
+    """Rebuild today's series from the candles so far: for each candle time, in order, load that bar's closes, and at every
+    sample boundary inside the session take a sample. Arrays in (bar start epoch seconds, token, close); returns rows written.
+
+    The same logic as stepping through the candles one bar at a time, done on arrays: the candles are normally already in time
+    order (checked, sorted only if not), and each bar is a slice, so there is no per-row Python except inside `dict.update`."""
+    ts = np.asarray(ts, dtype=np.int64)
+    token = np.asarray(token, dtype=np.int64)
+    close = np.asarray(close, dtype=np.float64)
+    if len(ts) == 0:
+        return 0
+    if not np.all(ts[1:] >= ts[:-1]):
+        order = np.argsort(ts, kind="stable")
+        ts, token, close = ts[order], token[order], close[order]
+    cuts = np.flatnonzero(ts[1:] != ts[:-1]) + 1
+    first = [0, *cuts.tolist()]
+    last = [*cuts.tolist(), len(ts)]
+    start, end = session
+    rows = 0
+    for a, b in zip(first, last):
+        close_t = float(ts[a]) + bucket                                             # the candle's close time
+        engine.set_prices(token[a:b], close[a:b], close_t)
+        if close_t % cadence:                                                       # not a sample boundary
+            continue
+        t_s = close_t + offset_s                                                    # simulated "now"
+        when = datetime.fromtimestamp(t_s, zone)
+        if start <= when.time() <= end:
+            out = engine.sample(when, t_s)
+            write(out)
+            rows += len(out)
+    return rows
+
+
 class Straddle(Plugin):
     name = "straddle"
     requires = ("master", "candles")
@@ -264,29 +309,21 @@ class Straddle(Plugin):
         ch = update.added(["token", "Close"])
         if ch is None:
             return
-        now_ts, needed = time.time(), self.engine.needed
-        for tok, close in zip(ch["token"], ch["Close"]):
-            tok = int(tok)
-            if tok in needed:
-                self.engine.set_price(tok, close, now_ts)          # set_price drops nulls / NaN / non-positive
+        self.engine.set_prices(ch["token"], ch["Close"], time.time())           # drops other tokens and unusable prices
 
     def _backfill(self, candles) -> None:
-        from deephaven.pandas import to_pandas
+        """Replay the candles so far. The engine does the filtering (only the legs of our series), so only those rows are
+        pulled into Python, as three arrays."""
+        import pandas as pd
+        from deephaven.pandas import to_pandas, to_table
 
         mk, eng = self.app.market, self.engine
-        df = to_pandas(candles.view(["Ts = epochSeconds(Minute)", "token", "Close"]))
-        df = df[df["token"].isin(eng.needed) & df["Close"].notna() & (df["Close"] > 0)].sort_values("Ts")
-        start, end = mk.session
-        for ts, g in df.groupby("Ts"):
-            close = float(ts) + self.bucket                                         # candle close time
-            for t, c in zip(g["token"], g["Close"]):
-                eng.set_price(int(t), c, close)
-            if close % self.cadence:                                                 # not a sample boundary
-                continue
-            t_s = close + self.cfg.offset_s                                          # simulated "now"
-            when = datetime.fromtimestamp(t_s, mk.zone)
-            if start <= when.time() <= end:
-                self._write(eng.sample(when, t_s))
+        legs = to_table(pd.DataFrame({"token": pd.Series(sorted(eng.needed), dtype="int64")}))
+        df = to_pandas(candles.where_in(legs, "token").view(["Ts = epochSeconds(Minute)", "token", "Close"]))
+        ts, tok, close = (df["Ts"].to_numpy(np.int64), df["token"].to_numpy(np.int64),
+                          df["Close"].to_numpy(np.float64, na_value=np.nan))
+        del df
+        replay(eng, ts, tok, close, self.bucket, self.cadence, self.cfg.offset_s, mk.session, mk.zone, self._write)   # _write counts the rows
 
     # ---- live ---------------------------------------------------------------------------------
     def _loop(self) -> None:
