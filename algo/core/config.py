@@ -51,10 +51,12 @@ NSE = Market(
 )
 
 # US: expiry epoch 1970, strike / tick / price scale 10000 (from the contract file's Divisor), checked against
-# 20261014DB.db3. NOT yet checked against a live feed row: the feed's ltt format and timezone, and that its prices
-# follow the file's Divisor. The session is the New York cash session.
+# 20261014DB.db3. The feed's ltt is text like "2026-10-15 11:01:04" in UTC (checked against table-2026-10-15-171828.csv:
+# the Kafka time is always at or after it, and the first trades fall in New York pre-market). Still unchecked: that the feed's
+# option prices follow the file's Divisor (the equity rows do: 34,669 with divisor 100 is 346.69). The session is the
+# New York cash session.
 US = Market(
-    code="US", tz="America/New_York", ltt_tz="Asia/Kolkata", ltt_fmt="%Y-%m-%dT%H:%M",
+    code="US", tz="America/New_York", ltt_tz="UTC", ltt_fmt="%Y-%m-%d %H:%M",
     price_div=10000.0, expiry_epoch="1970-01-01", strike_div=10000.0, tick_div=10000.0,
     session=(dtime(9, 30), dtime(16, 0)), trade_window=(dtime(9, 35), dtime(15, 45)),
 )
