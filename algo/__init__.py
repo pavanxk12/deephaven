@@ -14,7 +14,7 @@ from algo.core.app import App, MissingDependency, connect, current, reload
 from algo.core.config import MARKETS, NSE, US, Market, Paths
 from algo.core.plugin import Plugin
 from algo.data.candles import Candles
-from algo.data.indicators import EMA, RSI, Indicator, Indicators
+from algo.data.indicators import ATR, EMA, MACD, MACD_HIST, MACD_SIGNAL, PCT, RSI, SMA, Indicator, Indicators
 from algo.data.master import Master
 from algo.data.store import Eod, History
 from algo.series.straddle import Straddle, StraddleConfig
@@ -33,6 +33,6 @@ def __getattr__(name):                      # the console needs deephaven.ui, so
 __all__ = [
     "install",
     "App", "MissingDependency", "connect", "current", "reload", "MARKETS", "NSE", "US", "Market", "Paths", "Plugin",
-    "Master", "Candles", "Indicators", "Indicator", "RSI", "EMA", "Eod", "History", "Straddle", "StraddleConfig",
+    "Master", "Candles", "Indicators", "Indicator", "SMA", "EMA", "RSI", "MACD", "MACD_SIGNAL", "MACD_HIST", "ATR", "PCT", "Eod", "History", "Straddle", "StraddleConfig",
     "Book", "Bridge", "BridgeConfig", "RsiOptions", "RsiOptionsConfig", "Console", "ConsoleConfig",
 ]
