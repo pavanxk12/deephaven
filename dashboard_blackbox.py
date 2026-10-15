@@ -372,32 +372,36 @@ def automation_call(name, *args):
     fn(*args)
 
 
+def _under(k):
+    """PF_OF key -> underlying token. The multi-strike automation keys PF_OF by (token, slot); the single-PF one by token."""
+    return k[0] if isinstance(k, tuple) else k
+
+
 def owner_of(token):
-    """Automation keys everything (PF_OF, auto_allow) by the UNDERLYING future, but a net-positions row is the OPTION
-    that portfolio trades. Return the underlying token for a row, or None if no portfolio trades this instrument."""
+    """Automation keys auto_allow by the UNDERLYING future, but a net-positions row is the OPTION a portfolio trades.
+    Return the underlying token for a row, or None if no portfolio trades this instrument."""
     pf_of = globals().get("PF_OF", {})
-    if token in pf_of:
+    unders = {_under(k) for k in pf_of}
+    if token in unders:
         return token
     for pf, opt in globals().get("subscribed", {}).items():        # pf -> option token it is subscribed to
         if opt == token:
-            for u, p in pf_of.items():
+            for k, p in pf_of.items():
                 if p == pf:
-                    return u
+                    return _under(k)
     name = symbol_of(token).split()[0]               # old leg of a retired PF: same stock = same checkbox
-    for u in pf_of:
+    for u in unders:
         if symbol_of(u).split()[0] == name:
             return u
     return None
 
 
 def pf_for_row(token):
-    """PF of a net-positions row. One PF = one option, so first the PF subscribed to exactly this option (retired
-    portfolios included, newest if several). Otherwise the current PF of the same stock."""
+    """PF of a net-positions row. One PF = one option, so the PF subscribed to exactly this option (retired portfolios
+    included, newest if several). None when no PF is known for it: with several strikes per stock a guess could
+    pause the wrong portfolio."""
     exact = [pf for pf, opt in globals().get("subscribed", {}).items() if opt == token]
-    if exact:
-        return max(exact)
-    owner = owner_of(token)
-    return globals().get("PF_OF", {}).get(owner) if owner is not None else None
+    return max(exact) if exact else None
 
 
 def watch_automation(redraw):
