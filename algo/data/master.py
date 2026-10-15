@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from algo.core.config import Market
+from algo.core.files import replace_with_retry
 from algo.core.plugin import Plugin
 
 CACHE_VERSION = "v4"
@@ -240,15 +241,32 @@ def build_symbol_map(m: MasterData) -> dict:
 # =================================================================================================
 # files
 # =================================================================================================
+def db_candidates(directory: str, day: str) -> list[str]:
+    """Every contract file that could be the one for `day`: `<yyyymmdd>.db3` first, then any `*<yyyymmdd>*.db3`."""
+    exact = os.path.join(directory, f"{day}.db3")
+    others = sorted(glob.glob(os.path.join(directory, f"*{day}*.db3")))
+    return ([exact] if os.path.exists(exact) else []) + [p for p in others if p != exact]
+
+
 def find_db(directory: str, day: str) -> str:
     """`<dir>/<yyyymmdd>.db3`, else the last `*<yyyymmdd>*.db3`."""
-    exact = os.path.join(directory, f"{day}.db3")
-    if os.path.exists(exact):
-        return exact
-    hits = sorted(glob.glob(os.path.join(directory, f"*{day}*.db3")))
+    hits = db_candidates(directory, day)
     if not hits:
         raise FileNotFoundError(f"no .db3 for {day} in {directory}")
-    return hits[-1]
+    return hits[0] if os.path.exists(os.path.join(directory, f"{day}.db3")) else hits[-1]
+
+
+def check_exchange(raw: pd.DataFrame, market: Market, path: str = "the contract file") -> None:
+    """Refuse a file that belongs to the other market (an NSE file read as US, or the reverse). Two files with the same
+    date in one folder is how that happens."""
+    col = market.contract_columns.get("exch")
+    if not col or col not in raw:
+        return
+    found = {str(x).strip().upper() for x in raw[col].dropna().unique()}
+    wrong = (market.code == "NSE" and bool(found - {"NSE"})) or (market.code == "US" and "NSE" in found)
+    if wrong:
+        raise RuntimeError(f"{path} lists exchange {sorted(found)}, which is not {market.code}. It looks like the other market's "
+                           f"file for the same day; name it with master_build(..., file=\"<the right file name>\")")
 
 
 def read_contracts(db_path: str, market: Market, table: str | None = None,
@@ -306,6 +324,11 @@ class Master(Plugin):
         mk, paths = self.app.market, self.app.paths
         day = self.day or datetime.now(mk.zone).strftime("%Y%m%d")
         db = self.db_path or find_db(paths.market_data, day)
+        if not self.db_path:
+            near = db_candidates(paths.market_data, day)
+            if len(near) > 1:
+                self.log.warning("%d files match %s: %s. Using %s; pass file=... to choose", len(near), day,
+                                 ", ".join(os.path.basename(p) for p in near), os.path.basename(db))
         st = os.stat(db)
         cache_dir = pick_cache_dir(paths.cache)
         cache = (os.path.join(cache_dir, f"master_{CACHE_VERSION}_{mk.code}_{day}_{int(st.st_mtime)}_{st.st_size}.pkl")
@@ -314,6 +337,7 @@ class Master(Plugin):
         data = self._load(cache)
         if data is None:
             raw, table = read_contracts(db, mk, self.table)
+            check_exchange(raw, mk, db)
             df = normalise(raw, mk)
             if df["expiry"].notna().sum() == 0:
                 raise RuntimeError("could not parse the expiry column (all NaT) - check Market.expiry_epoch")
@@ -349,7 +373,7 @@ class Master(Plugin):
         tmp = path + ".tmp"
         try:
             pd.to_pickle(data.as_dict(), tmp)
-            os.replace(tmp, path)
+            replace_with_retry(tmp, path)
             self.log.info("saved cache %s", path)
         except OSError as e:
             self.log.warning("cache not saved (%s)", e)

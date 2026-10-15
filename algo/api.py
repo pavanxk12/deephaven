@@ -13,6 +13,7 @@ only `indicators(...)` starts the computation.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta
 
 from algo.core.app import App, MissingDependency, connect, current
@@ -38,11 +39,13 @@ def _run(plugin) -> None:
         raise RuntimeError(f"{e}. Call " + " then ".join(HINTS.get(d, d) for d in needed) + " first.") from None
 
 
-def master_build(exchange: str | None = None, day: str | None = None, force: bool = False) -> None:
+def master_build(exchange: str | None = None, day: str | None = None, force: bool = False, file: str | None = None) -> None:
     """Build the contract master: master_build("NSE") or master_build("US"). The exchange sets the timezone, price scale,
     session and file formats for everything after it. Naming a different exchange than the running one stops the plugins
     that are running (they belong to the other market); no argument keeps the current exchange.
-    Reads today's .db3 (or `day`, e.g. "20261015"); uses the cache unless force=True."""
+    Reads today's .db3 (or `day`, e.g. "20261015"); uses the cache unless force=True.
+    `file="20261015DB_US.db3"` names the file when more than one in the folder matches the day (it is also refused if the file
+    belongs to the other market)."""
     app = _app()
     if exchange is not None:
         market = market_for(exchange)
@@ -51,7 +54,8 @@ def master_build(exchange: str | None = None, day: str | None = None, force: boo
                 print(f"switching {app.market.code} -> {market.code}: stopping {', '.join(app.plugins)}")
             app = connect(app.ns, market, app.paths)
     print(f"exchange: {app.market.code}")
-    _run(Master(day=day, force_rebuild=force))
+    path = None if file is None else (file if os.path.isabs(file) else os.path.join(app.paths.market_data, file))
+    _run(Master(day=day, db_path=path, force_rebuild=force))
 
 
 def candles_start(timeframe: str = "1min", multiplier: float | None = None, *, symbols=None, kind: str | None = None,

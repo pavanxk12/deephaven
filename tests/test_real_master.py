@@ -122,3 +122,11 @@ def test_strikes_match_the_files_own_description(loaded):
     strike = m.opt.set_index("Token")["strike"]
     for r in opts.itertuples():
         assert abs(float(r.FullName.split()[2]) - strike[r.Token]) < 1e-9
+
+
+def test_the_other_markets_settings_would_refuse_this_file(loaded):
+    from algo.data.master import check_exchange
+    raw, m, mk = loaded
+    check_exchange(raw, mk, DB)                                            # its own market: fine
+    with pytest.raises(RuntimeError, match="not "):
+        check_exchange(raw, US if mk is NSE else NSE, DB)

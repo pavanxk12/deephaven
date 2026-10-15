@@ -209,3 +209,25 @@ def test_bridge_stop_twice_is_harmless(tmp_path):
 def test_dry_run_bridge_has_no_loop_and_never_sends():
     b = Bridge(BridgeConfig(dry_run=True))
     assert b.loop is None and b.transport is None
+
+
+def test_a_briefly_locked_state_file_is_retried(tmp_path, monkeypatch):
+    import os
+    from algo.strategy import book as book_module
+    real, calls = os.replace, []
+
+    def flaky(src, dst):
+        calls.append(1)
+        if len(calls) < 3:
+            raise PermissionError("locked by a scanner")
+        return real(src, dst)
+    monkeypatch.setattr(book_module.os, "replace", flaky)
+    book_module._write_json(str(tmp_path / "x.json"), {"1": 2})
+    assert len(calls) == 3 and (tmp_path / "x.json").exists() and not list(tmp_path.glob("*.tmp"))
+
+
+def test_a_state_file_that_stays_locked_raises_in_the_end(tmp_path, monkeypatch):
+    from algo.strategy import book as book_module
+    monkeypatch.setattr(book_module.os, "replace", lambda a, b: (_ for _ in ()).throw(PermissionError("locked")))
+    with pytest.raises(PermissionError):
+        book_module._write_json(str(tmp_path / "x.json"), {})

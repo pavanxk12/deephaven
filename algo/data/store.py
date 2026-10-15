@@ -16,6 +16,7 @@ import os
 from datetime import datetime, time as dtime, timedelta
 
 from algo.core import log as logmod
+from algo.core.files import replace_with_retry
 from algo.core.plugin import Plugin
 
 _log = logmod.get("eod")
@@ -66,7 +67,7 @@ class Store:
         tmp = final[:-len(".parquet")] + ".tmp.parquet"
         try:
             parquet.write(out, tmp)
-            os.replace(tmp, final)
+            replace_with_retry(tmp, final)
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -74,7 +75,7 @@ class Store:
             meta_path = final[:-len(".parquet")] + ".meta.json"
             with open(meta_path + ".tmp", "w") as f:
                 json.dump({**meta, "rows": int(src.size), "file": os.path.basename(final)}, f, indent=1)
-            os.replace(meta_path + ".tmp", meta_path)
+            replace_with_retry(meta_path + ".tmp", meta_path)
         return final, int(src.size)
 
     def find(self, prefix: str, day: str) -> str | None:

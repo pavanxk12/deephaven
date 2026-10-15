@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 CONTRACT_COLUMNS: Mapping[str, str] = {
     "token": "Token", "symbol": "Symbol", "expiry": "ExpiryDate", "inst": "InstType",
     "opt": "OptionType", "strike": "StrikePrice", "lot": "LotSize", "tick": "TickSize", "divisor": "Divisor",
+    "exch": "Exch",
 }
 
 

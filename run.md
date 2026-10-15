@@ -40,7 +40,13 @@ master_build("NSE")                      # India. Today's file
 master_build("US")                       # US. Switching the exchange stops what was running for the other one
 master_build("NSE", day="20261015")      # a specific day's file
 master_build("NSE", force=True)          # ignore the cache and rebuild
+master_build("US", file="20261015DB_US.db3")   # name the file when more than one in the folder matches the day
 ```
+**What the folder `/data/fo_market_data` (host: `./deephaven/fo_market_data`) holds:** the contract file `<yyyymmdd>.db3` (or
+`*<yyyymmdd>*.db3`, e.g. `20261015DB.db3`; the date is today in the market's own timezone, New York's date for the US),
+the saved days `candles_<day>.parquet` / `straddle_<day>.parquet` for `eod_load`, and `stocks.txt` / `logo.png` for the strategy
+and console. If two files match one day (an NSE one and a US one), it uses the last by name and logs a warning that lists them;
+a file that belongs to the other market is refused with a message, never read as the wrong market.
 Result: the dict `master`, and everything below uses it. Look at it: `algo_status()`.
 
 ---
@@ -198,6 +204,7 @@ and run the steps again.
 | `indicators needs ['candles']. Call candles_start() first.` | you skipped a step; run the one it names |
 | `unknown market ...` | the exchange must be `"NSE"` or `"US"` |
 | `no .db3 for <day> in /data/fo_market_data` | today's contract file is not there yet |
+| `... lists exchange [...], which is not NSE` (or US) | the file is the other market's; pass `file=` with the right name |
 | `bar size ... must be a whole multiple of the candle size` | an indicator's size such as `"30s"` on 1-minute candles |
 | `... is not writable (a read-only mount?)` | `eod_save`: use `folder=` or mount a writable folder (section 0) |
 | `no instruments in master for symbols [...]` | a name in `symbols=` is not in the contract file |

@@ -12,6 +12,7 @@ import os
 import threading
 from typing import Callable
 
+from algo.core.files import replace_with_retry
 from algo.core.plugin import Plugin
 
 
@@ -29,7 +30,7 @@ def _write_json(path: str, obj: dict) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(dict(obj), f, indent=1)
-    os.replace(tmp, path)
+    replace_with_retry(tmp, path)
 
 
 class Portfolios:
