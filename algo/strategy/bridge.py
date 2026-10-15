@@ -138,14 +138,20 @@ class Bridge(Plugin):
     # ---- plumbing ----------------------------------------------------------------------------
     def submit(self, coro: Awaitable) -> bool:
         """Schedule a coroutine on the loop without waiting. Returns False (and drops it) while sending is off."""
-        if not self.sending or self.loop is None:
+        loop = self.loop
+        if not self.sending or loop is None:
             coro.close()                                   # avoid Python's "never awaited" warning
             return False
 
         def done(f):
             if not f.cancelled() and f.exception():
                 self.log.error("job FAILED: %r", f.exception())
-        asyncio.run_coroutine_threadsafe(coro, self.loop).add_done_callback(done)
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop).add_done_callback(done)
+        except RuntimeError as e:                          # the loop was closed between the check and now
+            coro.close()
+            self.log.error("not sent, the bridge loop is closed: %s", e)
+            return False
         return True
 
     def lock(self, pf: int) -> asyncio.Lock:

@@ -9,7 +9,7 @@ from algo.strategy.config import BridgeConfig, RsiOptionsConfig
 from algo.strategy.rsi_options import RsiOptions
 
 RELIANCE_FUT = 3
-CLOSE = 300_000.0                      # 3000.00 rupees in paise
+CLOSE = 3000.0                         # rupees (the candles are in proper units)
 
 
 class FakeBridge:
@@ -41,9 +41,9 @@ class FakeBridge:
         return lambda: None
 
 
-def price_options(s, premium=10_000.0):
+def price_options(s, premium=100.0):
     for tok in s.master.opt["Token"]:
-        s.ltp[int(tok)] = premium                      # 100.00 rupees
+        s.ltp[int(tok)] = premium
 
 
 def build(master, tmp_path, sending=True, priced=True, **cfg_kw):
@@ -80,7 +80,7 @@ def test_overbought_buys_the_nearest_put_and_creates_a_portfolio(master, tmp_pat
 
 def test_same_leg_is_not_sent_twice(master, tmp_path):
     s, _, bridge = build(master, tmp_path)
-    s.ltp.update({s.master.token_of["RELIANCE 30JAN30 3000 PE"]: 12_000.0})
+    s.ltp.update({s.master.token_of["RELIANCE 30JAN30 3000 PE"]: 120.0})
     s.on_signal(RELIANCE_FUT, "OVERBOUGHT")
     s.on_signal(RELIANCE_FUT, "OVERBOUGHT")
     assert len(bridge.swaps) == 1
@@ -144,8 +144,8 @@ def test_mid_filter_blocks_a_basket_that_is_too_small_to_rank(master, tmp_path):
 
 def test_rsi_zone_thresholds(master, tmp_path):
     s, _, _ = build(master, tmp_path)
-    assert s.rsi_zone(6001) == "OVERBOUGHT" and s.rsi_zone(6000) is None
-    assert s.rsi_zone(3999) == "OVERSOLD" and s.rsi_zone(4000) is None
+    assert s.rsi_zone(60.01) == "OVERBOUGHT" and s.rsi_zone(60.0) is None
+    assert s.rsi_zone(39.99) == "OVERSOLD" and s.rsi_zone(40.0) is None
 
 
 class Update:
@@ -163,23 +163,23 @@ def test_indicator_update_triggers_a_signal_once_per_zone_entry(master, tmp_path
     s, book, bridge = build(master, tmp_path)
     col = s.cfg.rsi_col
     assert col == "RSI_9"
-    s._on_indicators(Update([(RELIANCE_FUT, 7000, 25)]), False)
-    s._on_indicators(Update([(RELIANCE_FUT, 7200, 30)]), False)        # still overbought: already running that leg
-    assert len(bridge.swaps) == 1 and s.pcts[RELIANCE_FUT] == 30
-    s._on_indicators(Update([(RELIANCE_FUT, 5000, 30)]), False)        # back to neutral: no new order
+    s._on_indicators(Update([(RELIANCE_FUT, 70.0, 0.25)]), False)
+    s._on_indicators(Update([(RELIANCE_FUT, 72.0, 0.3)]), False)        # still overbought: already running that leg
+    assert len(bridge.swaps) == 1 and s.pcts[RELIANCE_FUT] == 0.3
+    s._on_indicators(Update([(RELIANCE_FUT, 50.0, 0.3)]), False)        # back to neutral: no new order
     assert len(bridge.swaps) == 1 and s.zones[RELIANCE_FUT] is None
 
 
 def test_null_rsi_is_ignored(master, tmp_path):
-    from algo.core.nulls import NULL_LONG
+    from algo.core.nulls import NULL_DOUBLE
     s, _, bridge = build(master, tmp_path)
-    s._on_indicators(Update([(RELIANCE_FUT, NULL_LONG, NULL_LONG)]), False)
+    s._on_indicators(Update([(RELIANCE_FUT, NULL_DOUBLE, float("nan"))]), False)
     assert bridge.swaps == [] and s.rsis[RELIANCE_FUT] is None
 
 
 def test_unknown_token_in_the_indicator_stream_is_ignored(master, tmp_path):
     s, _, bridge = build(master, tmp_path)
-    s._on_indicators(Update([(999, 9000, 1)]), False)
+    s._on_indicators(Update([(999, 90.0, 1.0)]), False)
     assert bridge.swaps == []
 
 
@@ -195,7 +195,7 @@ def test_make_params_needs_price_and_tick(master, tmp_path):
     s, _, _ = build(master, tmp_path, priced=False)
     opt = s.master.token_of["RELIANCE 30JAN30 3000 CE"]
     assert s.make_params(opt) is None                                  # no price for the option yet
-    s.ltp[opt] = 10_000.0                                              # 100.00
+    s.ltp[opt] = 100.0
     p = s.make_params(opt)
     assert p is not None and p["trp"] > 100.0 and p["lowerrange"] < 100.0 < p["upperrange"]
 
@@ -209,9 +209,9 @@ def test_nifty_single_underlying_uses_the_synthetic_future(master, tmp_path):
     s.in_window = lambda: True
     price_options(s)
     nifty_fut = 1
-    s.ltp[nifty_fut] = 2_500_000.0
+    s.ltp[nifty_fut] = 25000.0
     ce, pe = master.token_of["NIFTY 30JAN30 25000 CE"], master.token_of["NIFTY 30JAN30 25000 PE"]
-    s.ltp[ce], s.ltp[pe] = 30_000.0, 10_000.0                            # synthetic 25200 -> strike 25100
+    s.ltp[ce], s.ltp[pe] = 300.0, 100.0                            # synthetic 25200 -> strike 25100
     s.on_signal(nifty_fut, "OVERSOLD")
     (swap,) = bridge.swaps
     assert sym(s, swap["option"]) == "NIFTY 30JAN30 25100 CE" and swap["pf"] == 1555

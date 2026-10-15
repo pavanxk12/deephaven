@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from algo.core import log
-from algo.core.nulls import NULL_LONG
+from algo.core.nulls import good_price
 from algo.core.plugin import Plugin
 
 _log = log.get("straddle")
@@ -113,7 +113,9 @@ class StraddleEngine:
         self.needed = {t for d in defs.values() for t in (d.fut, *d.ce, *d.pe)}
 
     def set_price(self, token: int, price: float, ts: float) -> None:
-        self.px[token] = (price, ts)
+        """Remember a price; a missing, NaN, infinite or non-positive price is ignored, so it can never be traded on."""
+        if good_price(price):
+            self.px[token] = (float(price), ts)
 
     def sample(self, when: datetime, now_ts: float) -> list[tuple]:
         """Run every series once for time `when`. Returns the output rows (series that could not be computed are skipped)."""
@@ -230,7 +232,6 @@ class Straddle(Plugin):
         self._writer = DynamicTableWriter(dict(zip(StraddleEngine.COLUMNS, (s, s, s, d, d, d, d, d, d, d, d, d, d, d, d))))
         app.publish("straddle_series", self._writer.table)
 
-        self._scale = mk.price_div
         self.listen(app.table("candles"), self._on_candles, replay=False)        # live prices first, as before the backfill
         self._backfill(app.table("candles"))
         self.spawn(self._loop)
@@ -251,20 +252,20 @@ class Straddle(Plugin):
         now_ts, needed = time.time(), self.engine.needed
         for tok, close in zip(ch["token"], ch["Close"]):
             tok = int(tok)
-            if tok in needed and close != NULL_LONG and close > 0:
-                self.engine.set_price(tok, float(close) / self._scale, now_ts)
+            if tok in needed:
+                self.engine.set_price(tok, close, now_ts)          # set_price drops nulls / NaN / non-positive
 
     def _backfill(self, candles) -> None:
         from deephaven.pandas import to_pandas
 
         mk, eng = self.app.market, self.engine
         df = to_pandas(candles.view(["Ts = epochSeconds(Minute)", "token", "Close"]))
-        df = df[df["token"].isin(eng.needed) & (df["Close"] != NULL_LONG) & (df["Close"] > 0)].sort_values("Ts")
+        df = df[df["token"].isin(eng.needed) & df["Close"].notna() & (df["Close"] > 0)].sort_values("Ts")
         start, end = mk.session
         for ts, g in df.groupby("Ts"):
             close = float(ts) + self.bucket                                         # candle close time
             for t, c in zip(g["token"], g["Close"]):
-                eng.set_price(int(t), float(c) / self._scale, close)
+                eng.set_price(int(t), c, close)
             if close % self.cadence:                                                 # not a sample boundary
                 continue
             t_s = close + self.cfg.offset_s                                          # simulated "now"
@@ -283,7 +284,10 @@ class Straddle(Plugin):
             now = datetime.now(mk.zone)
             start, end = mk.session
             if start <= now.time() <= end:
-                self._write(self.engine.sample(now, time.time()))
+                try:
+                    self._write(self.engine.sample(now, time.time()))
+                except Exception:                          # a bad sample must not end the loop
+                    self.log.exception("sample failed")
 
     def _write(self, rows: list[tuple]) -> None:
         for r in rows:

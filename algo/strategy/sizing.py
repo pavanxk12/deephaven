@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 
+from algo.core.nulls import good_price
 from algo.strategy.config import RsiOptionsConfig
 
 NUDGE = 1e-6
@@ -24,14 +25,19 @@ def ceil_tick(x: float, tick: float) -> float:
 
 def on_tick(v: float, tick: float) -> bool:
     """True if the bridge, which truncates v*100 to an int, ends up on a whole tick."""
-    return int(v * 100) % int(round(tick * 100)) == 0
+    step = int(round(tick * 100))
+    return step >= 1 and int(v * 100) % step == 0
 
 
 def option_params(premium: float, tick: float, cfg: RsiOptionsConfig) -> tuple[dict | None, str]:
     """Apply-payload fields for an option with this premium (currency units) and tick.
 
-    Returns (params, "") or (None, reason) if any value would not sit on the tick.
+    Returns (params, "") or (None, reason) if the inputs are unusable or any value would not sit on the tick.
     """
+    if not good_price(premium):
+        return None, f"no usable premium ({premium!r})"
+    if not good_price(tick) or tick < 0.01:
+        return None, f"tick {tick!r} is missing or finer than the bridge resolution of 0.01"
     ival = max(floor_tick(premium * cfg.ival_pct, tick), tick)
     jval = max(floor_tick(ival * cfg.jval_frac, tick), tick)
     sval = max(floor_tick(ival * cfg.sval_mult, tick), tick)

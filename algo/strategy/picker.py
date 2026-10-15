@@ -6,6 +6,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
+from algo.core.nulls import good_price, is_null
 from algo.strategy.config import RsiOptionsConfig
 
 LEG_TYPE = {"CALL": "CE", "PUT": "PE"}
@@ -14,11 +15,11 @@ LEG_TYPE = {"CALL": "CE", "PUT": "PE"}
 class OptionPicker:
     """Strike nearest to a reference price: the future close, or the synthetic future K + CE(K) - PE(K).
 
-    `price_fn(token)` returns the option's last price in raw units (paise) or None.
+    All prices are in currency units. `price_fn(token)` returns an option's last price or None.
     """
 
-    def __init__(self, master, cfg: RsiOptionsConfig, price_div: float, price_fn: Callable[[int], float | None]):
-        self.master, self.cfg, self.div, self.price = master, cfg, price_div, price_fn
+    def __init__(self, master, cfg: RsiOptionsConfig, price_fn: Callable[[int], float | None]):
+        self.master, self.cfg, self.price = master, cfg, price_fn
 
     def expiry(self, symbol: str, option_type: str, fut_expiry, today: pd.Timestamp):
         exps = self.master.expiries(symbol, option_type)
@@ -40,21 +41,23 @@ class OptionPicker:
         if len(j) == 0:
             return None
         ce, pe = self.price(int(ce_toks[i])), self.price(int(pe_toks[j[0]]))
-        if ce is None or pe is None:
+        if not good_price(ce) or not good_price(pe):
             return None
-        return k + (ce - pe) / self.div
+        return float(k + (ce - pe))
 
     def pick(self, symbol: str, fut_expiry, fut_close: float, leg: str, today: pd.Timestamp) -> tuple[int | None, str]:
         """(option token or None, human-readable explanation)."""
+        if not good_price(fut_close):                      # NaN would silently pick strike 0
+            return None, "no usable future price"
         ot = LEG_TYPE[leg]
         exp = self.expiry(symbol, ot, fut_expiry, today)
         if exp is None:
             return None, f"no {ot} expiry for {symbol}"
-        fut = fut_close / self.div
+        fut = float(fut_close)
         ref, how = fut, "future close"
         if self.cfg.synthetic:
             syn = self.synthetic(symbol, exp, fut)
-            if syn is not None:
+            if syn is not None and not is_null(syn) and syn > 0:
                 ref, how = syn, "synthetic"
             else:
                 how = "future close (no CE/PE price at the nearest strike)"

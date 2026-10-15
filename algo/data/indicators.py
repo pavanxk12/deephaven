@@ -1,12 +1,12 @@
 """One `indicator_values` table computed from `candles` with Deephaven's incremental `update_by`.
 
-Columns: Minute (start of the bar), Symbol, token, Pct, then int64 columns per indicator:
+Columns: Minute (start of the bar), Symbol, token, Pct, then one double column per indicator:
     SMA_<n>   simple average of the last n closes          EMA_<n>   exponential average of the close
-    RSI_<n>   RSI x 100 (Wilder smoothing)                 ATR_<n>   average true range (Wilder smoothing)
+    RSI_<n>   RSI, 0 to 100 (Wilder smoothing)             ATR_<n>   average true range (Wilder smoothing)
     MACD_<f>_<s>  MACD line     MACD_SIGNAL_<f>_<s>_<g>  its signal line     MACD_HIST_<f>_<s>_<g>  line - signal
 Every indicator makes exactly one column.
-Prices come out in the same unit as Close (paise for NSE). Pct = percent change from the first bar seen for the token,
-x 100 (+1.25% -> 125). Smoothed averages start from the first bar, as the EMA does; each is blank or a partial average
+Prices come out in the unit of the candles (proper currency units). Pct = percent change from the first bar seen for
+the token (+1.25 = +1.25%). A blank is a Deephaven null, never a number. Smoothed averages start from the first bar, as the EMA does; each is blank or a partial average
 until it has enough bars (see the class docs).
 
 Every indicator can have its own bar size: EMA(9) runs on the table's default bars, EMA(9, "5min") on 5-minute bars and
@@ -71,7 +71,7 @@ class SMA(Indicator):
         return [uby.rolling_avg_tick(cols=[f"{self.column}_raw = Px"], rev_ticks=self.n)]
 
     def final(self) -> str:
-        return f"{self.column} = Math.round({self.column}_raw)"
+        return f"{self.column} = {self.column}_raw"
 
 
 class EMA(Indicator):
@@ -90,7 +90,7 @@ class EMA(Indicator):
 
     def final(self) -> str:
         c, n = self.column, self.n
-        return f"{c} = Cnt < {n} ? Math.round(PxSum / Cnt) : Math.round({c}_raw)"
+        return f"{c} = Cnt < {n} ? PxSum / Cnt : {c}_raw"
 
 
 class RSI(Indicator):
@@ -111,8 +111,8 @@ class RSI(Indicator):
 
     def final(self) -> str:
         c, n = self.column, self.n
-        return (f"{c} = Cnt <= {n} ? NULL_LONG : Math.round(100.0 * "
-                f"(AvgL_{c} == 0 ? (AvgG_{c} > 0 ? 100.0 : 50.0) : 100.0 - 100.0 / (1.0 + AvgG_{c} / AvgL_{c})))")
+        return (f"{c} = Cnt <= {n} ? NULL_DOUBLE : "
+                f"(AvgL_{c} == 0 ? (AvgG_{c} > 0 ? 100.0 : 50.0) : 100.0 - 100.0 / (1.0 + AvgG_{c} / AvgL_{c}))")
 
 
 class _MACD(Indicator):
@@ -156,7 +156,7 @@ class MACD(_MACD):
 
     def final(self) -> str:
         c = self.column
-        return f"{c} = Cnt < {self.slow} ? NULL_LONG : Math.round({c}_f - {c}_s)"
+        return f"{c} = Cnt < {self.slow} ? NULL_DOUBLE : {c}_f - {c}_s"
 
 
 class MACD_SIGNAL(_MACD):
@@ -168,7 +168,7 @@ class MACD_SIGNAL(_MACD):
 
     def final(self) -> str:
         c = self.column
-        return f"{c} = Cnt < {self.slow + self.signal - 1} ? NULL_LONG : Math.round({c}_g)"
+        return f"{c} = Cnt < {self.slow + self.signal - 1} ? NULL_DOUBLE : {c}_g"
 
 
 class MACD_HIST(_MACD):
@@ -180,7 +180,7 @@ class MACD_HIST(_MACD):
 
     def final(self) -> str:
         c = self.column
-        return f"{c} = Cnt < {self.slow + self.signal - 1} ? NULL_LONG : Math.round({c}_m - {c}_g)"
+        return f"{c} = Cnt < {self.slow + self.signal - 1} ? NULL_DOUBLE : {c}_m - {c}_g"
 
 
 class ATR(Indicator):
@@ -204,7 +204,7 @@ class ATR(Indicator):
                 ("ops", [uby.ema_tick(decay_ticks(1.0 / self.n), [f"{c}_atr = {c}_tr"])])]
 
     def final(self) -> str:
-        return f"{self.column} = Cnt < {self.n} ? NULL_LONG : Math.round({self.column}_atr)"
+        return f"{self.column} = Cnt < {self.n} ? NULL_DOUBLE : {self.column}_atr"
 
 
 # Every indicator listed here is also exposed as a function in the session by `algo.install` (EMA(9), RSI(14), ...).
@@ -291,7 +291,7 @@ def _compute(bars, indicators, with_pct: bool):
 
     out = ["Minute", "Symbol", "token"]
     if with_pct:
-        out.append("Pct = (isNull(DayOpen) || DayOpen == 0) ? NULL_LONG : Math.round(10000.0 * (Px - DayOpen) / DayOpen)")
+        out.append("Pct = (isNull(DayOpen) || DayOpen == 0) ? NULL_DOUBLE : 100.0 * (Px - DayOpen) / DayOpen")
     return t.view(out + [i.final() for i in indicators])
 
 

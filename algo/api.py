@@ -52,11 +52,13 @@ def master_build(exchange: str | None = None, day: str | None = None, force: boo
     _run(Master(day=day, force_rebuild=force))
 
 
-def candles_start(timeframe: str = "1min", build_from: int | None = None) -> None:
+def candles_start(timeframe: str = "1min", multiplier: float | None = None, build_from: int | None = None) -> None:
     """Start building candles from the live feed: candles_start("30s"), "1min" (default), "5min", "15min".
+    `multiplier` is applied to every feed price to get proper rates: a feed in paise needs 0.01
+    (candles_start("1min", 0.01)); the default is the exchange's own scale (NSE 0.01, US 1).
     Calling it again restarts the builder (the candles table starts empty); indicators, the straddle and the strategy
     follow the new table by themselves. `build_from`: epoch second of the first bar; default = the next full bar."""
-    _run(Candles(timeframe, build_from=build_from))
+    _run(Candles(timeframe, multiplier=multiplier, build_from=build_from))
 
 
 def candles_stop() -> None:

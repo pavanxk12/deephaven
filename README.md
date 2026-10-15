@@ -72,6 +72,22 @@ straddle_start(0)                     # nearest option expiry only; 1 = two near
 The strategy and the console are plugins (`scripts/02_strategy.py`, `03_console.py`). Running a plugin whose name is
 already running replaces it, so re-running a call is always safe. `algo.reload()` after editing the package.
 
+## Prices and units
+
+`candles_start("1min", 0.01)`: the **multiplier** is applied to every feed price, so a feed in paise (x100) gets
+`0.01` and the candles hold proper rates. The default is the exchange's own scale (NSE 0.01, US 1). From the candles on,
+**everything is in proper currency units as doubles** (candles, indicators, straddle, strategy): there is no `price_div`
+anywhere downstream, so there is one place where the scale can be wrong. Volume stays int64.
+
+* Why doubles: a multiplier like 0.01 makes prices fractional, so int64 would round 245.67 to 246. Prices are rounded to 6
+  decimals on the way in (so 24567 x 0.01 is stored as 245.67, not 245.67000000000002); averages are not rounded.
+* Orders are the one place prices become integers again: sizes are floored/ceiled to the instrument's tick with a small
+  nudge so the bridge's truncation (x100, int) lands on the tick.
+* RSI is 0 to 100, `Pct` is a percent (1.25 = +1.25%), a blank is a Deephaven null.
+* The code assumes `fo_market_data.ltp` is in the exchange's minor unit (NSE: paise). Set the multiplier to match the real feed.
+* Bad input is dropped, never stored: NaN, infinity, null, zero or negative prices, negative volume, unparseable times.
+  Dropped rows are counted (`app.status()` shows how many).
+
 ## Adding things
 
 **An indicator** — one small class in `algo/data/indicators.py` (see `EMA`, `RSI`): `column`, `ops()` (the

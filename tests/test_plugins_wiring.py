@@ -78,13 +78,14 @@ def test_candles_rows_reach_the_writer(fake_dh, master, monkeypatch):
     app = App({"fo_market_data": FakeTable()}, NSE, Paths())
     app.plugins["master"] = type("M", (), {"name": "master", "data": master, "_teardown": lambda self: None})()
     app.run(Candles(build_from=0))
-    fake_dh[0].fn(Update([(100, 10.4, 5, "14-10-2030 10:15:05"), (100, 11.2, 9, "14-10-2030 10:15:40"),
-                          (100, 9.6, 12, "14-10-2030 10:16:30")]), False)
+    fake_dh[0].fn(Update([(100, 1040, 5, "14-10-2030 10:15:05"), (100, 1120, 9, "14-10-2030 10:15:40"),
+                          (100, 960, 12, "14-10-2030 10:16:30")]), False)
     (w,) = writers
     (minute, symbol, token, o, h, l, close, vol) = w.rows[0]
-    assert (symbol, token, o, h, l, close, vol) == ("NIFTY 30JAN30 24900 CE", 100, 10, 11, 10, 11, 4)
+    # the NSE feed is in paise: the default multiplier 0.01 gives rupees, and float noise is rounded away
+    assert (symbol, token, o, h, l, close, vol) == ("NIFTY 30JAN30 24900 CE", 100, 10.4, 11.2, 10.4, 11.2, 4)
     assert minute % 60 == 0
-    assert w.schema["Close"] == "int64"                 # NSE keeps integer prices
+    assert w.schema["Close"] == "double" and w.schema["Volume"] == "int64"
 
 
 def test_a_bad_tick_does_not_stop_the_listener(fake_dh, master, monkeypatch):

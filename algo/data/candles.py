@@ -1,8 +1,11 @@
 """Candles of 30s / 1min / 5min / 15min built from the live tick table (`fo_market_data`).
 
 `LttParser` and `CandleAggregator` are pure Python (unit tested); `Candles` is the Deephaven plugin around them.
-Output table `candles`: Minute (start of the bar), Symbol, token, Open, High, Low, Close, Volume
-(one row per token per closed bar).
+Output table `candles`: Minute (start of the bar), Symbol, token, Open, High, Low, Close (double, in proper currency
+units), Volume (int64); one row per token per closed bar.
+
+Prices are `feed price x multiplier`, rounded to `decimals` places so binary-float noise (245.67000000000002) never reaches
+a table. A feed in paise needs multiplier 0.01. Anything that is not a finite price above zero is dropped, never stored.
 """
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ from datetime import datetime
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+from algo.core.nulls import good_price, good_volume
 from algo.core.plugin import Plugin
 from algo.core.timeframe import format_timeframe, parse_timeframe
 
@@ -109,10 +113,17 @@ class Candles(Plugin):
     COLS = ["token", "ltp", "vol", "ltt"]
     GRACE_S = 10          # a minute is closed this many seconds after its end
 
-    def __init__(self, timeframe: str = "1min", build_from: int | None = None):
-        """timeframe: "30s", "1min", "5min", "15min". build_from: epoch second of the first bar to build;
+    def __init__(self, timeframe: str = "1min", multiplier: float | None = None, build_from: int | None = None,
+                 decimals: int = 6):
+        """timeframe: "30s", "1min", "5min", "15min". multiplier: applied to every feed price to get proper rates
+        (feed in paise -> 0.01); None = 1 / the exchange's price_div. build_from: epoch second of the first bar to build;
         None = the next full bar."""
         super().__init__()
+        if multiplier is not None and (isinstance(multiplier, (bool, str)) or not good_price(multiplier)):
+            raise ValueError(f"multiplier must be a number above zero (e.g. 0.01 for a feed in paise), got {multiplier!r}")
+        if not isinstance(decimals, int) or isinstance(decimals, bool) or not 0 <= decimals <= 12:
+            raise ValueError("decimals must be a whole number from 0 to 12")
+        self.multiplier, self.decimals, self.skipped = multiplier, decimals, 0
         self.timeframe = format_timeframe(parse_timeframe(timeframe))
         self.bucket = parse_timeframe(timeframe)
         self.build_from = build_from
@@ -125,7 +136,9 @@ class Candles(Plugin):
         app, mk = self.app, self.app.market
         feed = app.table(mk.feed)
         symbol_of = app.master.symbol_of
-        price_t = dht.int64 if mk.int_prices else dht.double
+        price_t = dht.double
+        self.scale = self.multiplier if self.multiplier is not None else 1.0 / mk.price_div
+        app.shared["price_multiplier"] = self.scale
         writer = DynamicTableWriter({
             "MinuteEpoch": dht.int64, "Symbol": dht.string, "token": dht.int64,
             "Open": price_t, "High": price_t, "Low": price_t, "Close": price_t, "Volume": dht.int64,
@@ -136,10 +149,8 @@ class Candles(Plugin):
             "Symbol", "token", "Open", "High", "Low", "Close", "Volume",
         ]))
 
-        px = (lambda v: round(v)) if mk.int_prices else (lambda v: float(v))
-
         def emit(token, minute, o, h, l, c, vol):
-            writer.write_row(minute, symbol_of.get(token), token, px(o), px(h), px(l), px(c), vol)
+            writer.write_row(minute, symbol_of.get(token), token, float(o), float(h), float(l), float(c), int(vol))
             self.rows += 1
 
         b = self.bucket
@@ -147,11 +158,35 @@ class Candles(Plugin):
         self.agg = CandleAggregator(emit, start, b)
         self._parse = LttParser(mk.ltt_fmt, mk.ltt_zone)
         self.listen(feed, self._on_update, replay=True)
-        self.log.info("%s candles, market=%s ltt_tz=%s fmt=%s feed=%s tokens mapped=%d",
-                      self.timeframe, mk.code, mk.ltt_tz, mk.ltt_fmt, mk.feed, len(symbol_of))
+        self.log.info("%s candles, feed price x %g, market=%s ltt_tz=%s fmt=%s feed=%s tokens mapped=%d",
+                      self.timeframe, self.scale, mk.code, mk.ltt_tz, mk.ltt_fmt, mk.feed, len(symbol_of))
 
     def describe(self) -> str:
-        return f"{self.timeframe}, {self.rows} candles written"
+        return f"{self.timeframe}, feed x {getattr(self, 'scale', '?'):g}, {self.rows} candles, {self.skipped} bad ticks skipped"
+
+    def _tick(self, agg: CandleAggregator, tok, ltp, vol, lt) -> int | None:
+        """One feed row -> the aggregator. Returns the tick's time, or None if the row was not usable.
+        Nothing a feed row contains can raise out of here: a bad row is counted and skipped."""
+        try:
+            if lt is None or not good_price(ltp) or not good_volume(vol):
+                return None
+            tok, vol = int(tok), int(vol)
+            if not agg.is_new(tok, lt, vol):
+                return None
+            sec = self._parse(lt)
+            if sec is None:
+                return None
+            price = round(float(ltp) * self.scale, self.decimals)
+            if not good_price(price):                  # the multiplier rounded it to zero
+                return None
+            agg.mark(tok, lt, vol)
+            agg.tick(tok, price, vol, sec)
+            return sec
+        except Exception as e:
+            self.skipped += 1
+            if self.skipped <= 10 or self.skipped % 1000 == 0:
+                self.log.warning("tick skipped (%d so far) token=%r: %r", self.skipped, tok, e)
+            return None
 
     def _on_update(self, update, is_replay) -> None:
         agg, latest = self.agg, 0
@@ -159,21 +194,8 @@ class Candles(Plugin):
             if ch is None:
                 continue
             for tok, ltp, vol, lt in zip(ch["token"], ch["ltp"], ch["vol"], ch["ltt"]):
-                if lt is None or vol < 0 or not (ltp == ltp and ltp > 0):
-                    continue
-                tok, vol = int(tok), int(vol)
-                if not agg.is_new(tok, lt, vol):
-                    continue
-                try:
-                    sec = self._parse(lt)
-                    if sec is None:
-                        continue
-                    agg.mark(tok, lt, vol)
-                    agg.tick(tok, float(ltp), vol, sec)
-                except Exception as e:             # one bad tick must never stop the listener
-                    self.log.warning("tick skipped token=%s: %r", tok, e)
-                    continue
-                if sec > latest:
+                sec = self._tick(agg, tok, ltp, vol, lt)
+                if sec is not None and sec > latest:
                     latest = sec
         if latest:
             agg.flush(int((latest - self.GRACE_S) // self.bucket * self.bucket))

@@ -7,6 +7,7 @@ from typing import Mapping
 import pandas as pd
 
 from algo.core import log
+from algo.core.nulls import is_null
 
 _log = log.get("universe")
 
@@ -57,7 +58,7 @@ def middle_set(pcts: Mapping[int, int | None], basket_of: Mapping[int, str]) -> 
     """
     out: set[int] = set()
     for b in set(basket_of.values()):
-        ranked = sorted((pcts[t], t) for t in basket_of if basket_of[t] == b and pcts.get(t) is not None)
+        ranked = sorted((pcts[t], t) for t in basket_of if basket_of[t] == b and not is_null(pcts.get(t)))
         n = len(ranked)
         if n < 4:
             continue

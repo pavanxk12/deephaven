@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Callable
 
 from algo.core.plugin import Plugin
@@ -23,10 +24,11 @@ def _read_ints(path: str) -> dict[int, int]:
 
 
 def _write_json(path: str, obj: dict) -> None:
+    """Write through a temp file and rename, so a crash can never leave a half-written state file."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(obj, f, indent=1)
+        json.dump(dict(obj), f, indent=1)
     os.replace(tmp, path)
 
 
@@ -44,6 +46,7 @@ class Portfolios:
         self.tracked: set[int] = set()                            # future tokens some strategy follows this session
         self.session_pfs: set[int] = set()                        # PFs touched this session (current and retired)
         self._listeners: list[Callable[[], None]] = []
+        self._lock = threading.RLock()          # strategy threads, the bridge loop and the UI all change this state
 
     # ---- change notification (the console redraws on it) ---------------------------------------
     def on_change(self, callback: Callable[[], None]) -> Callable[[], None]:
@@ -60,24 +63,26 @@ class Portfolios:
     # ---- registration ------------------------------------------------------------------------
     def track(self, tokens) -> None:
         """A strategy follows these future tokens: their existing PFs join this session."""
-        for t in tokens:
-            self.tracked.add(t)
-            self.allow.setdefault(t, True)
-            self.live.setdefault(t, None)
-            if t in self.pf_map:
-                pf = self.pf_map[t]
-                self.session_pfs.add(pf)
-                self.caps.setdefault(pf, 0)
+        with self._lock:
+            for t in tokens:
+                self.tracked.add(t)
+                self.allow.setdefault(t, True)
+                self.live.setdefault(t, None)
+                if t in self.pf_map:
+                    pf = self.pf_map[t]
+                    self.session_pfs.add(pf)
+                    self.caps.setdefault(pf, 0)
         self.changed()
 
     def reset(self, tokens=None) -> None:
         """Forget what the strategy believes it has done: live legs, option choice, caps, cooldowns."""
-        for t in (self.tracked if tokens is None else tokens):
-            self.live[t] = None
-            self.opt_of.pop(t, None)
-            self.last_fail.pop(t, None)
-            if t in self.pf_map:
-                self.caps[self.pf_map[t]] = 0
+        with self._lock:
+            for t in list(self.tracked if tokens is None else tokens):
+                self.live[t] = None
+                self.opt_of.pop(t, None)
+                self.last_fail.pop(t, None)
+                if t in self.pf_map:
+                    self.caps[self.pf_map[t]] = 0
         self.changed()
 
     # ---- lookups -----------------------------------------------------------------------------
@@ -134,27 +139,30 @@ class Portfolios:
         return max(found) if found else None
 
     def create(self, token: int) -> int:
-        last = self.last_pf()
-        pf = self.pf_start if last is None else last + 1
-        self.pf_map[token] = pf
-        self.save_map()
-        self.session_pfs.add(pf)
-        self.caps.setdefault(pf, 0)
+        with self._lock:                                  # two signals must never get the same number
+            last = self.last_pf()
+            pf = self.pf_start if last is None else last + 1
+            self.pf_map[token] = pf
+            self.save_map()
+            self.session_pfs.add(pf)
+            self.caps.setdefault(pf, 0)
         self.changed()
         return pf
 
     def revert(self, token: int, old_pf: int, new_pf: int) -> None:
         """The new PF never reached the bridge: the stock goes back to its old PF."""
-        self.pf_map[token] = old_pf
-        self.save_map()
-        self.session_pfs.discard(new_pf)
-        self.caps.pop(new_pf, None)
+        with self._lock:
+            self.pf_map[token] = old_pf
+            self.save_map()
+            self.session_pfs.discard(new_pf)
+            self.caps.pop(new_pf, None)
         self.changed()
 
     # ---- mutations ---------------------------------------------------------------------------
     def subscribe(self, pf: int, option_token: int) -> None:
-        self.subscribed[pf] = option_token
-        _write_json(self.sub_file, self.subscribed)
+        with self._lock:
+            self.subscribed[pf] = option_token
+            _write_json(self.sub_file, self.subscribed)
         self.changed()
 
     def set_paused(self, pf: int, paused: bool) -> None:
@@ -173,7 +181,8 @@ class Portfolios:
             self.opt_of[token] = option
 
     def save_map(self) -> None:
-        _write_json(self.map_file, self.pf_map)
+        with self._lock:
+            _write_json(self.map_file, self.pf_map)
 
 
 class Book(Plugin):

@@ -13,7 +13,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from algo.core.nulls import NULL_LONG
+from algo.core.nulls import good_price, is_null
 from algo.core.plugin import Plugin
 from algo.strategy.config import RsiOptionsConfig
 from algo.strategy.picker import OptionPicker
@@ -72,10 +72,10 @@ class RsiOptions(Plugin):
 
         self.ltp: dict[int, float] = {}                       # token (futures AND options) -> last Close, raw
         self.zones = {t: None for t in self.tokens}           # RSI zone
-        self.rsis = {t: None for t in self.tokens}            # last RSI x 100
-        self.pcts = {t: None for t in self.tokens}            # last Pct-from-open x 100
+        self.rsis = {t: None for t in self.tokens}            # last RSI (0 to 100)
+        self.pcts = {t: None for t in self.tokens}            # last Pct-from-open (percent)
         self.off_seen: dict[int, str] = {}                    # leg already logged as "would BUY" while sending is off
-        self.picker = OptionPicker(self.master, cfg, self.market.price_div, self.opt_price)
+        self.picker = OptionPicker(self.master, cfg, self.opt_price)
 
     def _reattach_px(self, table) -> None:
         self.stop_listener(self._h_px)
@@ -124,30 +124,32 @@ class RsiOptions(Plugin):
         try:
             snap = to_pandas(self.app.table("candles").where(flt).last_by("token"))
             for t, c in zip(snap["token"], snap["Close"]):
-                self.ltp[int(t)] = float(c)
+                if good_price(c):
+                    self.ltp[int(t)] = float(c)
         except Exception as e:
             self.log.warning("could not seed prices: %s", e)
         try:
             h = to_pandas(self.app.table("indicators").where(flt).last_by("token").view(["token", cfg.rsi_col, cfg.pct_col]))
             for t, rsi, pct in zip(h["token"], h[cfg.rsi_col], h[cfg.pct_col]):
-                if not pd.isna(pct) and int(pct) != NULL_LONG:
-                    self.pcts[int(t)] = int(pct)
-                if pd.isna(rsi) or int(rsi) == NULL_LONG:
+                if not is_null(pct):
+                    self.pcts[int(t)] = float(pct)
+                if is_null(rsi):
                     continue
-                self.zones[int(t)] = self.rsi_zone(int(rsi))
-                self.rsis[int(t)] = int(rsi)
+                self.zones[int(t)] = self.rsi_zone(float(rsi))
+                self.rsis[int(t)] = float(rsi)
         except Exception as e:
             self.log.warning("could not replay history: %s", e)
 
     def opt_price(self, token: int) -> float | None:
-        """Last Close (raw) of any token; falls back to a query on `candles` if no tick was seen yet."""
+        """Last Close of any token, in currency units; falls back to a query on `candles` if no tick was seen yet.
+        None when there is no usable price."""
         if token in self.ltp:
             return self.ltp[token]
         try:
             from deephaven.pandas import to_pandas
             with self.app.in_ctx():
                 s = to_pandas(self.app.table("candles").where(f"token == {token}").last_by("token"))
-            if len(s):
+            if len(s) and good_price(s["Close"].iloc[0]):
                 self.ltp[token] = float(s["Close"].iloc[0])
                 return self.ltp[token]
         except Exception as e:
@@ -155,10 +157,13 @@ class RsiOptions(Plugin):
         return None
 
     # ---- signal logic -------------------------------------------------------------------------
-    def rsi_zone(self, rsi_x100: int) -> str | None:
-        if rsi_x100 > self.cfg.rsi_high * 100:
+    def rsi_zone(self, rsi: float) -> str | None:
+        """OVERBOUGHT / OVERSOLD / None. A missing value is never in a zone."""
+        if is_null(rsi):
+            return None
+        if rsi > self.cfg.rsi_high:
             return "OVERBOUGHT"
-        if rsi_x100 < self.cfg.rsi_low * 100:
+        if rsi < self.cfg.rsi_low:
             return "OVERSOLD"
         return None
 
@@ -199,7 +204,7 @@ class RsiOptions(Plugin):
                               self.master.symbol_of.get(opt, "?"), leg)
             return
         rsi = self.rsis[token]
-        self.log.info("%s RSI %s -> %s", name, rsi / 100 if rsi is not None else "?", zone)
+        self.log.info("%s RSI %s -> %s", name, f"{rsi:.2f}" if rsi is not None else "?", zone)
         self.activate(token, leg)
 
     def make_params(self, option: int) -> dict | None:
@@ -210,7 +215,7 @@ class RsiOptions(Plugin):
         if tick is None:
             self.log.warning("option %s has no tick in master, skipped", option)
             return None
-        params, why = option_params(px / self.market.price_div, tick, self.cfg)
+        params, why = option_params(px, tick, self.cfg)
         if params is None:
             self.log.warning("option %s %s, NOT sent", option, why)
         return params
@@ -254,7 +259,7 @@ class RsiOptions(Plugin):
         if ch is None:
             return
         for tok, close in zip(ch["token"], ch["Close"]):
-            if close != NULL_LONG and close > 0:
+            if good_price(close):
                 self.ltp[int(tok)] = float(close)              # futures AND options (options are needed for sizing)
 
     def _on_indicators(self, update, is_replay) -> None:
@@ -268,11 +273,11 @@ class RsiOptions(Plugin):
                 tok = int(tok)
                 if tok not in self.inst:
                     continue
-                if pct != NULL_LONG:
-                    self.pcts[tok] = int(pct)
-                if rsi == NULL_LONG:
+                if not is_null(pct):
+                    self.pcts[tok] = float(pct)
+                if is_null(rsi):
                     continue
-                rsi = int(rsi)
+                rsi = float(rsi)
                 zone = self.rsi_zone(rsi)
                 self.rsis[tok], self.zones[tok] = rsi, zone
                 if zone is None:
@@ -280,9 +285,8 @@ class RsiOptions(Plugin):
                 if cfg.log_rsi:
                     px = self.ltp.get(tok)
                     pc = self.pcts[tok]
-                    self.log.info("rsi %-24s %.2f pct %s close %s zone %s", self.inst[tok].name, rsi / 100,
-                                  pc / 100 if pc is not None else "?",
-                                  px / self.market.price_div if px else "?", zone)
+                    self.log.info("rsi %-24s %.2f pct %s close %s zone %s", self.inst[tok].name, rsi,
+                                  f"{pc:.2f}" if pc is not None else "?", px if px else "?", zone)
         # ranks shift on every update, so re-check every stock sitting in a zone
         if not self.in_window():
             return
@@ -343,7 +347,7 @@ class RsiOptions(Plugin):
         for t in self.tokens:
             r, p, pf, o = self.rsis[t], self.pcts[t], book.pf_of(t), book.opt_of.get(t)
             print(f"{self.inst[t].name:24} PF {pf if pf else '-'} basket {self.basket_of[t]} zone {self.zones[t]} "
-                  f"rsi {r / 100 if r is not None else None} pct {p / 100 if p is not None else None} mid {t in mid} "
+                  f"rsi {r} pct {p} mid {t in mid} "
                   f"leg {book.live.get(t)} option {self.master.symbol_of.get(o, '-') if o else '-'} "
                   f"subscribed {self.master.symbol_of.get(book.subscribed.get(pf), '-') if pf else '-'} "
                   f"cap {book.caps.get(pf, 0)} fut_close {self.ltp.get(t)} "

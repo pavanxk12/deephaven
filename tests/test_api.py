@@ -130,7 +130,7 @@ def test_helper_columns_do_not_clash_between_bar_sizes():
     assert "EMA_9_5min_raw" in b.final() and "EMA_9_5min_raw" not in a.final()
     r, q = RSI(5), RSI(5, "5min")
     assert "AvgG_RSI_5_5min" in q.final() and "AvgG_RSI_5_5min" not in r.final()
-    assert "NULL_LONG" in r.final()
+    assert "NULL_DOUBLE" in r.final() and "Math.round" not in r.final()
 
 
 # ---- the other starters -----------------------------------------------------------------------------

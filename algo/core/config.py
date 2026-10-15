@@ -24,8 +24,8 @@ class Market:
     tz: str                        # exchange timezone (session windows, "today", contract file date)
     ltt_tz: str                    # timezone the feed's `ltt` string is written in
     ltt_fmt: str                   # strptime format of `ltt` up to the minute (seconds are parsed separately)
-    price_div: float               # raw price -> currency units (paise -> rupees = 100)
-    int_prices: bool               # True: candle OHLC stored as int64 raw units; False: double
+    price_div: float               # raw feed / order price -> currency units (paise -> rupees = 100); the default candle
+                                   # multiplier is 1 / price_div
     expiry_epoch: str              # epoch of numeric contract expiries
     strike_div: float
     tick_div: float
@@ -45,7 +45,7 @@ class Market:
 
 NSE = Market(
     code="NSE", tz="Asia/Kolkata", ltt_tz="Asia/Kolkata", ltt_fmt="%d-%m-%Y %H:%M",
-    price_div=100.0, int_prices=True, expiry_epoch="1980-01-01", strike_div=100.0, tick_div=100.0,
+    price_div=100.0, expiry_epoch="1980-01-01", strike_div=100.0, tick_div=100.0,
     session=(dtime(9, 15), dtime(15, 30)), trade_window=(dtime(9, 20), dtime(15, 0)),
 )
 
@@ -53,7 +53,7 @@ NSE = Market(
 # the feed stamps IST, prices are assumed to be dollars (double), the session is the New York cash session.
 US = Market(
     code="US", tz="America/New_York", ltt_tz="Asia/Kolkata", ltt_fmt="%Y-%m-%dT%H:%M",
-    price_div=1.0, int_prices=False, expiry_epoch="1970-01-01", strike_div=1.0, tick_div=1.0,
+    price_div=1.0, expiry_epoch="1970-01-01", strike_div=1.0, tick_div=1.0,
     session=(dtime(9, 30), dtime(16, 0)), trade_window=(dtime(9, 35), dtime(15, 45)),
 )
 
