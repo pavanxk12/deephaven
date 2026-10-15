@@ -161,7 +161,7 @@ def classify(df: pd.DataFrame) -> MasterData:
 def build_symbol_map(m: MasterData) -> dict:
     sym = {}
     for r in m.opt.itertuples(index=False):
-        sym[int(r.Token)] = f"{r.TckrSymb} {r.expiry:%d%b%y}".upper() + f" {r.strike:g} {r.OptionType}"
+        sym[int(r.Token)] = f"{r.TckrSymb} {r.expiry:%d%b%y}".upper() + f" {r.strike:.10g} {r.OptionType}"
     for r in m.futs.itertuples(index=False):
         sym[int(r.fut_token)] = f"{r.TckrSymb} {r.expiry:%d%b%y}".upper() + " FUT"
     for r in m.eqs.itertuples(index=False):
