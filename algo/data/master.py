@@ -25,6 +25,16 @@ CACHE_VERSION = "v4"
 # =================================================================================================
 # data
 # =================================================================================================
+def _positive_pairs(frame: pd.DataFrame, token_col: str, value_col: str) -> dict:
+    """{token: value} for the rows whose value is a finite number above zero (vectorised, no per-row Python)."""
+    if value_col not in frame or not len(frame):
+        return {}
+    tokens = frame[token_col].to_numpy(dtype=np.int64)
+    values = frame[value_col].to_numpy(dtype=np.float64, na_value=np.nan)
+    ok = np.isfinite(values) & (values > 0)
+    return dict(zip(tokens[ok].tolist(), values[ok].tolist()))
+
+
 @dataclass
 class MasterData:
     chain: pd.DataFrame      # ce_token, pe_token, TckrSymb, expiry, strike
@@ -42,8 +52,9 @@ class MasterData:
     @cached_property
     def tick_of(self) -> dict:
         """token -> tick in currency units. An equity uses its own tick, else its future's."""
-        out = {int(t): float(k) for frame, col in ((self.futs, "fut_token"), (self.opt, "Token"), (self.eqs, "eq_token"))
-               if "tick" in frame for t, k in zip(frame[col], frame["tick"]) if pd.notna(k) and k > 0}
+        out = {}
+        for frame, col in ((self.futs, "fut_token"), (self.opt, "Token"), (self.eqs, "eq_token")):
+            out.update(_positive_pairs(frame, col, "tick"))
         fut_tick = self.futs.dropna(subset=["tick"]).drop_duplicates("TckrSymb").set_index("TckrSymb")["tick"]
         for tok, sym in zip(self.eqs["eq_token"], self.eqs["TckrSymb"]):
             if int(tok) not in out and sym in fut_tick.index and fut_tick[sym] > 0:
@@ -53,8 +64,29 @@ class MasterData:
     @cached_property
     def divisor_of(self) -> dict:
         """token -> the contract file's own Divisor (how many raw units make one currency unit)."""
-        return {int(t): float(d) for frame, col in ((self.futs, "fut_token"), (self.opt, "Token"), (self.eqs, "eq_token"))
-                if "divisor" in frame for t, d in zip(frame[col], frame["divisor"]) if pd.notna(d) and d > 0}
+        out = {}
+        for frame, col in ((self.futs, "fut_token"), (self.opt, "Token"), (self.eqs, "eq_token")):
+            out.update(_positive_pairs(frame, col, "divisor"))
+        return out
+
+    def tokens_for(self, symbols=None, kind: str | None = None) -> np.ndarray | None:
+        """Sorted token array of the chosen underlyings and kind ("FUT", "OPT", "EQ"); None = no restriction.
+        Used to keep candles and indicators to the instruments that are actually needed."""
+        if symbols is None and kind is None:
+            return None
+        if kind is not None and kind.upper() not in ("FUT", "OPT", "EQ"):
+            raise ValueError("kind must be FUT, OPT or EQ")
+        want = None if symbols is None else {str(s).upper() for s in symbols}
+        parts = []
+        for k, frame, col in (("FUT", self.futs, "fut_token"), ("OPT", self.opt, "Token"), ("EQ", self.eqs, "eq_token")):
+            if kind is not None and kind.upper() != k:
+                continue
+            f = frame if want is None else frame[frame["TckrSymb"].isin(want)]
+            parts.append(f[col].to_numpy(dtype=np.int64))
+        out = np.unique(np.concatenate(parts)) if parts else np.empty(0, dtype=np.int64)
+        if want is not None and not len(out):
+            raise ValueError(f"no instruments in master for symbols {sorted(want)}")
+        return out
 
     @cached_property
     def fut_info(self) -> dict:
@@ -173,14 +205,27 @@ def classify(df: pd.DataFrame) -> MasterData:
     return data
 
 
+def _expiry_text(s: pd.Series) -> pd.Series:
+    return s.dt.strftime("%d%b%y").str.upper()
+
+
+def _strike_text(s: pd.Series) -> pd.Series:
+    """Exact strike text ("16.25", "100000.5", "25000"); each distinct strike is formatted once."""
+    return s.map({v: f"{v:.10g}" for v in s.unique()})
+
+
 def build_symbol_map(m: MasterData) -> dict:
+    """token -> display symbol, built with column operations (no per-row Python)."""
     sym = {}
-    for r in m.opt.itertuples(index=False):
-        sym[int(r.Token)] = f"{r.TckrSymb} {r.expiry:%d%b%y}".upper() + f" {r.strike:.10g} {r.OptionType}"
-    for r in m.futs.itertuples(index=False):
-        sym[int(r.fut_token)] = f"{r.TckrSymb} {r.expiry:%d%b%y}".upper() + " FUT"
-    for r in m.eqs.itertuples(index=False):
-        sym[int(r.eq_token)] = r.TckrSymb
+    if len(m.opt):
+        names = m.opt["TckrSymb"] + " " + _expiry_text(m.opt["expiry"]) + " " + _strike_text(m.opt["strike"]) \
+            + " " + m.opt["OptionType"]
+        sym.update(zip(m.opt["Token"].astype("int64").tolist(), names.tolist()))
+    if len(m.futs):
+        names = m.futs["TckrSymb"] + " " + _expiry_text(m.futs["expiry"]) + " FUT"
+        sym.update(zip(m.futs["fut_token"].astype("int64").tolist(), names.tolist()))
+    if len(m.eqs):
+        sym.update(zip(m.eqs["eq_token"].astype("int64").tolist(), m.eqs["TckrSymb"].tolist()))
     return sym
 
 
@@ -198,8 +243,10 @@ def find_db(directory: str, day: str) -> str:
     return hits[-1]
 
 
-def read_contracts(db_path: str, market: Market, table: str | None = None) -> tuple[pd.DataFrame, str]:
-    """All rows of the contract table (auto-detected when `table` is None)."""
+def read_contracts(db_path: str, market: Market, table: str | None = None,
+                   extra: tuple[str, ...] = ()) -> tuple[pd.DataFrame, str]:
+    """The contract table (auto-detected when `table` is None), only the columns master uses plus any in `extra`
+    that exist, so the long descriptive text columns never reach memory."""
     c = market.contract_columns
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
@@ -212,7 +259,10 @@ def read_contracts(db_path: str, market: Market, table: str | None = None) -> tu
                     break
             if table is None:
                 raise RuntimeError(f"no table with columns {need}; tables: {names}")
-        return pd.read_sql_query(f'SELECT * FROM "{table}"', con), table
+        have = {r[1] for r in con.execute(f'PRAGMA table_info("{table}")')}
+        want = [name for name in dict.fromkeys([*c.values(), *extra]) if name in have]
+        cols = ", ".join(f'"{name}"' for name in want)
+        return pd.read_sql_query(f'SELECT {cols} FROM "{table}"', con), table
     finally:
         con.close()
 

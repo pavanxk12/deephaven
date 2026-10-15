@@ -1,14 +1,8 @@
 """Table queries behind the operator console. Pure Deephaven queries: no UI, no globals, constants inline."""
 from __future__ import annotations
 
-import pandas as pd
 
-
-def symbol_table(symbol_of: dict):
-    """token -> Symbol lookup as a static table (joined in the queries instead of calling Python per row)."""
-    from deephaven.pandas import to_table
-    return to_table(pd.DataFrame({"token": pd.Series(list(symbol_of), dtype="int64"),
-                                  "Symbol": pd.Series(list(symbol_of.values()), dtype="object")}))
+from algo.data.symbols import symbol_table  # noqa: F401,E402  (token -> Symbol lookup table, shared with the candles)
 
 
 def messages(events, cols: dict, tz: str):

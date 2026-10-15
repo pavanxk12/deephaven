@@ -52,34 +52,39 @@ def master_build(exchange: str | None = None, day: str | None = None, force: boo
     _run(Master(day=day, force_rebuild=force))
 
 
-def candles_start(timeframe: str = "1min", multiplier: float | None = None, build_from: int | None = None) -> None:
+def candles_start(timeframe: str = "1min", multiplier: float | None = None, *, symbols=None, kind: str | None = None,
+                  build_from: int | None = None) -> None:
     """Start building candles from the live feed: candles_start("30s"), "1min" (default), "5min", "15min".
     `multiplier` is applied to every feed price to get proper rates: a feed in paise needs 0.01
-    (candles_start("1min", 0.01)); the default is the exchange's own scale (NSE 0.01, US 1).
+    (candles_start("1min", 0.01)); the default is each contract's own Divisor from the contract file.
+    `symbols=["NIFTY", "BANKNIFTY"]` and/or `kind="FUT"` ("FUT", "OPT" or "EQ") build candles only for those instruments:
+    the candle table (and everything derived from it) shrinks in proportion, which is the main way to save memory.
     Calling it again restarts the builder (the candles table starts empty); indicators, the straddle and the strategy
     follow the new table by themselves. `build_from`: epoch second of the first bar; default = the next full bar."""
-    _run(Candles(timeframe, multiplier=multiplier, build_from=build_from))
+    _run(Candles(timeframe, multiplier=multiplier, symbols=symbols, kind=kind, build_from=build_from))
 
 
 def candles_stop() -> None:
     _app().stop("candles")
 
 
-def indicators(*specs, timeframe: str | None = None) -> None:
+def indicators(*specs, timeframe: str | None = None, symbols=None, kind: str | None = None) -> None:
     """Start computing indicators, e.g. indicators(EMA(9), RSI(5)). Calling it again adds to what is already running:
         indicators(EMA(9), RSI(5))   then   indicators(EMA(6))   ->   EMA_9, RSI_5 and EMA_6 are all computed.
     The result is the table `indicator_values`.
     Bar size: each indicator can have its own, EMA(9, "5min") -> column EMA_9_5min, on 5-minute bars rolled up from the
     candles (a whole multiple of the candle size). `timeframe="5min"` here is the default for the ones that name none.
+    Instruments: `symbols=["NIFTY"]` and/or `kind="FUT"` compute only for those (everything in `candles` by default);
+    each extra instrument costs memory for every indicator column, so narrow this to what you use.
     With no arguments it lists what is computed."""
     app = _app()
     plugin = app.get("indicators")
     if plugin is None:
-        _run(Indicators(specs, timeframe))
-    elif not specs and timeframe is None:
+        _run(Indicators(specs, timeframe, symbols=symbols, kind=kind))
+    elif not specs and timeframe is None and symbols is None and kind is None:
         print("computing:", ", ".join(plugin.columns()) or "(Pct only)", f"[{plugin.describe().split(':')[0]}]")
     else:
-        plugin.add(*specs, timeframe=timeframe)
+        plugin.add(*specs, timeframe=timeframe, symbols=symbols, kind=kind)
 
 
 def indicators_remove(*columns: str) -> None:

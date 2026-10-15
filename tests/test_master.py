@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from algo.core.config import NSE
 from algo.data.master import MasterData, classify, normalise, parse_expiry
@@ -111,3 +112,17 @@ def test_a_fractional_strike_sizes_on_the_tick():
     params, why = option_params(0.85, 0.05, RsiOptionsConfig.stocks())
     assert params is not None, why
     assert all(int(params[k] * 100) % 5 == 0 for k in ("ival", "trp", "lowerrange", "upperrange"))
+
+
+def test_tokens_for_narrows_to_the_wanted_instruments(master):
+    import numpy as np
+    assert master.tokens_for() is None
+    assert list(master.tokens_for(["NIFTY"], "FUT")) == [1, 2]
+    assert list(master.tokens_for(kind="FUT")) == [1, 2, 3]
+    assert list(master.tokens_for(["reliance"], "EQ")) == [900]
+    assert len(master.tokens_for(["NIFTY"])) == 2 + 12 // 2 and master.tokens_for(["NIFTY"]).dtype == np.int64
+    assert list(master.tokens_for(["NIFTY"], "OPT")) == sorted(master.tokens_for(["NIFTY"], "OPT"))
+    with pytest.raises(ValueError, match="no instruments"):
+        master.tokens_for(["NOPE"])
+    with pytest.raises(ValueError, match="kind must be"):
+        master.tokens_for(kind="BOND")

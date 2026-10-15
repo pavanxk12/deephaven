@@ -238,3 +238,34 @@ def test_indicators_follow_a_restarted_candles_table(monkeypatch):
     a.run(Indicators([EMA(9)]))
     a.publish("candles", "new")
     assert builds == ["old", "new"]
+
+
+# ---- instrument scope ---------------------------------------------------------------------------------
+def test_candles_start_passes_the_instrument_scope(session, started):
+    ns, _ = session
+    ns["candles_start"]("5min", symbols=["NIFTY"], kind="FUT")
+    assert started[-1].symbols == ["NIFTY"] and started[-1].kind == "FUT" and started[-1].bucket == 300
+    ns["candles_start"]()
+    assert started[-1].symbols is None and started[-1].kind is None
+
+
+def test_indicators_scope_is_set_once_and_changed_with_a_rebuild(session, no_build):
+    ns, app = session
+    ns["indicators"](EMA(9), kind="FUT")
+    assert (app["indicators"].symbols, app["indicators"].kind) == (None, "FUT")
+    ns["indicators"](RSI(5))                                           # no scope named: unchanged, one rebuild for the new column
+    assert app["indicators"].kind == "FUT" and len(no_build) == 2
+    ns["indicators"](symbols=["NIFTY"])                                # new scope alone: rebuild with the same columns
+    assert (app["indicators"].symbols, app["indicators"].kind) == (["NIFTY"], None) and len(no_build) == 3
+    ns["indicators"](symbols=["NIFTY"])                                # same scope again: nothing to do
+    assert len(no_build) == 3
+
+
+def test_a_failed_scope_change_rolls_back(session, monkeypatch):
+    ns, app = session
+    monkeypatch.setattr(Indicators, "_build", lambda self: None)
+    ns["indicators"](EMA(9), kind="FUT")
+    monkeypatch.setattr(Indicators, "_build", lambda self: (_ for _ in ()).throw(ValueError("no instruments")))
+    with pytest.raises(ValueError):
+        ns["indicators"](symbols=["NOPE"])
+    assert (app["indicators"].symbols, app["indicators"].kind) == (None, "FUT")

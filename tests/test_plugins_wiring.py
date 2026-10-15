@@ -18,6 +18,10 @@ class FakeTable:
         self.views.append(cols)
         return self
 
+    def natural_join(self, other, on=None, joins=None):
+        self.joins = getattr(self, "joins", []) + [(on, joins)]
+        return self
+
 
 class FakeWriter:
     def __init__(self, schema):
@@ -42,8 +46,11 @@ def fake_dh(monkeypatch):
     dh.dtypes = types.SimpleNamespace(int64="int64", double="double", string="string")
     tl = types.ModuleType("deephaven.table_listener")
     tl.listen = listen
+    dhp = types.ModuleType("deephaven.pandas")
+    dhp.to_table = lambda df: df                         # the lookup table is only handed to natural_join
     monkeypatch.setitem(sys.modules, "deephaven", dh)
     monkeypatch.setitem(sys.modules, "deephaven.table_listener", tl)
+    monkeypatch.setitem(sys.modules, "deephaven.pandas", dhp)
     return listeners
 
 
@@ -81,11 +88,14 @@ def test_candles_rows_reach_the_writer(fake_dh, master, monkeypatch):
     fake_dh[0].fn(Update([(100, 1040, 5, "14-10-2030 10:15:05"), (100, 1120, 9, "14-10-2030 10:15:40"),
                           (100, 960, 12, "14-10-2030 10:16:30")]), False)
     (w,) = writers
-    (minute, symbol, token, o, h, l, close, vol) = w.rows[0]
+    (minute, token, o, h, l, close, vol) = w.rows[0]
     # the NSE feed is in paise: the default multiplier 0.01 gives rupees, and float noise is rounded away
-    assert (symbol, token, o, h, l, close, vol) == ("NIFTY 30JAN30 24900 CE", 100, 10.4, 11.2, 10.4, 11.2, 4)
+    assert (token, o, h, l, close, vol) == (100, 10.4, 11.2, 10.4, 11.2, 4)
     assert minute % 60 == 0
     assert w.schema["Close"] == "double" and w.schema["Volume"] == "int64"
+    assert "Symbol" not in w.schema                       # the text is joined from a static table, not stored per row
+    published = app.tables["candles"]
+    assert published.joins and published.joins[0] == ("token", "Symbol")
 
 
 def test_a_bad_tick_does_not_stop_the_listener(fake_dh, master, monkeypatch):

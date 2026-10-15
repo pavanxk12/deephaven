@@ -88,6 +88,27 @@ anywhere downstream, so there is one place where the scale can be wrong. Volume 
 * Bad input is dropped, never stored: NaN, infinity, null, zero or negative prices, negative volume, unparseable times.
   Dropped rows are counted (`app.status()` shows how many).
 
+## Memory and speed
+
+The candle table grows all day (one row per instrument per bar) and every indicator column adds to it, so **how many
+instruments you build candles and indicators for** decides the memory. A rough guide, 1-minute bars:
+
+| instruments | rows per day | candles (numbers only, ~64 B/row) |
+|---|---|---|
+| 700 (futures + a few chains) | 262,500 | ~17 MB |
+| 32,000 (every option of every symbol) | 12,000,000 | ~770 MB, plus ~8 B per row per indicator column |
+
+* Restrict at the source: `candles_start("1min", symbols=["NIFTY","BANKNIFTY"])`, `kind="FUT"` (or `"OPT"`, `"EQ"`).
+  Restrict indicators separately with `indicators(..., symbols=[...], kind="FUT")` (they can be narrower than candles).
+* The candle table stores numbers only; the `Symbol` text is joined from one small table, not kept per row.
+* Indicator formulas that need no memory per row are lazy (`update_view`); only the running state an indicator really needs
+  is stored (the running price sum only for EMA, the price change only for RSI / ATR, high / low only for ATR).
+* The feed batch is cleaned and scaled with numpy in one pass; only usable rows reach Python (about 2.4x faster than row by
+  row on a feed where a third of the rows have no trade yet, with identical candles).
+* No extra threads: candles and indicators run on Deephaven's own listener thread; only the straddle sampler and the
+  bridge (strategy) have a thread each.
+* These numbers are estimates from row sizes, not measurements of a running Deephaven.
+
 ## Adding things
 
 **An indicator** — one small class in `algo/data/indicators.py` (see `EMA`, `RSI`): `column`, `ops()` (the

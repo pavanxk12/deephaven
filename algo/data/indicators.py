@@ -32,6 +32,9 @@ def decay_ticks(alpha: float) -> float:
 class Indicator:
     """One output column. Subclasses set `base` ("EMA_9") and describe the calculation as `steps()`."""
     needs_delta = False            # True: the bar table provides D (price change)
+    needs_gain_loss = False        # True: and Gain / Loss (D split in two)
+    needs_pxsum = False            # True: and PxSum (running sum of closes, for the early running average)
+    needs_hilo = False             # True: and Hi / Lo (high and low of the bar)
     base = ""                      # column name without the bar size
 
     def __init__(self, timeframe: str | None = None):
@@ -76,6 +79,7 @@ class SMA(Indicator):
 
 class EMA(Indicator):
     """EMA with alpha 2/(n+1). While fewer than n bars exist it is the running average, so it never starts blank."""
+    needs_pxsum = True
 
     def __init__(self, n: int, timeframe: str | None = None):
         if not isinstance(n, int) or isinstance(n, bool) or n < 1:
@@ -96,6 +100,7 @@ class EMA(Indicator):
 class RSI(Indicator):
     """Wilder RSI (EMA with alpha 1/n of gains and losses). Blank until n price changes have been seen."""
     needs_delta = True
+    needs_gain_loss = True
 
     def __init__(self, n: int, timeframe: str | None = None):
         if not isinstance(n, int) or isinstance(n, bool) or n < 2:
@@ -187,6 +192,7 @@ class ATR(Indicator):
     """Average true range: Wilder smoothing (alpha 1/n) of max(high-low, |high-prev close|, |low-prev close|).
     The first bar's true range is high-low. Blank until n bars."""
     needs_delta = True            # previous close = Px - D
+    needs_hilo = True
 
     def __init__(self, n: int = 14, timeframe: str | None = None):
         if not isinstance(n, int) or isinstance(n, bool) or n < 1:
@@ -242,16 +248,19 @@ def group_by_bar(indicators, default_seconds: int, candle_seconds: int) -> dict[
 # =================================================================================================
 # the query
 # =================================================================================================
-def _bars(candles, bar_seconds: int, candle_seconds: int):
-    """Minute (bar start), Symbol, token, Px (close), Op (open), Hi, Lo, One: the candles, or rolled up into larger bars."""
-    cols = ["Minute", "Symbol", "token", "Px = Close * 1.0", "Op = Open * 1.0", "Hi = High * 1.0", "Lo = Low * 1.0", "One = 1"]
+def _bars(candles, bar_seconds: int, candle_seconds: int, hilo: bool = False):
+    """Minute (bar start), Symbol, token, Px (close), Op (open), One, and Hi / Lo when asked: the candles, or rolled up
+    into larger bars. Only the columns that are used are carried (a rolled-up high / low is a stored aggregate)."""
+    cols = ["Minute", "Symbol", "token", "Px = Close * 1.0", "Op = Open * 1.0", "One = 1"]
+    if hilo:
+        cols += ["Hi = High * 1.0", "Lo = Low * 1.0"]
     if bar_seconds == candle_seconds:
         return candles.view(cols)
     from deephaven import agg
-    return (candles.view([f"Minute = lowerBin(Minute, {bar_seconds} * SECOND)", "Symbol", "token",
-                          "Open", "High", "Low", "Close"])
-            .agg_by([agg.first("Open"), agg.max_("High"), agg.min_("Low"), agg.last("Close")],
-                    by=["Minute", "Symbol", "token"])
+    aggs = [agg.first("Open"), agg.last("Close")] + ([agg.max_("High"), agg.min_("Low")] if hilo else [])
+    src = ["Open", "Close"] + (["High", "Low"] if hilo else [])
+    return (candles.view([f"Minute = lowerBin(Minute, {bar_seconds} * SECOND)", "Symbol", "token", *src])
+            .agg_by(aggs, by=["Minute", "Symbol", "token"])
             .view(cols))
 
 
@@ -260,20 +269,22 @@ def _compute(bars, indicators, with_pct: bool):
     from deephaven import updateby as uby
     need_delta = any(i.needs_delta for i in indicators)
 
-    # bar count + running price sum per token (+ price change for RSI / ATR)
-    first = [uby.cum_sum(["Cnt = One", "PxSum = Px"])]
+    # bar count per token, plus only what some indicator uses: the running price sum (EMA), the price change (RSI, ATR)
+    sums = ["Cnt = One"] + (["PxSum = Px"] if any(i.needs_pxsum for i in indicators) else [])
+    first = [uby.cum_sum(sums)]
     if need_delta:
         first.append(uby.delta(["D = Px"]))
     t = bars.update_by(first, by="token")
 
+    # plain formulas are lazy (update_view): they are evaluated when read and take no memory per row
     helpers = []
     if with_pct:
         helpers.append("OpenFirst = Cnt == 1 ? Op : NULL_DOUBLE")
-    if any(i.base.startswith("RSI") for i in indicators):
+    if any(i.needs_gain_loss for i in indicators):
         helpers += ["Gain = isNull(D) ? NULL_DOUBLE : Math.max(D, 0.0)",
                     "Loss = isNull(D) ? NULL_DOUBLE : Math.max(-D, 0.0)"]
     if helpers:
-        t = t.update(helpers)
+        t = t.update_view(helpers)
 
     # the indicators' steps, run together step by step; the day-open carry-forward rides along in step 0
     plans = [ind.steps() for ind in indicators]
@@ -285,7 +296,7 @@ def _compute(bars, indicators, with_pct: bool):
                 kind, payload = plan[k]
                 (ops if kind == "ops" else updates).extend(payload)
         if updates:
-            t = t.update(updates)
+            t = t.update_view(updates)
         if ops:
             t = t.update_by(ops, by="token")
 
@@ -295,17 +306,22 @@ def _compute(bars, indicators, with_pct: bool):
     return t.view(out + [i.final() for i in indicators])
 
 
-def build_indicator_table(candles, candle_seconds: int, default_seconds: int, indicators):
-    """candles table -> indicator table (pure Deephaven query; no side effects)."""
+def build_indicator_table(candles, candle_seconds: int, default_seconds: int, indicators, token_table=None):
+    """candles table -> indicator table (pure Deephaven query; no side effects).
+    `token_table` (a table with a `token` column) limits the work to those instruments."""
+    if token_table is not None:
+        candles = candles.where_in(token_table, "token")
     groups = group_by_bar(indicators, default_seconds, candle_seconds)
     (driver_s, driver_inds), *coarser = groups.items()
-    table = _compute(_bars(candles, driver_s, candle_seconds), driver_inds, with_pct=True)
+    table = _compute(_bars(candles, driver_s, candle_seconds, any(i.needs_hilo for i in driver_inds)), driver_inds,
+                     with_pct=True)
     if not coarser:
         return table
     bins = []
     for bar_s, inds in coarser:
         cols = [i.column for i in inds]
-        g = _compute(_bars(candles, bar_s, candle_seconds), inds, with_pct=False).view(["Minute", "token"] + cols)
+        g = (_compute(_bars(candles, bar_s, candle_seconds, any(i.needs_hilo for i in inds)), inds, with_pct=False)
+             .view(["Minute", "token"] + cols))
         bins.append(f"Bin_{bar_s}")
         table = (table.update_view(f"Bin_{bar_s} = lowerBin(Minute, {bar_s} * SECOND)")
                  .natural_join(g, on=["token", f"Bin_{bar_s} = Minute"], joins=cols))
@@ -324,12 +340,15 @@ class Indicators(Plugin):
     requires = ("candles",)
     TABLE_VAR = "indicator_values"
 
-    def __init__(self, indicators=(), timeframe: str | None = None):
-        """timeframe: bar size for indicators that name none ("5min"); None = the candle size."""
+    def __init__(self, indicators=(), timeframe: str | None = None, symbols=None, kind: str | None = None):
+        """timeframe: bar size for indicators that name none ("5min"); None = the candle size.
+        symbols / kind: compute only for these underlyings (["NIFTY"]) and kinds ("FUT", "OPT", "EQ"); None = every
+        instrument in `candles`. Narrowing this is the main way to save memory and CPU."""
         super().__init__()
         if timeframe is not None:
             parse_timeframe(timeframe)
         self.timeframe = timeframe
+        self.symbols, self.kind = symbols, kind
         self.indicators: list[Indicator] = []
         self._merge(indicators)
 
@@ -352,20 +371,25 @@ class Indicators(Plugin):
         self.follow("candles", lambda _t: self._build())
         self._build()
 
-    def add(self, *specs, timeframe: str | None = None) -> list[str]:
-        """Start computing more indicators alongside the existing ones. Returns the new columns."""
-        before = (list(self.indicators), self.timeframe)
+    def add(self, *specs, timeframe: str | None = None, symbols=None, kind: str | None = None) -> list[str]:
+        """Start computing more indicators alongside the existing ones. Returns the new columns.
+        Naming `symbols` / `kind` again changes which instruments every indicator is computed for."""
+        before = (list(self.indicators), self.timeframe, self.symbols, self.kind)
         try:
+            rescope = (symbols is not None or kind is not None) and (symbols, kind) != (self.symbols, self.kind)
+            if rescope:
+                self.log.warning("instruments change to symbols=%s kind=%s: every indicator is recomputed", symbols, kind)
+                self.symbols, self.kind = symbols, kind
             if timeframe is not None and timeframe != self.timeframe:
                 parse_timeframe(timeframe)
                 self.log.warning("default bar size changes from %s to %s for indicators that name none",
                                  self.timeframe or "the candle size", timeframe)
                 self.timeframe = timeframe
             added = self._merge(specs)
-            if added or self.timeframe != before[1]:
+            if added or rescope or self.timeframe != before[1]:
                 self._build()
         except Exception:
-            self.indicators, self.timeframe = before
+            self.indicators, self.timeframe, self.symbols, self.kind = before
             raise
         return added
 
@@ -381,11 +405,18 @@ class Indicators(Plugin):
     def _build(self) -> None:
         candle_s = self.app.shared["candle_seconds"]
         default_s = default_bars(self.timeframe, candle_s)
-        table = build_indicator_table(self.app.table("candles"), candle_s, default_s, self.indicators)
+        tokens = self.app.master.tokens_for(self.symbols, self.kind)
+        token_table = None
+        if tokens is not None:
+            from deephaven.pandas import to_table
+            import pandas as pd
+            token_table = to_table(pd.DataFrame({"token": pd.Series(tokens, dtype="int64")}))
+        table = build_indicator_table(self.app.table("candles"), candle_s, default_s, self.indicators, token_table)
         self.app.publish("indicators", table, ns_name=self.TABLE_VAR)
         self.default_seconds = default_s
-        self.log.info("`%s`: Pct%s (default bars %s)", self.TABLE_VAR, "".join(", " + c for c in self.columns()),
-                      format_timeframe(default_s))
+        self.log.info("`%s`: Pct%s (default bars %s, %s)", self.TABLE_VAR, "".join(", " + c for c in self.columns()),
+                      format_timeframe(default_s),
+                      "all instruments" if tokens is None else f"{len(tokens)} instruments")
 
     def columns(self) -> list[str]:
         return [i.column for i in self.indicators]

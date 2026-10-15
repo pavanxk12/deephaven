@@ -26,7 +26,7 @@ def market_of(raw):
 
 @pytest.fixture(scope="module")
 def loaded():
-    raw, _ = read_contracts(DB, NSE)                # same column names for both exchanges
+    raw, _ = read_contracts(DB, NSE, extra=("Exch", "FullName"))      # same column names for both exchanges
     mk = market_of(raw)
     return raw, classify(normalise(raw, mk)), mk
 

@@ -147,7 +147,7 @@ def test_rsi_alone_adds_gain_and_loss(fake_uby):
 def test_high_and_low_come_along_when_candles_are_rolled_up(fake_uby):
     calls = run([ATR(5, "5min")], candle=60, default=60)
     agg = next(c for c in calls if c[0] == "agg_by")
-    assert [a[0] for a in agg[1]] == ["first", "max_", "min_", "last"]
+    assert sorted(a[0] for a in agg[1]) == ["first", "last", "max_", "min_"]
     assert "High" in str(calls[0]) and "Low" in str(calls[0])
 
 
@@ -157,3 +157,20 @@ def test_mixed_bar_sizes_join_the_coarser_group_on_the_bar_start(fake_uby):
     assert [j[1] for j in joins] == [["token", "Bin_300 = Minute"], ["token", "Bin_900 = Minute"]]
     assert joins[0][2] == ["EMA_9_5min"] and joins[1][2] == ["RSI_5_15min"]
     assert calls[-1][1] == ["Minute", "Symbol", "token", "Pct", "EMA_9", "EMA_9_5min", "RSI_5_15min"]
+
+
+def test_a_table_does_not_carry_columns_no_indicator_uses(fake_uby):
+    """EMA needs PxSum, RSI needs D / Gain / Loss, ATR needs Hi / Lo: a table without them must not carry them."""
+    sma = str(run([SMA(5)]))
+    assert "PxSum" not in sma and "Gain" not in sma and "Hi =" not in sma and "delta" not in sma
+    assert "PxSum" in str(run([EMA(5)])) and "Hi =" not in str(run([EMA(5)]))
+    rsi = str(run([RSI(5)]))
+    assert "Gain" in rsi and "delta" in rsi and "PxSum" not in rsi and "Hi =" not in rsi
+    atr = str(run([ATR(5)]))
+    assert "Hi = High" in atr and "delta" in atr and "Gain" not in atr and "PxSum" not in atr
+
+
+def test_plain_formulas_are_lazy_so_they_take_no_memory_per_row(fake_uby):
+    calls = run([RSI(5), ATR(5), MACD_SIGNAL(3, 6, 2)])
+    assert "update" not in {c[0] for c in calls}                    # no stored update(): only update_view and update_by
+    assert {"update_view", "update_by"} <= {c[0] for c in calls}
