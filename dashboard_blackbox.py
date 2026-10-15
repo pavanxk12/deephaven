@@ -195,8 +195,11 @@ def tile(label, text, color):
 
 
 @ui.component
-def summary_window(net_tbl, book_tbl, filter_ctl=None):
-    # net_tbl / book_tbl follow the overall time window; filter_ctl = the time filter button, top-right
+def summary_window(filter_ctl=None):
+    # filter_ctl = the user + time filter buttons, top-right; the tables follow the filters (read inside this panel)
+    a, b, user = use_filters()
+    net_tbl = ui.use_memo(lambda: net_for(a, b, user), [a, b, user])
+    book_tbl = ui.use_memo(lambda: book_for(a, b, user), [a, b, user])
     totals = ui.use_memo(
         lambda: net_tbl.agg_by(
             [agg.sum_(["BuyVal", "SellVal", "Realised", "M2M", "Fills"])]
@@ -256,7 +259,9 @@ def summary_window(net_tbl, book_tbl, filter_ctl=None):
 
 
 @ui.component
-def message_window(msgs):
+def message_window():
+    a, b, user = use_filters()
+    msgs = ui.use_memo(lambda: msgs_for(a, b, user), [a, b, user])
     kind, set_kind = ui.use_state("ALL")            # one of: ALL, TRADE, ORDER, EVENT, ERROR, INFO
 
     # "" = show all, otherwise the single selected type
@@ -298,7 +303,9 @@ def message_window(msgs):
 
 
 @ui.component
-def order_book(book_tbl):
+def order_book():
+    a, b, user = use_filters()
+    book_tbl = ui.use_memo(lambda: book_for(a, b, user), [a, b, user])
     return ui.panel(
         ui.table(
             book_tbl,
@@ -315,7 +322,9 @@ def order_book(book_tbl):
 
 
 @ui.component
-def net_positions(net_tbl):
+def net_positions():
+    a, b, user = use_filters()
+    net_tbl = ui.use_memo(lambda: net_for(a, b, user), [a, b, user])
     hide_flat, set_hide_flat = ui.use_state(False)
     kind, set_kind = ui.use_state("ALL")            # one of: ALL, FUT, OPT, EQ
 
@@ -838,12 +847,33 @@ def user_picker():
 # ===========================================================================
 # ONE DASHBOARD: summary (with time filter) + controls, messages left, order book + net positions right
 # ===========================================================================
-@ui.component
-def console():
-    applied, set_applied = ui.use_state(TIME_WINDOW["v"])    # (from, to) epoch seconds, set by the time picker
-    user, set_user = ui.use_state(USER_FILTER["v"])          # user id or None, set by the user picker
+def net_for(a, b, user):
+    conds = ([f"{TRADE_TIME} >= {a}"] if a is not None else []) + ([f"{TRADE_TIME} <= {b}"] if b is not None else []) + (
+        [user_cond("PF", user)] if user is not None else [])
+    return make_net(orders_trade.where(conds)) if conds else net_positions_table
 
-    def follow_window():                                     # look at both every second, redraw only when one changed
+
+def msgs_for(a, b, user):
+    conds = ([f"Ts >= epochSecondsToInstant({a}L)"] if a is not None else []) + (
+        [f"Ts <= epochSecondsToInstant({b}L)"] if b is not None else [])
+    if user is not None:
+        conds = conds + [user_cond("Pf", user)]
+    return messages.where(conds) if conds else messages
+
+
+def book_for(a, b, user):
+    conds = ([f"{ORDER_TIME} >= {a}"] if a is not None else []) + ([f"{ORDER_TIME} <= {b}"] if b is not None else []) + (
+        [user_cond("PF", user)] if user is not None else [])
+    return make_order_book(conds) if conds else order_book_table
+
+
+def use_filters():
+    """Hook for a panel: (from, to, user). The panel redraws itself when the time or user filter changes, so the
+    dashboard root never re-renders (re-rendering the root can make the layout fail: 'Root node can only have a single child')."""
+    applied, set_applied = ui.use_state(TIME_WINDOW["v"])
+    user, set_user = ui.use_state(USER_FILTER["v"])
+
+    def follow():
         stop = threading.Event()
 
         def loop():
@@ -859,43 +889,21 @@ def console():
         threading.Thread(target=loop, daemon=True).start()
         return stop.set
 
-    ui.use_effect(follow_window, [])
-    a, b = applied
+    ui.use_effect(follow, [])
+    return applied[0], applied[1], user
 
-    def trade_tbl():
-        conds = ([f"{TRADE_TIME} >= {a}"] if a is not None else []) + ([f"{TRADE_TIME} <= {b}"] if b is not None else []) + (
-            [user_cond("PF", user)] if user is not None else [])
-        return make_net(orders_trade.where(conds)) if conds else net_positions_table
 
-    def msg_tbl():
-        conds = ([f"Ts >= epochSecondsToInstant({a}L)"] if a is not None else []) + (
-            [f"Ts <= epochSecondsToInstant({b}L)"] if b is not None else [])
-        if user is not None:
-            conds = conds + [user_cond("Pf", user)]
-        return messages.where(conds) if conds else messages
-
-    def book_tbl_fn():
-        conds = ([f"{ORDER_TIME} >= {a}"] if a is not None else []) + ([f"{ORDER_TIME} <= {b}"] if b is not None else []) + (
-            [user_cond("PF", user)] if user is not None else [])
-        return make_order_book(conds) if conds else order_book_table
-
-    net_tbl = ui.use_memo(trade_tbl, [a, b, user])
-    msgs = ui.use_memo(msg_tbl, [a, b, user])
-    book_tbl = ui.use_memo(book_tbl_fn, [a, b, user])
-
-    return ui.dashboard(
-        ui.column(
-            ui.row(
-                ui.column(summary_window(net_tbl, book_tbl, ui.flex(user_picker(), time_picker(), gap="size-100", align_items="center")), width=72),
-                ui.column(control_panel(), width=28),
-                height=26,                                   # slightly taller: the filter row needs ~30px
-            ),
-            ui.row(
-                message_window(msgs),
-                ui.column(ui.row(order_book(book_tbl), height=30), ui.row(net_positions(net_tbl), height=70)),
-            ),
-        )
+# the dashboard is a plain call (no wrapper component): the simplest root, accepted by every deephaven.ui version
+operator_console = ui.dashboard(
+    ui.column(
+        ui.row(
+            ui.column(summary_window(ui.flex(user_picker(), time_picker(), gap="size-100", align_items="center")), width=72),
+            ui.column(control_panel(), width=28),
+            height=26,                                   # slightly taller: the filter row needs ~30px
+        ),
+        ui.row(
+            message_window(),
+            ui.column(ui.row(order_book(), height=30), ui.row(net_positions(), height=70)),
+        ),
     )
-
-
-operator_console = console()
+)

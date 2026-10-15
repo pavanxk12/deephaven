@@ -36,9 +36,9 @@ from deephaven.pandas import to_pandas
 # =============================== USER INPUT ===============================
 DRY_RUN = False              # True = only print what would be sent. Set False to go live.
 SEND_ON = False              # True = send commands to NATS. False = compute only. Switch live: send_on() / send_off()
-USER_ID = 3
+USER_ID = 4
 SENDER = "AUTOMATION"
-NATS_URL = "nats://192.168.1.130:4222"
+NATS_URL = "nats://192.168.1.104:4222"
 TIMEOUT_S = 5
 
 # What is traded
@@ -46,12 +46,12 @@ UNDERLYING = "NIFTY"                                 # signal = nearest future o
 OPT_EXPIRY_IDX = 0                                   # option expiry: 0 = nearest, 1 = next, 2 = the one after, ...
 PF_MAP_FILE = "/data/stocks_pf.json"                 # remembers underlying token -> PF (never reused)
 PF_SUB_FILE = "/data/stocks_pf_sub.json"             # remembers PF -> option token it is subscribed to
-PF_START = 1555                                      # first portfolio number, used ONLY when the two JSON files above hold no portfolio number yet
+PF_START = 1902                                     # first portfolio number, used ONLY when the two JSON files above hold no portfolio number yet
 # sent as the subscribe payload when a PF is created / repointed; only T1 (the OPTION token) is replaced
 SUB_PAYLOAD = {"T1": 0, "gtw": 32395, "PRNT": 1, "code": "", "ival": 1, "jval": 0.75, "side": "BUY", "sval": 3, "trp": 0,
                "jqty1": 1, "jqty2": 1, "openq": 0, "maxqty": 0, "target": 1000, "maxloss": -1000, "stoploss": -1000,
                "lowerrange": 0, "upperrange": 10000, "max_unhedge": 1, "strategyname": "Churning",
-               "USERIDENTIFIER": 3, "user_id": 3}
+               "USERIDENTIFIER": 4, "user_id": 4}
 RESET_ON_START = True       # forget live legs and caps on every paste (fresh start)
 RSI_HIGH = 60               # RSI above this -> buy PUT
 RSI_LOW = 40                # RSI below this -> buy CALL
@@ -73,7 +73,7 @@ TRP_PCT = 0.01
 # WARNING: every re-paste with this True adds another ADD_QTY to maxqty.
 ACT_ON_START = True
 
-ADD_QTY = 5                 # added to the cumulative maxqty on every activation / flip
+ADD_QTY = 3                 # added to the cumulative maxqty on every activation / flip
 
 PRICE_DIV = 100             # candle Close is paise -> 100. Use 1 if already rupees.
 
@@ -90,7 +90,7 @@ TRADE_END = dtime(15, 0)
 # other fields of the apply payload (maxqty, ranges, ival, jval, sval, side are set by the script)
 APPLY_PARAMS = {
     "jqty1": 1, "jqty2": 1,
-    "target": 5000, "stoploss": -5000, "maxloss": -5000,
+    "target": 2000, "stoploss": -2000, "maxloss": -2000,
     "max_unhedge": 1, "PRNT": 1,
 }
 # ==========================================================================
