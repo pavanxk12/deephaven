@@ -13,6 +13,79 @@ Code: `algo/data/master.py`, `algo/data/candles.py`, `algo/data/indicators.py`, 
 
 ---
 
+## 0. Where the data comes from
+
+There are two different sources, and they behave differently.
+
+| | **Contract master** | **Live feed `fo_market_data`** |
+|---|---|---|
+| what | the day's instrument list: token, symbol, expiry, strike, tick, lot, divisor | the latest trade of every instrument |
+| where | file `<yyyymmdd>DB.db3` (SQLite, one table `ResultSet`) in `/data/fo_market_data` (read-only mount) | a Deephaven table in the session, fed from Kafka (`hft.marketdata.fo` in your compose file) |
+| shape | static, written once a day | **ticking, updated in place** |
+| read by | `master_build()`, once, with pandas | `candles_start()`, continuously, with a table listener |
+| joined by | the integer `token` | the integer `token` |
+
+### The master file (db3)
+
+`20261015DB.db3` is an ordinary SQLite file with one table, `ResultSet`, one row per contract (85,272 rows for NSE F&O on
+2026-10-15, 79,728 for the US file of 2026-10-14). Columns used: `Token, Symbol, ExpiryDate, InstType, OptionType,
+StrikePrice, LotSize, TickSize, Divisor`. It is opened read-only, read once, turned into `MasterData` and cached. Nothing in it
+changes during the day. It answers *"what is token 48704?"*, *"what is the tick of this option?"*, *"how many raw units make
+one rupee?"* (the `Divisor`).
+
+### The feed table `fo_market_data`: updated, not appended
+
+This is the key point. The table has **one row per token**, and when a new trade arrives for a token **that row is changed in
+place**; no new row is added. So the table never grows; it always shows the last known state of each instrument.
+
+```
+ time ->     cycle 1                 cycle 2                 cycle 3
+ token 48704 added   ltp 2456700     modified ltp 2456750    modified ltp 2456725
+ token 48987 added   ltp 305000                              modified ltp 305100
+             (first sight = "added")      (every later change = "modified")
+```
+Columns the candle builder reads: `token`, `ltp` (last traded price, raw units), `vol` (**cumulative** volume for the day),
+`ltt` (time of that trade, as text).
+
+What this means for the code:
+
+* **Both kinds of change are processed.** The listener reads `update.added(...)` and `update.modified(...)` of every update
+  cycle. A token is "added" the first time it is seen and "modified" every time after.
+* **Unchanged rows come again.** Other fields of the row (quotes, for example) can change while the last trade does not, which
+  also shows up as a modification. The builder compares `(ltt, vol)` with the last trade it saw for that token and skips
+  repeats.
+* **The first batch is the current state.** The listener starts with `replay=True`, so it first receives the whole table as
+  "added" rows (one latest value per token). Rows older than the first bar build no candle; they only record the
+  cumulative volume, so the first candle's volume is correct.
+* **You see the last value per cycle, not every trade.** Deephaven delivers changes in update cycles (about one a second by
+  default). If a token trades three times inside one cycle, only the last trade is visible. Consequences:
+  * **Close** is exact (the last value at the end of the bar), and **Volume** is exact (it is a cumulative number, so
+    differences add up whatever was missed).
+  * **Open, High and Low are built from the sampled values**, so a spike that starts and ends inside one cycle can be
+    missed. For liquid, fast instruments the High / Low may be slightly narrower than the exchange's.
+  * If you need exact highs and lows, the source should be an **append-only stream** of every trade (the Kafka topic behind
+    this table), not the last-value table. `Candles` would then read only `added` rows. I have not built that; say if you want it.
+* **A quiet token produces no candle** for a bar in which it did not trade (no forward fill). Indicators then see only the
+  bars that exist for that token: an illiquid option's "EMA 9" spans nine traded bars, not nine minutes.
+* **Time is the feed's own.** Bars are cut by `ltt`, and a bar is closed when the latest `ltt` seen moves 10 s past it.
+* **The table that creates the feed is not in this repo** (it is set up by your `init.py` / Kafka consumer), so "updated in
+  place, keyed by token" is read from how the old scripts and the console use it (they `natural_join` it on `token`, which
+  only works when each token appears once). Please confirm it against `init.py`.
+
+### How the two meet
+
+```
+ master (static)                                feed (streaming)
+ token -> symbol, divisor, tick, expiry         token -> ltp, vol (cumulative), ltt
+        \                                           /
+         `---------- joined on token ------------'
+   candles: price = ltp * (1 / Divisor of that token) ;  Symbol joined from master ;  scope (symbols / kind) taken from master
+```
+A token in the feed but not in the master has no symbol (null) and uses the default scale; with `symbols=` / `kind=` set it is
+dropped. A token in the master that never trades never produces a candle.
+
+---
+
 ## 1. The big picture
 
 ```
@@ -34,7 +107,7 @@ Code: `algo/data/master.py`, `algo/data/candles.py`, `algo/data/indicators.py`, 
 
 Rules of the design:
 
-* **Candles are the source.** Indicators (and the straddle, strategy) read `candles`; `candles` never reads them.
+* **Candles are the source of everything derived.** Indicators (and the straddle, strategy) read `candles`; `candles` never reads them.
 * **Heavy numeric work stays in vectors or in the Deephaven engine.** Python only does what is inherently sequential
   (building a candle tick by tick).
 * **Nothing is stored that is not used.** The candle table holds numbers only; helper columns are lazy formulas.
