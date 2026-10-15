@@ -26,6 +26,8 @@ Pure logic (candle aggregation, ltt parsing, sizing, basket ranking, option pick
 sequences) is separate from the Deephaven wiring and covered by tests. Deephaven queries are not testable outside a
 server, so they are kept small and in one place per plugin.
 
+How master, candles and indicators work inside (workflow, which steps are numpy / DataFrame / engine, threads, memory, error handling): [docs/master_candles_indicators.md](docs/master_candles_indicators.md).
+
 ## A day
 
 Once per session (or the last line of `init.py`): `import algo; algo.install(globals(), "NSE")`. That puts plain
