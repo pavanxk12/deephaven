@@ -168,4 +168,7 @@ All the numbers that sat in the USER INPUT blocks are fields of `RsiOptionsConfi
   The plugin warns about the first at start and about cleared caps at the second.
 * `Pct` is measured from the first bar `candles` built (candles start at the next full minute after `Candles` starts),
   so after a late start it is not the real day open.
-* `Market` US values (price scale, session, tz) are placeholders to check against a real feed row.
+* US: checked against the 2026-10-14 contract file and a real feed export (tokens 1-8): strikes / ticks / equity prices use the
+  file's `Divisor`, `ltt` is text `yyyy-mm-dd HH:MM:SS` in UTC. Not yet checked: the live option prices against their divisor
+  (10000), the US option tick (the file lists 0.0001; sizing refuses anything under 0.01), and there are no US futures, so the
+  straddle and the strategy still need an equity-underlying mode.
