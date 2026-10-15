@@ -372,7 +372,7 @@ makes that equal `1 - alpha`. A blank is a Deephaven null. Every division has a 
 
 The old tables are released when their listeners are stopped (nothing else holds them). Restarting candles loses the candles
 built so far; indicators then restart from the first new bar (EMA/SMA start as running averages, RSI/ATR/MACD blank, `Pct`
-measured from the first new bar). Save with `app["eod"].save()` first if you need the day.
+measured from the first new bar). Run `eod_save()` first if you need the day (see the README, "End of day").
 
 ---
 

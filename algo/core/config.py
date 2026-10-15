@@ -78,14 +78,16 @@ class Paths:
     """Container paths. `market_data` is a read-only host mount, `work` is the writable named volume."""
     market_data: str = "/data/fo_market_data"     # contract .db3, stocks.txt, logo, history parquet (read only)
     work: str = "/data/deephaven"                 # writable volume
+    eod_dir: str | None = None                    # where end-of-day Parquet files go; None = <work>/fo_market_data.
+                                                  # Point it at a folder mounted from the host to find the files outside Docker
 
     @property
     def state(self) -> str:        # strategy state that must survive a container recreate
         return os.path.join(self.work, "state")
 
     @property
-    def saved(self) -> str:        # end-of-day parquet files (docker cp'd to the host)
-        return os.path.join(self.work, "fo_market_data")
+    def saved(self) -> str:        # end-of-day parquet files
+        return self.eod_dir or os.path.join(self.work, "fo_market_data")
 
     @property
     def cache(self) -> str:        # rebuildable caches (master pickle)

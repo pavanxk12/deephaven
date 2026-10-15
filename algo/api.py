@@ -13,12 +13,14 @@ only `indicators(...)` starts the computation.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 
 from algo.core.app import App, MissingDependency, connect, current
 from algo.core.config import Paths, market_for
 from algo.data.candles import Candles
 from algo.data.indicators import LIBRARY, Indicators
 from algo.data.master import Master
+from algo.data.store import DEFAULT_TABLES, PREFIX, Eod, make_store, normalise_day, save_tables
 from algo.series.straddle import Straddle, StraddleConfig
 
 HINTS = {"master": "master_build()", "candles": "candles_start()", "indicators": "indicators(EMA(9), RSI(14))"}
@@ -111,13 +113,63 @@ def straddle_stop() -> None:
     _app().stop("straddle")
 
 
+def eod_save(day: str | None = None, folder: str | None = None, tables=None, snapshot: bool = True) -> None:
+    """Save the whole candles and straddle tables to Parquet files: candles_<day>.parquet, straddle_<day>.parquet (each with
+    a Date column and a small .meta.json beside it). `tables=["candles", "straddle_series", "indicator_values"]` chooses.
+    `folder` is where the files go; by default Paths.saved (set Paths(eod_dir=...) in algo.install to point it at a folder
+    mounted from the host). `day` defaults to today in the exchange timezone ("2026-10-15" or "20261015").
+    snapshot=True takes a frozen copy first (briefly needs the memory of one copy); False writes the live table."""
+    results = save_tables(_app(), tuple(tables) if tables else DEFAULT_TABLES, day, folder, snapshot)
+    for r in results:
+        print(f"  {r['table']:<17} {r['status']:<8} {r['rows']:>12,} rows  {r['path'] or ''}")
+
+
+def eod_load(day: str | None = None, folder: str | None = None, tables=None) -> None:
+    """Load saved files back as tables. eod_load("2026-10-15") -> candles_20261015, straddle_20261015 (and indicators_...);
+    eod_load() merges every saved day -> candles_hist, straddle_hist."""
+    app = _app()
+    store = make_store(app, folder)
+    for prefix in [PREFIX[t] for t in (tables or DEFAULT_TABLES)]:
+        try:
+            if day is None:
+                table, n = store.load_all(prefix)
+                name, note = f"{prefix}hist", f"{n} file(s)"
+            else:
+                d = normalise_day(day, app.market.zone)
+                table = store.load_day(prefix, d)
+                name, note = f"{prefix}{d.replace('-', '')}", d
+        except FileNotFoundError as e:
+            print(f"  {prefix}: {e}")
+            continue
+        app.publish(name, table)
+        print(f"  {name:<24} loaded ({note})")
+
+
+def eod_auto(at: str | None = None, folder: str | None = None, stop: bool = False) -> None:
+    """Save by itself every day at `at` ("15:35", exchange time). Default: 5 minutes after the session ends.
+    eod_auto(stop=True) switches it off."""
+    app = _app()
+    if stop:
+        app.stop("eod")
+        return
+    if at is None:
+        end = datetime.combine(datetime.now(app.market.zone).date(), app.market.session[1]) + timedelta(minutes=5)
+        when = end.time()
+    else:
+        try:
+            when = datetime.strptime(at, "%H:%M").time()
+        except (TypeError, ValueError):
+            raise ValueError(f'at must look like "15:35", got {at!r}') from None
+    _run(Eod(DEFAULT_TABLES, auto_at=when, folder=folder))
+
+
 def algo_status() -> None:
     """What is running."""
     _app().status()
 
 
 FUNCTIONS = (master_build, candles_start, candles_stop, indicators, indicators_remove,
-             straddle_start, straddle_stop, algo_status)
+             straddle_start, straddle_stop, eod_save, eod_load, eod_auto, algo_status)
 
 
 def install(ns: dict, market: str = "NSE", paths: Paths | None = None, level: int = logging.INFO) -> App:

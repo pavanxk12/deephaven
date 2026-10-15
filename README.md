@@ -91,6 +91,34 @@ anywhere downstream, so there is one place where the scale can be wrong. Volume 
 * Bad input is dropped, never stored: NaN, infinity, null, zero or negative prices, negative volume, unparseable times.
   Dropped rows are counted (`app.status()` shows how many).
 
+## End of day: whole tables to Parquet files
+
+```python
+eod_save()                       # today: candles_2026-10-15.parquet, straddle_2026-10-15.parquet (+ .meta.json each)
+eod_save(tables=["candles", "straddle_series", "indicator_values"])    # choose; indicators go to indicators_<day>.parquet
+eod_save(day="2026-10-14", folder="/data/eod")                           # another day / another folder
+eod_auto()                       # saves by itself every day, 5 minutes after the session ends (NSE 15:35, US 16:05)
+eod_auto("15:40")                # or at a time you choose;  eod_auto(stop=True) switches it off
+eod_load("2026-10-15")           # -> tables candles_20261015, straddle_20261015
+eod_load()                       # every saved day merged -> candles_hist, straddle_hist
+```
+* **The whole table is written**, every row and column, with an added `Date` column (the tables carry only a time of day).
+  The `.meta.json` beside each file records the market, timezone, row count, columns, when it was saved and how the table was built.
+* **Safe:** a file is written under a temporary name and renamed when complete, so a crash never leaves half a file and never
+  damages the previous day's. A missing or empty table is skipped and reported; one failing table does not stop the other.
+* **Memory:** by default a frozen copy of the table is taken first (so it can keep ticking while it is written), which
+  briefly needs the memory of that table (~770 MB for 32,000 instruments). `eod_save(snapshot=False)` writes the live table instead.
+* **Getting the files outside Docker:** `/data/fo_market_data` is a read-only mount, so by default the files stay in the
+  Deephaven volume and need `docker cp`. To see them on the host straight away, mount a writable folder and point the
+  exporter at it:
+  ```yaml
+      volumes:
+        - ./deephaven/eod:/data/eod            # in docker-compose.yml, under the deephaven service
+  ```
+  ```python
+  import algo; algo.install(globals(), "NSE", paths=algo.Paths(eod_dir="/data/eod"))
+  ```
+
 ## Memory and speed
 
 The candle table grows all day (one row per instrument per bar) and every indicator column adds to it, so **how many
@@ -141,7 +169,7 @@ read-only mount:
 |---|---|
 | portfolio state (`pf_map.json`, `pf_sub.json`) | `/data/deephaven/state/` |
 | master cache | `/data/deephaven/cache/` |
-| end-of-day files (`candles_<day>.parquet`, `straddle_<day>.parquet`) | `/data/deephaven/fo_market_data/` |
+| end-of-day files (`candles_<day>.parquet`, `straddle_<day>.parquet`) | `/data/deephaven/fo_market_data/` by default, or any folder you choose (below) |
 | contract `.db3`, `stocks.txt`, `logo.png`, history to load | `/data/fo_market_data/` (read-only) |
 
 **Before the first run copy the old state files** (`/data/stocks_pf.json`, `/data/stocks_pf_sub.json`) to
@@ -155,7 +183,7 @@ read-only mount:
 | candles.py | `algo.Candles` |
 | indicators.py | `algo.Indicators` (+ `RSI`, `EMA`) |
 | straddle.py | `algo.Straddle` |
-| eod.py / bod.py | `algo.Eod` / `algo.History` |
+| eod.py / bod.py | `eod_save()` / `eod_auto()` / `eod_load()` (`algo.Eod`, `algo.History`) |
 | automation_rsi.py | `algo.Book` + `algo.Bridge` + `algo.RsiOptions(RsiOptionsConfig.stocks())` |
 | niftyrsi.py | the same with `RsiOptionsConfig.nifty()` |
 | dashboard_blackbox.py | `algo.Console` |
