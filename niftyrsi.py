@@ -32,7 +32,7 @@ UNDERLYING = "NIFTY"
 OPT_EXPIRY_IDX = 0
 PF_MAP_FILE = "/data/stocks_pf.json"                 # "token:slot" -> PF (old format "token" = slot 0 is still read)
 PF_SUB_FILE = "/data/stocks_pf_sub.json"
-PF_START = 1903
+PF_START = 1933
 
 # ---- NEW: multi-strike ----
 N_STRIKES = 3               # number of strikes churning is started on (1 = only the strike nearest the synthetic future)
@@ -40,12 +40,12 @@ STRIKE_MODE = "OTM"         # "OTM" = away from the money, "ITM" = into the mone
 STRIKE_GAP = 1              # step between slots in LISTED strikes (1 = neighbouring strikes, 2 = every second strike)
 
 SUB_PAYLOAD = {"T1": 0, "gtw": 32395, "PRNT": 1, "code": "", "ival": 1, "jval": 0.75, "side": "BUY", "sval": 3, "trp": 0,
-               "jqty1": 1, "jqty2": 1, "openq": 0, "maxqty": 0, "target": 1000, "maxloss": -1000, "stoploss": -1000,
-               "lowerrange": 0, "upperrange": 10000, "max_unhedge": 1, "strategyname": "Churning",
+               "jqty1": 1, "jqty2": 1, "openq": 0, "maxqty": 0, "target": 1000, "maxloss": -400, "stoploss": -400,
+               "lowerrange": 0, "upperrange": 10000, "max_unhedge": 3, "strategyname": "Churning",
                "USERIDENTIFIER": 4, "user_id": 4}
 RESET_ON_START = True
-RSI_HIGH = 60
-RSI_LOW = 40
+RSI_HIGH = 70
+RSI_LOW = 30
 
 SIDE_FIELD = "side"
 SIDE_VALUES = {"PUT": "BUY", "CALL": "BUY"}
@@ -63,7 +63,7 @@ ADD_QTY = 3
 PRICE_DIV = 100
 TICK = 0.1
 JVAL_FRAC = 0.75
-SVAL_MULT = 3
+SVAL_MULT = 5
 
 FAIL_COOLDOWN_S = 30
 MAX_PARALLEL = 0
@@ -73,8 +73,8 @@ TRADE_END = dtime(15, 20)
 
 APPLY_PARAMS = {
     "jqty1": 1, "jqty2": 1,
-    "target": 2000, "stoploss": -2000, "maxloss": -2000,
-    "max_unhedge": 1, "PRNT": 1,
+    "target": 1000, "stoploss": -400, "maxloss": -400,
+    "max_unhedge": 3, "PRNT": 1,
 }
 # ==========================================================================
 

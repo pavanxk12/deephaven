@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: algo
+Version: 0.1.0
+Summary: Deephaven trading stack: master, candles, straddle, the NATS service, the book (portfolio numbers), end of day, console.
+Requires-Python: >=3.10
+Requires-Dist: pandas
+Requires-Dist: numpy
+Provides-Extra: runtime
+Requires-Dist: nats-py; extra == "runtime"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"

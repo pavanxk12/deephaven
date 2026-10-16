@@ -1,0 +1,8 @@
+pandas
+numpy
+
+[dev]
+pytest
+
+[runtime]
+nats-py
