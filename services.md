@@ -131,3 +131,18 @@ Not measured: a live Deephaven (table memory is the arithmetic above), and a rea
 
 Master's lookup dictionaries (about 7 MB each) could be replaced by arrays to save roughly 15 MB; not worth the risk to working code. The
 feed, EOD, straddle maths are untouched. Nothing here is deployed to the host or committed.
+
+---
+
+## The console, one window per strategy
+
+`app.run(algo.Console())` (needs the registry running) publishes **`operator_console`** (all strategies, with a strategy picker and a time window) and, for
+every strategy that has portfolios, **`console_<strategy>`**: that strategy's own **summary, net positions, message window and order book**, with the
+tick box / Pause / Square up / controls of *its* portfolios only. Starting a new algo (`algo_start(user, "name")`) opens its window by itself;
+`console_open("name")` makes one by hand.
+
+How a row finds its strategy: the registry records, for every (user, portfolio number), the strategy (the algo) that uses it. The order, trade and
+message tables carry `PF = user * 10000 + portfolio number`, so each of those rows is tagged with a `Strategy` column from the registry, live (a trade
+of a portfolio that is registered a moment later is tagged as soon as the registry row arrives). A row of an unknown portfolio has no strategy and
+shows only on the all-strategies window. Strategy names may hold letters, digits, `_ . -` only (they go into queries and table names).
+The pause / square up / subscribe state in these windows is the shared state described in `nats.md`.

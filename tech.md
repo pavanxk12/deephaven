@@ -1,0 +1,294 @@
+# Technical overview: what runs, how it is wired, how a signal becomes an order
+
+Written for: an engineer who has to understand, operate or extend the whole stack. Nothing here has been run on a live Deephaven yet;
+what is verified is the logic, by tests with fakes (475 passing), and that is said where it matters (section 12).
+
+---
+
+## 1. The whole picture
+
+Everything runs **inside one Deephaven session** (one Python process in the Deephaven container) plus **one real NATS server** outside it.
+The package `algo` is a wheel installed in that session. The session holds a small number of long-lived pieces ("plugins"); your trading
+scripts (algos) are plain Python pasted into the same session and call plain functions.
+
+```
+ exchange feed ──► fo_market_data (ticking table, one row per token: ltp, ltt, volume ...)      [Deephaven, from your feed]
+                        │ listener
+                        ▼
+   contract file ─► MASTER ──► CANDLES ──► table `candles`  ─────────────┬──► STRADDLE ──► `straddle_series`
+   (.db3, daily)    (lookups)   (bars)      (closed bars only)           │
+                        │                                                ├──► END OF DAY ──► parquet files (+ .meta.json)
+                        │                                                └──► your algo scripts (watch("candles", fn))
+                        ▼
+              lookups: contract, strikes, last_price ...   (plain functions, read-only)
+
+   your algo script ── algo_start(user, "name") ─► its own BOOK + BRIDGE ─┐
+        pf_assign()  = BOOK picks the portfolio number (REGISTRY keeps it, unique per user)
+        pf_activate()= BRIDGE queues: [retire old] subscribe, pause, apply, unpause  ──► NATS SERVICE ──► NATS server ──► order bridge (C++/other)
+                                                                                         │ (one service for everybody)
+   console (UI) ── tick box / Pause / Square up ──────────────────────────────────────────┘
+                                                                                         │ every confirmed command
+                                                                                         ▼
+                                                                  SHARED PORTFOLIO STATE (algo.core.pfstate)  ──► read by algos AND the console
+   order/trade/ack tables from the bridge (strategy_events, orders_trade, orders_ack) ──► CONSOLE: one window per strategy
+```
+
+Three rules hold the design together:
+
+1. **Services are independent.** None imports another one (a test reads every import line and fails if one is added). They find each other
+   *by name in the `App`* only when needed. If one stops or is busy, the others carry on (section 9).
+2. **Algos are plain functions and scripts**, not classes of the package. The package gives infrastructure only: master, candles, straddle,
+   end of day, NATS, registry/book/bridge, console. Indicators, signals and sizing are written in the algo script.
+3. **One place for each fact.** Contract data in the master; bars in `candles`; commands only through the NATS service; portfolio identity in the
+   registry; what the commands did in the shared portfolio state.
+
+---
+
+## 2. What is running (and on what thread)
+
+| piece | what it is | started by | thread | published tables |
+|---|---|---|---|---|
+| **App** | one per session: the running plugins, the published tables, `app.shared` (objects that must outlive a plugin restart) | `algo.install(globals(), "NSE")` | - | - |
+| **master** | parses the day's contract `.db3` once (cached as a pickle), builds the lookups | `master_build("NSE")` | caller's | `master` (dict) |
+| **candles** | turns the live feed into closed bars | `candles_start("1min", ...)` | Deephaven's listener thread (no own thread) | `candles` |
+| **straddle** | V / D straddle series per underlying and expiry, from candles | `straddle_start(0)` | one sampler thread `algo-straddle` + candle listener | `straddle_series` |
+| **eod** | saves whole tables to Parquet once a day | `eod_auto()` (or `eod_save()` now) | one thread `algo-eod` | files, `candles_hist`... on load |
+| **registry** | the portfolio registry: (user, number) -> strategy, name, owner | `registry_start()` | caller's (a small file append) | `portfolio_registry`, `portfolio_registry_log` |
+| **nats** | the ONE command service | `nats_start(ip, port, users=[...])` | one asyncio loop thread `algo-nats` | `cmd_queue_automated`, `nats_events`, `portfolio_state_log` |
+| **console** | the operator dashboards | `app.run(algo.Console())` | Deephaven UI render threads | `operator_console`, `console_<strategy>` |
+| **per algo**: `<name>_book`, `<name>_bridge`, `<name>` | what `algo_start` creates for one automation | your script | none of their own (the bridge uses the NATS loop) | - |
+
+Plain functions (not plugins) read the master and candles: `contract`, `strikes`, `nearest_strikes`, `last_price`, `last_candles` (`algo/lookup.py`).
+
+`algo_status()` lists what is running; `algo_help()` lists every function by service.
+
+---
+
+## 3. The plugin framework (`algo/core`)
+
+* `App` (`app.py`): `plugins` (name -> running plugin), `tables` (published), `shared`, `ns` (the session globals, so a published table is also a
+  variable in the IDE). `app.run(plugin)` first stops a running plugin of the same name, so **a re-paste never leaves a duplicate listener behind**.
+* `Plugin` (`plugin.py`): `requires = (...)` names other plugins it needs (a clear message if one is missing: *"straddle needs ['candles']. Call
+  candles_start() first."*); `start()` builds its output; `listen(table, fn)` for table listeners and `spawn(fn)` for threads, **both stopped for
+  you** when the plugin stops; `follow("candles", cb)` = "call me when another plugin republishes this table" (how the straddle notices a candle
+  restart); `on_stop()` for cleanup.
+* `config.py`: `Market` (NSE / US: timezone, price scale, session times, file formats, feed table name) and `Paths` (where state, cache, EOD and the
+  market data live). `FIRST_PF = 1001`, the first portfolio number.
+* `pfstate.py`: the shared portfolio state (section 8). `files.py`: safe atomic writes (temp file + rename, retrying a briefly locked rename).
+  `nulls.py`, `timeframe.py`, `log.py`: small helpers.
+* `algo.install(globals(), "NSE")` builds the `App` and puts the plain functions of `api.py` into the session.
+
+Start-up order (each step needs the ones before it; calling out of order prints what to call first):
+
+```
+algo.install(globals(), "NSE")      the App and the functions
+master_build("NSE")                 contract master            (needs the .db3 in /data/fo_market_data)
+candles_start("1min")               needs master and the live table fo_market_data
+straddle_start(0)                   needs master + candles                (optional)
+eod_auto()                          needs candles / straddle              (optional)
+registry_start()                    portfolio numbers                     (once)
+nats_start("192.168.1.130", 4222, users=[3, 4])   the command service     (once)
+app.run(algo.Console())             needs master + registry (+ strategy_events, orders_trade, orders_ack tables)
+--- then, per algo script ---
+nats_connect(user=, client=) ; registry_connect() ; algo_start(user, "name") ; ... listeners ... ; nats_send(True, client="name")
+```
+
+"Start once, connect many": `nats_start` and `registry_start` are safe to call twice (second call does nothing and refuses to change a running
+service with other settings; that is `nats_restart` on purpose). A script only **connects** (`nats_connect`, `registry_connect` check that the
+service is up and the user may send; they start and change nothing).
+
+---
+
+## 4. The data path: feed -> candles -> everything derived
+
+**Feed.** `fo_market_data` is a Deephaven table with one row per token holding the last value (`ltp`, `ltt` last trade time, `volume`). It is your table; the
+code assumes `ltp` is in the exchange's minor unit (NSE: paise) and applies the multiplier (default `1/price_div`; or each contract's own `Divisor`).
+
+**Master** (`algo/data/master.py`). Reads the day's `.db3` (refuses the other market's file), keeps dictionaries token -> symbol, divisor, tick, expiry,
+strike ...; `tokens_for(symbols, kind, expiries)` selects instruments. Cached as a pickle keyed by file name, mtime and size. About 17 MB retained for all NSE.
+
+**Candles** (`algo/data/candles.py`). The listener gets each batch of changed feed rows; numpy cleans and scales the batch in one pass (drops NaN, inf,
+null, zero or negative prices, negative volume, unparseable times); a `CandleAggregator` keeps one open bar per token (~230 B) and emits **only closed
+bars** after a 10 s grace, on epoch-aligned buckets (30s / 1min / 5min / 15min). A bar is written as one row of numbers to a `DynamicTableWriter`; the
+`Symbol` text is joined from a small static table, not stored per row. Row = 56 bytes. A quiet token produces no row for that bar (no forward fill).
+Starting in the middle of a minute starts at the next full bar. Options to bound memory: `symbols=`, `kind="FUT"|"OPT"|"EQ"`, `expiries=1`
+(about 1.8 GB/day for everything on 1-minute bars; 0.7 GB with `expiries=1`; 14 MB futures only; a size estimate is logged at start).
+`candles_start` again restarts the table empty and **republishes** it; whoever `follow`s it moves to the new table.
+
+**Straddle** (`algo/series/straddle.py`). For each underlying and expiry it uses the future that goes with that expiry (nearest future on or after it;
+spot if no future exists, e.g. US) and builds V / D series from the candles of the future and the options, one point per minute (per candle if candles
+are larger). Backfills from existing candles, then runs live (listener + sampler thread). Restarts itself when candles restart.
+
+**End of day** (`algo/data/store.py`). `eod_save()` writes whole tables (all rows and columns plus a `Date` column) to Parquet with a `.meta.json`, via a
+temporary file renamed on completion (a crash never leaves half a file or damages yesterday's). `eod_auto()` does it daily 5 minutes after the close;
+`eod_load()` brings files back as tables. By default it snapshots first (briefly one extra copy of the table in memory).
+
+**Algos and candles.** `watch("candles", fn)` (in `algo/automation.py`) listens to the `candles` table **and follows it** across restarts; `fn(update,
+is_replay)` gets each batch of newly closed candles. `last_candles(x, n)` seeds an indicator from today's history. Any time frame at or above the candle size is
+the algo's own roll-up. The indicator (e.g. Wilder RSI) is computed in the script (`examples/03_algo_template.py`).
+
+---
+
+## 5. The command path: signal -> portfolio -> NATS -> bridge
+
+### 5.1 Identity: registry and book
+
+* A **portfolio** is identified by **(user, number)**. The same number under two users is two portfolios; a user never gets a number twice.
+  Numbers start at **1001** (`FIRST_PF`) unless an algo gives `pf_start`.
+* **Registry** (`algo/strategy/registry.py`): append-only JSONL file `portfolio_registry.json` in the state folder. For each (user, number) it
+  remembers `owner` (the book), `algo` (the strategy), `name` (what it trades), `created`, `note`. `allocate/create` reserve a number *before* returning it.
+  Tables `portfolio_registry` (current record) and `portfolio_registry_log` (every change).
+* **Book** (`algo/strategy/book.py`): one per automation (`<name>_book`). It decides *which portfolio an instrument and option map to*:
+  none yet -> a new number from the registry; same option -> the same portfolio; another option -> a **new** portfolio and the old one is reported as
+  `old_pf` (to retire). The algo never picks a number. State kept: `pf_map` (instrument -> pf, file), `subscribed` (pf -> option, file), caps, paused,
+  live leg, allow flags, last failure. Slots: `instrument*100 + slot` lets one instrument have several portfolios (multi-strike).
+  Old files can be adopted (`algo_start(..., map_file=, sub_file=)`); clashes are reported, wrong-format files are refused, never overwritten.
+
+### 5.2 Your script
+
+```python
+algo_start(USER, STRATEGY, pf_start=1001)       # registers: its own book + bridge + sending switch, starts OFF; opens its console window
+pf_track(STRATEGY, [future], slots=N)           # find the portfolios it had before a restart
+watch("candles", on_candle)                     # your listener
+a = pf_assign(STRATEGY, future, option, name="NIFTY", slot=k)   # the BOOK picks the number; None while OFF or while unticked on the console
+pf_activate(a, "CALL", params)                  # the BRIDGE queues the sequence; returns at once
+nats_send(True, client=STRATEGY)                # last line: switch this automation on
+```
+
+`params` (ival, jval, sval, trp, ranges ...) come from **your** code (`order_params` in the examples): sizing is strategy logic.
+
+### 5.3 Bridge (`algo/strategy/bridge.py`)
+
+One per algo (`<name>_bridge`); it holds **no connection**. It knows the *order of commands* and gives the NATS service a workflow:
+
+```
+swap(pf, option, params):   [retire old: pause -> (squareup) -> (unsubscribe)]   then   subscribe (if new) -> pause -> apply (maxqty = cap + add_qty) -> unpause
+```
+
+Any step that is not `ok` stops the sequence, leaves the portfolio **paused**, rolls the book's bookkeeping back, sets a cooldown (`pf_cooling`) and writes a
+`swap failed` row to `nats_events`. Each bridge is one **client** of the service with **its own send switch** (starts OFF).
+
+### 5.4 NATS service (`algo/comms/nats_service.py`) — the only thing that talks to NATS
+
+* **One thread, one asyncio loop**, no locks. A **lane per (user, portfolio)** is a bounded FIFO: commands of one portfolio always run in the order
+  given (pause, apply, unpause can never overtake each other); different portfolios run side by side. `max_in_flight` (64) caps requests on the wire for all;
+  `lane_depth` caps waiting jobs per lane; `max_queued` (5000) caps everything inside. Over a cap the command is refused with status `full`, never silently lost.
+* Each command is a NATS request on subject `cmd.hft.<pf>` with `{"Cmd", "Payload", "ReplyId"}`; the payload is stamped with `USERIDENTIFIER`/`user_id` and `SENDER`.
+  The answer's `Status` ("ok" or an error) becomes a `Reply(ok, status, ...)`.
+* **Never raises to the caller; never resends by itself.** After a timeout it is unknown whether the bridge acted, so the caller sees `timeout` and decides.
+  Statuses besides the bridge's own: `timeout, no_responders, disconnected, service_down, off, dry, full, stopped, bad_reply, error, no_user, user_not_allowed, blocked`.
+  Every refusal and failure is also a row in `nats_events`; every accepted command is a row in `cmd_queue_automated` (audit).
+* **Connection**: if NATS drops, commands fail fast with `disconnected` and the client reconnects about once a second (no restart needed). The first
+  connect times out after about 3 s with a clear error. `NatsService` stopped/never started -> `NO_SERVICE` stand-in answers `service_down`: algos and
+  console keep working and say what is wrong.
+* **Users and blocks**: `nats_start(users=[3,4])` lists who may send (`nats_add_user` adds one live); `nats_block(user=)` / `(user=, pf=)` stops sending for a user
+  or one portfolio; blocks live in `app.shared` and **survive a service restart** (a restart that names a user lifts that user's block).
+* **Switches**: master (`nats_send(True/False)`) and one per client (algo / console). A command goes out only if both are on. Typed commands (`pf_pause(...)`) and the
+  console buttons have no client and need only the master switch.
+* **Dry run**: `nats_start(dry_run=True)` opens no connection and only logs.
+
+### 5.5 Shared portfolio state (`algo/core/pfstate.py`)
+
+After every command the bridge answers `ok`, the service records it in one shared object (`app.shared["pf_states"]`), **whoever sent it**: per (user, pf)
+`option, subscribed, paused, squared, by, cmd, at`. A failed command changes nothing. Each change is a row in `portfolio_state_log`. Listeners are told.
+
+```
+ algo command  ──►  NATS service ──ok──►  PfStates  ──►  console redraws (tick box, Pause/Resume, Square up)
+ console click ──►  NATS service ──ok──►  PfStates  ──►  the algo's bridge hears it and updates its book:
+                                                            pause / resume   -> book.paused; the algo's next order APPLIES but does not unpause (their pause stands)
+                                                            square up        -> pf_leg() = None: the slot may start again
+                                                            untick (unsub)   -> slot blocked: pf_allowed() False, pf_assign() None, until ticked again
+```
+
+An algo's *own* unsubscribe (retiring a portfolio) never blocks its slot; only the operator's tick box does. After a Deephaven restart the states start
+empty and each book re-adopts what it had subscribed.
+
+---
+
+## 6. The console (`algo/ui`)
+
+* Inputs: `strategy_events`, `orders_trade`, `orders_ack` (from your order bridge, via Kafka) and the live feed table; the registry and the shared state.
+* **Strategy mapping**: trade/ack/message rows carry `PF = user * 10000 + portfolio number`; they are tagged with a `Strategy` column joined live from
+  `portfolio_registry` (`PfKey = User*10000 + PF` -> `Algo`). Unknown portfolio -> null strategy (visible only on the all-strategies window).
+* **Windows**: `operator_console` (all strategies, strategy picker, time window) and `console_<strategy>`: **its own** summary, net positions, message window,
+  order book, controls. A new `algo_start` opens its window; `console_open("name")` by hand. Names may only hold letters, digits, `_ . -`.
+* **Net positions** per row: tick box = subscribe/unsubscribe, Pause/Resume, Square up (two clicks, only while paused), all from the shared state (5.5). Rules kept:
+  Square up needs Pause first; untick only at net 0. Commands go through the NATS service with no client name (operator). Failures are written under the buttons.
+* Memory/CPU: every table is a lazy chain; per-row text is joined, not stored; the whole-day net table per strategy is created when its window renders.
+
+---
+
+## 7. Files and tables
+
+| where | what |
+|---|---|
+| `/data/fo_market_data/` (read-only mount) | contract `.db3`, `stocks.txt`, `logo.png`, history to load |
+| `/data/deephaven/state/` | `portfolio_registry.json`, per-algo `pf_map`/`pf_sub` files |
+| `/data/deephaven/cache/` | master pickles |
+| `/data/deephaven/fo_market_data/` or your `eod_dir` | `candles_<day>.parquet`, `straddle_<day>.parquet` (+ `.meta.json`) |
+
+Published tables (Deephaven IDE variables): `candles`, `straddle_series`, `portfolio_registry`, `portfolio_registry_log`, `cmd_queue_automated`, `nats_events`,
+`portfolio_state_log`, `operator_console`, `console_<strategy>`; after `eod_load`: `candles_<day>`, `candles_hist`, ...
+
+---
+
+## 8. Memory and CPU
+
+* Candles dominate: **56 B per closed bar row**; ~230 B per instrument for the open bar. Control with `symbols=`, `kind=`, `expiries=`, the bar size.
+* Master ~17 MB; registry a few hundred bytes per portfolio (3,000 portfolios load in under a second); shared portfolio state ~100 B each.
+* NATS: one thread; queued commands are tiny; bounded by `max_queued`.
+* No extra threads for candles (Deephaven's listener thread); straddle and EOD one thread each; NATS one. Measurements are external; the code has no instrumentation.
+
+---
+
+## 9. What happens when something breaks
+
+| breaks | effect on the rest |
+|---|---|
+| **NATS server down / connection lost** | candles, straddle, master, registry untouched; algos keep computing signals; commands return `disconnected`, swaps roll back and retry after the cooldown; reconnects by itself |
+| **NATS service stopped** (`nats_stop`) | same, answers `service_down`; restart with `nats_start`, algos need not restart; every algo is OFF again and switches itself on |
+| **registry** | only creating a *new* number fails, with a message |
+| **candles restarted** | straddle and `watch()` listeners follow the new table; a plain `listen()` would stay on the old, silent one |
+| **an algo** | the others do not know it exists |
+| **a command times out** | not resent; caller sees `timeout`; look at the bridge before sending again |
+| **a bad feed row** | dropped and counted, never stored |
+
+---
+
+## 10. Where each thing lives in the code
+
+```
+algo/core/      app.py plugin.py config.py pfstate.py files.py log.py nulls.py timeframe.py
+algo/data/      master.py candles.py store.py symbols.py
+algo/series/    straddle.py
+algo/comms/     nats_service.py
+algo/strategy/  registry.py book.py bridge.py config.py
+algo/ui/        console.py tables.py filters.py
+algo/           api.py (functions you type)  automation.py (functions an algo script uses)  lookup.py (contract/price lookups)
+examples/       00_services.py .. 04_nifty_multistrike.py   (plain scripts; 03/04 compute their own RSI and sizing)
+tests/          pytest, no Deephaven needed
+```
+Allowed imports (test-enforced): `core` knows nothing; `data` uses core; `series` core+data; `comms` and the registry core only; `strategy` core+comms+data; `ui` anything.
+
+---
+
+## 11. Extending it
+
+* **A new algo**: copy `examples/03_algo_template.py`, change `STRATEGY`, `USER`, the signal and the sizing. Nothing in the package changes.
+* **A new data service**: a `Plugin` with `requires`, `start()` publishing a table, listeners via `self.listen`; add a function in `api.py`.
+* **A new command**: add it in `nats_service.py` (and, if it changes what the console shows, in `pfstate.PfStates.record`).
+
+---
+
+## 12. What is verified and what is not
+
+Verified by tests (fakes for Deephaven tables and the NATS connection; real registry, book, bridge, service logic): candle aggregation and timing, master parsing for NSE
+and US files, straddle maths and replay, NATS ordering/caps/errors/reconnect/blocks, registry persistence and uniqueness, the command sequences and their rollbacks,
+shared state both ways, the example scripts end to end, Wilder RSI against textbook values, import-direction independence.
+
+**Not verified:** anything on a live Deephaven (query semantics of `natural_join`, `where_in`, listeners, `deephaven.ui` rendering of the console), the real order bridge's
+replies, real feed row shapes, the join of the integer `PF` column with the registry (cast to long on both sides), and real memory/CPU numbers (the sizes above are
+arithmetic from row sizes). The wheel built from this tree has not been deployed to the dev host.
+
+Open items: the subscribe payload is service-wide (not per automation); one NATS server per service; `candles_start`/`master_build` are not yet start-once; a "blocked until RSI
+leaves its zone" rule is not in example 04; the trades-event mapping (contracts, qty, M2M per portfolio) is the next piece.

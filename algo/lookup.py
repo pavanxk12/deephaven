@@ -239,7 +239,7 @@ def last_price(x, show: bool = True) -> float | None:
     """The latest candle close of a token, a symbol or an underlying name (None if there is no candle yet). show=False prints nothing."""
     df = _rows("candles", x, 1)
     if df is None or not len(df):
-        if df is not None:
+        if df is not None and show:
             print("no candle yet for it")
         return None
     price = float(df["Close"].iloc[-1])

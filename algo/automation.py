@@ -11,6 +11,7 @@
     pf_leg("stocks", token)                              "CALL", "PUT" or None: what it last started on that instrument
     pf_mark("stocks", token, "CALL", option)             remember a leg without sending
     pf_cooling("stocks", token, 30)                      True while the last failure was less than 30 seconds ago
+    pf_allowed("stocks", token)                          False while the operator has UNTICKED it on the console (pf_assign then returns None)
     pf_track("stocks", [token1, token2])                 find the portfolios it had before a restart (call it once after algo_start)
     watch("candles", on_price)                           call your function on every update of a published table ("candles" or "straddle_series");
                                                          it follows the table if the service restarts it (candles_start again)
@@ -90,6 +91,9 @@ class _Book:
             self._run.log.info("[OFF] no portfolio assigned for %s: this automation is not sending", instrument)
             return None
         id_ = self.track(instrument, slot)
+        if not self.state.allow.get(id_, True):
+            self._run.log.info("[BLOCKED] no portfolio assigned for %s slot %s: it is unticked on the console", instrument, slot)
+            return None
         pf, old_pf, created = self.state.assign(id_, int(option), name=name or str(instrument), algo=self._run.name)
         return Assignment(pf, int(instrument), int(option), slot, old_pf, created)
 
@@ -160,6 +164,8 @@ class _AlgoRun(Plugin):
         self.log.info("started as user %s; sending OFF (switch on with nats_send(True, client=%r))", self.user, self.name)
 
     def on_stop(self) -> None:
+        for w in self.app.shared.get("watches", {}).pop(self.name, []):      # its candle listeners go with it
+            w.stop()
         for child in reversed(self._children):
             self.app.stop(child)
 
@@ -205,6 +211,13 @@ def algo_start(user: int, strategy: str, pf_start: int = FIRST_PF, map_file: str
     except MissingDependency:
         print("algo_start: the portfolio registry is not running. Start it once with registry_start().")
         return False
+    window = app.get("console")                                  # the console, if it is running, makes this strategy its own window
+    if window is not None and hasattr(window, "open"):
+        try:
+            window.open(strategy)
+        except Exception:
+            import logging
+            logging.getLogger("algo.automation").exception("the console window of %r was not made", strategy)
     return True
 
 
@@ -248,17 +261,25 @@ class _Watch:
             self.handle = None
 
 
-def watch(table: str, fn: Callable, replay: bool = False) -> "_Watch | None":
+def watch(table: str, fn: Callable, replay: bool = False, owner: str | None = None) -> "_Watch | None":
     """Call fn(update, is_replay) on every update of a table a service publishes: watch("candles", on_price).
     Unlike a plain Deephaven listen(), it FOLLOWS the table: when the table is restarted (candles_start was run again) it
     moves to the new one by itself, so your script does not keep listening to a stale copy. An error in your function is logged and the
-    listener carries on. Returns a handle: handle.stop(). Prints a message and returns None if that table is not there."""
+    listener carries on. Returns a handle: handle.stop(). Prints a message and returns None if that table is not there.
+    Give `owner=<your strategy name>` in a script: the listener then belongs to that automation, so pasting the script again (or algo_stop) stops the
+    old listener first. Without it, every paste adds another listener, and your function runs once per paste."""
     app = current()
     published = app.tables.get(table)
     if published is None:
         print(f"watch: the {table} table is not there: start it first ({'candles_start()' if table == 'candles' else 'straddle_start(0)'})")
         return None
     w = _Watch(table, fn, replay)
+    if owner:
+        mine = app.shared.setdefault("watches", {}).setdefault(owner, [])
+        for old in [x for x in mine if x.name == table]:      # a re-pasted script replaces its own listener
+            old.stop()
+            mine.remove(old)
+        mine.append(w)
     w.attach(published)
     w._undo = app.on_publish(table, w.attach)
     return w
@@ -320,6 +341,13 @@ def pf_mark(strategy: str, instrument: int, leg: str | None, option: int | None 
     run = _run(strategy, "pf_mark")
     if run is not None:
         run.book.state.set_live(run.book.track(instrument, slot), leg, option)
+
+
+def pf_allowed(strategy: str, instrument: int, slot: int = 0) -> bool:
+    """False while the operator has UNTICKED this slot on the console (it is unsubscribed from there). pf_assign then returns None by itself;
+    use this to skip the work earlier. Ticking it again allows it."""
+    run = _run(strategy, "pf_allowed")
+    return True if run is None else run.book.state.allow.get(run.book.key(instrument, slot), True)
 
 
 def pf_cooling(strategy: str, instrument: int, seconds: float = 30, slot: int = 0) -> bool:

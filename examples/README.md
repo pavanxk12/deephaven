@@ -86,3 +86,7 @@ What stays in your script is the part that is yours: the settings, which option,
 1. Make the **subscribe payload** a setting of each automation (gap 1)?
 2. Are `.130` and `.104` **two NATS servers**? If so, should one session talk to both?
 3. Should the stocks logic (baskets and the mid filter) be a ready function, or stay in your script?
+
+## 05_nifty_sma_cross.py
+NIFTY near-expiry options, the 5 strikes nearest the money, churned when the fast SMA of the future crosses the slow one (above: CALLs, below: PUTs, the old
+portfolios retire). It needs `candles_start("1min", symbols=["NIFTY"], expiries=1)` so the options have candles, and the registry and NATS service started.

@@ -13,6 +13,7 @@ from concurrent.futures import Future
 from typing import Awaitable, Callable
 
 from algo.comms.nats_service import NO_SERVICE, Call, NatsService, Reply
+from algo.core.pfstate import PfState
 from algo.core.plugin import Plugin
 from algo.strategy.book import Portfolios
 from algo.strategy.config import BridgeConfig
@@ -42,11 +43,13 @@ class Bridge(Plugin):
         self._nats: NatsService | None = None
         self._enable_cbs: list[Callable[[], None]] = []
         self._halt_cbs: list[Callable[[], None]] = []
+        self._hub = None                                  # the shared portfolio states this bridge listens to
+        self._unhook: Callable[[], None] | None = None
 
     # ---- lifecycle ---------------------------------------------------------------------------
     def start(self) -> None:
         self.bind(None, self.app[self.book_name].state)
-        self.nats.disable(self.client)                    # every start begins OFF, even a re-paste of an algo that was sending
+        self.nats.disable(self.client)                    # (this also hooks the shared portfolio states, see `nats`)                    # every start begins OFF, even a re-paste of an algo that was sending
         self.log.info("sending through %s: %s", self.nats_name, self.nats.describe())
         book_user = getattr(self.book, "user", None)
         if self.cfg.user is not None and book_user is not None and self.cfg.user != book_user:
@@ -67,7 +70,51 @@ class Bridge(Plugin):
         """The running NATS service, looked up every time so a stopped and restarted service is picked up. While there is
         none, a stand-in that answers "service_down" to everything and raises nothing."""
         svc = self._app.get(self.nats_name) if self._app is not None else self._nats
-        return svc if svc is not None else NO_SERVICE
+        svc = svc if svc is not None else NO_SERVICE
+        if svc.states is not self._hub and self.book is not None:
+            self._listen(svc.states)
+        return svc
+
+    # ---- what the console (or another algo) did to one of our portfolios -----------------------
+    def _listen(self, hub) -> None:
+        """Listen to the shared portfolio states, and tell them about the portfolios the book already had subscribed."""
+        if self._unhook is not None:
+            self._unhook()
+        self._hub, self._unhook = hub, hub.on_change(self._on_pf)
+        user = self.user
+        if user is None:
+            users = self.nats.cfg.users if self.nats is not NO_SERVICE else ()
+            user = users[0] if len(users) == 1 else None
+        if user is not None:
+            for pf, option in list(self.book.subscribed.items()):
+                hub.adopt(user, pf, option, paused=pf in self.book.paused)
+
+    def _on_pf(self, user: int, pf: int, st: PfState) -> None:
+        """A confirmed command on some portfolio. If it is ours, bring the book in line, so this algo knows what the console did:
+        a pause or resume, a square up (the slot may start again on the next signal), or a tick / untick of the checkbox, which
+        allows / blocks the slot (an unticked slot gets no new portfolio and no order until it is ticked again)."""
+        book = self.book
+        if book is None or (self.user is not None and user != self.user):
+            return
+        key = book.token_of_pf(pf)
+        if key is None and pf not in book.subscribed:
+            return                                        # not one of ours
+        try:
+            if st.cmd == "pause_unpause":
+                book.set_paused(pf, st.paused)
+            elif st.cmd == "squareup" and key is not None:
+                book.set_live(key, None)
+            elif st.cmd in ("subscribe", "unsubscribe") and st.by != self.client and key is not None:
+                book.set_allow(key, st.subscribed)
+                self.log.info("PF %s %s from %s: slot %s", pf, "ticked" if st.subscribed else "UNTICKED", st.by,
+                              "allowed" if st.subscribed else "blocked, no new orders until it is ticked again")
+        except Exception:
+            self.log.exception("portfolio state not applied")
+
+    def on_stop(self) -> None:
+        if self._unhook is not None:
+            self._unhook()
+        self._hub = self._unhook = None
 
     @property
     def user(self) -> "int | None":
@@ -160,6 +207,8 @@ class Bridge(Plugin):
         book, cfg = self.book, self.cfg
 
         async def job(call: Call) -> None:
+            seen = self.nats.pf_state(pf, self.user)
+            held = bool(seen and seen.paused and seen.by != self.client)  # paused by the console (or another algo): their pause stands
             if book.subscribed.get(pf) is None:                           # new PF: subscribe it to the option
                 await _step(call, "subscribe", {**self.nats.cfg.sub_payload, "T1": option}, "subscribe not ok, apply skipped")
                 book.subscribe(pf, option)
@@ -167,6 +216,9 @@ class Bridge(Plugin):
             cap = book.caps.get(pf, 0) + cfg.add_qty
             await _step(call, "apply", {**params, "maxqty": cap}, "apply not ok, left paused")
             book.caps[pf] = cap
+            if held:
+                self.log.info("PF %s was paused by %s: applied, and left paused", pf, seen.by)
+                return
             _need(await self._pause(call, pf, "UnPause"), "unpause not ok, may still be paused")
 
         try:

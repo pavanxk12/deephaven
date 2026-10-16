@@ -110,7 +110,7 @@ def on_candle(update, is_replay):
             buy("PUT")
 
 
-candle_listener = watch("candles", on_candle)               # follows the table if candles are restarted
+candle_listener = watch("candles", on_candle, owner=STRATEGY)               # follows the table if candles are restarted
 
 nats_send(True, client=STRATEGY)                             # NOW it may send. Stop just this automation: nats_send(False, client=STRATEGY)
 # To remove it:  candle_listener.stop(); algo_stop(STRATEGY)        Its portfolios:  algo_portfolios(STRATEGY)

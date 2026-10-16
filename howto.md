@@ -106,6 +106,9 @@ params = {...}                                       # your own order parameters
 pf_activate(a, "CALL", params)                       # THE NATS SERVICE: [retire old] subscribe, pause, apply, unpause. Returns at once.
 nats_send(True, client="stocks")                     # switch THIS automation on;  nats_send(False, client="stocks") stops only it
 pf_leg("stocks", token)  pf_cooling("stocks", token, 30)  algo_sending("stocks")     # quick checks for use inside your listener
+pf_allowed("stocks", token)                                       # False while the console has this slot UNTICKED (pf_assign then gives None)
+# The console and your algo share one state: what the algo pauses / squares up shows on the console, and a Pause, Square up or untick on the
+# console reaches the algo (a pause stands, a square up lets the slot restart, an untick blocks it). See nats.md "One state for the algos and the console".
 algo_portfolios("stocks")                            # its portfolios as a table;  algo_exit("stocks"), algo_pause("stocks") ... for all of them
 ```
 `examples/03_algo_template.py` is a complete one to copy; `examples/04_nifty_multistrike.py` is your multi-strike NIFTY script.

@@ -42,6 +42,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
 
+from algo.core.pfstate import PfStates, pf_states
 from algo.core.plugin import Plugin
 
 NO_SENDER = ("subscribe", "unsubscribe")          # these two carry the user id but not SENDER
@@ -168,6 +169,7 @@ class NoService:
     state = "service_down"
     cfg = NatsConfig()
     counts: dict = {}
+    states = PfStates()                              # always empty: nothing is confirmed while the service is down
 
     def _down(self, pf, label: str) -> Future:
         fut: Future = Future()
@@ -211,6 +213,9 @@ class NoService:
     def note(self, pf, cmd, status, detail="", user=0) -> None:
         pass
 
+    def pf_state(self, pf, user=None):
+        return None
+
     def describe(self) -> str:
         return "the NATS service is not running (nats_start())"
 
@@ -238,6 +243,8 @@ class NatsService(Plugin):
         self.blocked_users: set = set()                   # nothing is sent for these users / portfolios until unblocked
         self.blocked_pfs: set = set()                     # (user, portfolio): a portfolio number belongs to a user
         self.zone = None
+        self.states = PfStates()                          # what the confirmed commands did to each portfolio (see algo.core.pfstate)
+        self.state_log = None                             # anything with write_row(...): the `portfolio_state_log` table
         self._thread: threading.Thread | None = None
         self._sem: asyncio.Semaphore | None = None
         self._lanes: dict[tuple, deque] = {}              # (user, portfolio) -> waiting jobs, loop thread only
@@ -265,6 +272,13 @@ class NatsService(Plugin):
             shared["nats_events_writer"] = w
             self.app.publish("nats_events", w.table)
         self.events = shared["nats_events_writer"]
+        self.states = pf_states(shared)                   # shared: algos and the console read it, and it survives a restart of this service
+        if "pf_state_writer" not in shared:               # every confirmed change of a portfolio (pause, squareup, subscribe ...)
+            w = DynamicTableWriter({"Time": dht.string, "User": dht.int64, "PF": dht.int64, "Cmd": dht.string, "By": dht.string,
+                                    "Option": dht.int64, "Subscribed": dht.int64, "Paused": dht.int64, "Squared": dht.int64})   # 1 / 0
+            shared["pf_state_writer"] = w
+            self.app.publish("portfolio_state_log", w.table)
+        self.state_log = shared["pf_state_writer"]
         self.adopt_blocks(shared, self.lift_blocks)
         if self.blocked_users or self.blocked_pfs:
             self.log.warning("still BLOCKED from before: %s (nats_unblock(...) lifts it)", self.blocks())
@@ -313,7 +327,7 @@ class NatsService(Plugin):
     async def _shutdown(self) -> None:
         for (_, pf), lane in list(self._lanes.items()):   # whatever is still waiting is told it will not run
             while lane:
-                _, fut, user = lane.popleft()
+                _, fut, user, _client = lane.popleft()
                 self.queued -= 1
                 if fut.set_running_or_notify_cancel():
                     fut.set_result(Reply(False, "stopped", pf, user=user))
@@ -602,12 +616,12 @@ class NatsService(Plugin):
         try:
             if loop is None:
                 raise RuntimeError("stopped")
-            loop.call_soon_threadsafe(self._enqueue, pf, job, fut, uid)
+            loop.call_soon_threadsafe(self._enqueue, pf, job, fut, uid, client)
         except RuntimeError:                              # stopped, or the loop closed just now
             fut.set_result(Reply(False, "stopped", pf, label, user=uid))
         return fut
 
-    def _enqueue(self, pf: int, job: Job, fut: Future, user: int) -> None:
+    def _enqueue(self, pf: int, job: Job, fut: Future, user: int, client: str | None = None) -> None:
         try:
             key = (user, pf)                              # the same number under another user is another portfolio
             lane = self._lanes.get(key)
@@ -624,7 +638,7 @@ class NatsService(Plugin):
                 return
             if fresh:
                 lane = self._lanes[key] = deque()
-            lane.append((job, fut, user))
+            lane.append((job, fut, user, client))
             self.queued += 1
             if fresh:
                 task = asyncio.ensure_future(self._drain(key, lane))
@@ -638,13 +652,13 @@ class NatsService(Plugin):
         pf = key[1]
         try:
             while lane:
-                job, fut, user = lane.popleft()
+                job, fut, user, client = lane.popleft()
                 self.queued -= 1
                 if not fut.set_running_or_notify_cancel():
                     continue                              # the caller cancelled it while it waited
                 self.running += 1
                 try:
-                    result = await job(functools.partial(self._call, pf, user))
+                    result = await job(functools.partial(self._call, pf, user, client=client))
                 except asyncio.CancelledError:            # the service is stopping and this request did not finish in time
                     fut.set_result(Reply(False, "stopped", pf, user=user))
                     raise
@@ -667,7 +681,7 @@ class NatsService(Plugin):
             out["SENDER"] = self.cfg.sender
         return out
 
-    async def _call(self, pf: int, user: int, cmd: str, payload: dict | None = None) -> Reply:
+    async def _call(self, pf: int, user: int, cmd: str, payload: dict | None = None, client: str | None = None) -> Reply:
         counts = self.counts
         if user in self.blocked_users or (user, pf) in self.blocked_pfs:  # blocked in the middle of a sequence
             counts["failed"] += 1
@@ -722,10 +736,28 @@ class NatsService(Plugin):
             if reply.ok:
                 self.log.info("[%s] PF %s -> ok (%.0f ms)", cmd, pf, self.rtt_ms)
                 self._record(pf, cmd, payload_str, reply_id)
+                self._track(pf, user, cmd, payload, client)
             else:
                 self.log.warning("[%s] PF %s -> %s: %s", cmd, pf, reply.status, raw.decode(errors="replace"))
                 self.note(pf, cmd, reply.status, raw.decode(errors="replace"), user)
         return reply
+
+    def _track(self, pf: int, user: int, cmd: str, payload: dict, client: str | None) -> None:
+        """Tell everybody what a confirmed command did to the portfolio: the shared state, and a row in `portfolio_state_log`."""
+        try:
+            st = self.states.record(user, pf, cmd, payload, client)
+            if st is not None and self.state_log is not None:
+                from datetime import datetime
+                self.state_log.write_row(datetime.now(self.zone).strftime("%H:%M:%S"), int(user), int(pf), cmd, st.by,
+                                         st.option or 0, int(st.subscribed), int(st.paused), int(st.squared))
+        except Exception:
+            self.log.exception("portfolio state not recorded")
+
+    def pf_state(self, pf: int, user: int | None = None):
+        """What the confirmed commands did to this portfolio (a PfState), or None if nothing is known. `user` may be left out when the
+        service has only one user."""
+        uid, why = self._resolve(user)
+        return None if why else self.states.get(uid, pf)
 
     def _record(self, pf: int, cmd: str, payload_str: str, reply_id: str) -> None:
         if self.audit is None:

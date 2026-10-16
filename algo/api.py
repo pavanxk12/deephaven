@@ -26,7 +26,7 @@ from algo.lookup import (contract, contracts, expiries, last_candles, last_price
 from algo.data.master import Master
 from algo.data.store import DEFAULT_TABLES, PREFIX, Eod, make_store, normalise_day, save_tables
 from algo.automation import (algo_exit, algo_pause, algo_portfolios, algo_sending, algo_start, algo_stop, algo_unpause,
-                             algo_unsubscribe, pf_activate, pf_assign, pf_cooling, pf_leg, pf_mark, pf_track, watch)
+                             algo_unsubscribe, pf_activate, pf_assign, pf_allowed, pf_cooling, pf_leg, pf_mark, pf_track, watch)
 from algo.series.straddle import Straddle, StraddleConfig
 from algo.strategy.registry import PortfolioRegistry
 
@@ -454,6 +454,19 @@ def pf_list(user: int | None = None) -> None:
         print(f"user {u}  portfolio {p}  {name or '-'}  algo {algo or '-'}  book {owner}  {created}" + (f"  {note}" if note else ""))
 
 
+def console_open(strategy: str) -> bool:
+    """Make the console window of one strategy: its own summary, net positions, messages and order book, as `console_<strategy>`.
+    (algo_start does this by itself while the console is running; this is for a strategy that has portfolios but was not started
+    with algo_start, such as "manual".)"""
+    c = current().get("console")
+    if c is None:
+        print("The console is not running. Start it with  app.run(algo.Console())  (scripts/03_console.py).")
+        return False
+    done = c.open(strategy)
+    print(f"console_{strategy}: " + ("published" if done else "nothing to do (already there, or not a plain name)"))
+    return done
+
+
 def algo_status() -> None:
     """What is running."""
     _app().status()
@@ -467,8 +480,9 @@ GROUPS = {
     "PORTFOLIOS (the book)": ("registry_start", "registry_connect", "registry_stop", "pf_create", "pf_register", "pf_list"),
     "NATS (commands)": ("nats_start", "nats_connect", "nats_add_user", "nats_restart", "nats_stop", "nats_send", "pf_subscribe", "pf_pause",
                         "pf_unpause", "pf_squareup", "pf_unsubscribe", "pf_apply", "nats_block", "nats_unblock"),
-    "AUTOMATIONS (a script you write)": ("algo_start", "algo_stop", "pf_track", "pf_assign", "pf_activate", "pf_leg", "pf_mark", "pf_cooling",
+    "AUTOMATIONS (a script you write)": ("algo_start", "algo_stop", "pf_track", "pf_assign", "pf_activate", "pf_leg", "pf_mark", "pf_cooling", "pf_allowed",
                                          "algo_sending", "watch", "algo_portfolios", "algo_pause", "algo_unpause", "algo_exit", "algo_unsubscribe"),
+    "CONSOLE (one window per strategy)": ("console_open",),
     "WHAT IS RUNNING": ("algo_status", "algo_help"),
 }
 
@@ -493,8 +507,8 @@ FUNCTIONS = (master_build, contract, contracts, expiries, strikes, nearest_strik
              straddle_start, straddle_stop, eod_save, eod_load, eod_auto, nats_start, nats_restart, nats_connect, nats_add_user, nats_stop, nats_send,
              pf_subscribe, pf_pause, pf_unpause, pf_squareup, pf_unsubscribe, pf_apply, nats_block, nats_unblock,
              registry_start, registry_connect, registry_stop, pf_create, pf_register, pf_list, algo_start, algo_stop, pf_track,
-             pf_assign, pf_activate, pf_leg, pf_mark, pf_cooling, algo_sending, watch, algo_portfolios, algo_pause, algo_unpause, algo_exit,
-             algo_unsubscribe, algo_status, algo_help)
+             pf_assign, pf_activate, pf_leg, pf_mark, pf_cooling, pf_allowed, algo_sending, watch, algo_portfolios, algo_pause, algo_unpause, algo_exit,
+             algo_unsubscribe, console_open, algo_status, algo_help)
 
 
 def install(ns: dict, market: str = "NSE", paths: Paths | None = None, level: int = logging.INFO) -> App:

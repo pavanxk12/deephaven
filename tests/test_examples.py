@@ -152,7 +152,7 @@ def run_script(ns, name, **replace):
 
 def test_the_plain_scripts_have_no_class_and_start_no_shared_service():
     import ast
-    for name in ("03_algo_template.py", "04_nifty_multistrike.py"):
+    for name in ("03_algo_template.py", "04_nifty_multistrike.py", "05_nifty_sma_cross.py"):
         tree = ast.parse((EXAMPLES / name).read_text(encoding="utf-8"))
         assert not [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)], name
         called = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
@@ -421,3 +421,71 @@ def test_the_plain_examples_start_nothing_and_define_nothing():
         assert not [n for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))], name       # no class, no def
         called = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
         assert not called & {"master_build", "candles_start", "nats_start", "registry_start", "nats_restart"}, name
+
+
+# ---- 05: SMA crossover on the 5 nearest strikes ------------------------------------------------------------------------------------
+def start_sma(tmp_path, monkeypatch, history=None):
+    ns, app, svc, wire = console_with_services(tmp_path, monkeypatch, history=history)
+    run_script(ns, "05_nifty_sma_cross.py", **{"FAST, SLOW = 5, 20": "FAST, SLOW = 3, 8"})
+    ns["WINDOW"] = (dtime(0, 0), dtime(23, 59, 59))                                  # always inside this automation's own window
+    return ns, app, svc, wire
+
+
+def test_an_sma_crossing_up_churns_the_five_nearest_calls_and_down_replaces_them_with_puts(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire = start_sma(tmp_path, monkeypatch)
+    assert svc.is_enabled("nifty_sma") and len(fake_dh) == 1
+    feed(fake_dh, falling(10, start=25100.0))                                        # the fast average sits under the slow one: no crossing yet
+    time.sleep(0.1)
+    assert wire.sent == [] and ns["state"]["side"] == -1
+    feed(fake_dh, rising(6, start=25010.0, step=40.0))                               # the fast average crosses ABOVE the slow one: CALLs
+    assert wait_for(lambda: len(wire.sent) == 20)                                    # 5 strikes x (subscribe, pause, apply, unpause)
+    firsts = [p["T1"] for _, lab, p in wire.sent if lab == "subscribe"]
+    assert sorted(firsts) == sorted(CE(i) for i in range(4, 9))                     # 24900 to 25300: the 5 nearest the future when it crossed (near 25130)
+    assert {p["USERIDENTIFIER"] for _, _, p in wire.sent} == {3}
+    reg = app.plugins["registry"].state
+    assert [(r[1], r[4]) for r in reg.portfolios(3)] == [(1001 + k, "nifty_sma") for k in range(5)]
+    assert [ns["pf_leg"]("nifty_sma", FUT, k) for k in range(5)] == ["CALL"] * 5
+    feed(fake_dh, [25100.0])                                                         # still above: nothing more is sent
+    time.sleep(0.2)
+    assert len(wire.sent) == 20
+    feed(fake_dh, falling(10, start=25200.0, step=50.0))                             # a fall: the fast average crosses BELOW again: PUTs
+    assert wait_for(lambda: len(wire.sent) == 20 + 5 * 7)                            # per slot: pause, squareup, unsubscribe the old; 4 for the new
+    assert [ns["pf_leg"]("nifty_sma", FUT, k) for k in range(5)] == ["PUT"] * 5
+    assert sorted(r[1] for r in reg.portfolios(3)) == list(range(1001, 1011))
+    svc.on_stop()
+
+
+def test_the_sma_script_does_not_trade_at_start_off_or_unticked(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire = start_sma(tmp_path, monkeypatch, history=falling(10, start=25100.0))
+    assert len(ns["closes"]) == 10 and ns["state"]["side"] == -1                     # seeded from the candles already built: no crossing at start
+    ns["nats_send"](False, client="nifty_sma")                                       # off: a crossing computes but sends nothing, uses no number
+    feed(fake_dh, rising(8, start=25010.0, step=40.0))
+    time.sleep(0.2)
+    assert wire.sent == [] and app.plugins["registry"].state.portfolios() == []
+    ns["nats_send"](True, client="nifty_sma")
+    ns["churn"]("CALL")                                                              # switched on again: now it sends, 5 strikes x 4 commands
+    assert wait_for(lambda: len(wire.sent) == 20)
+    svc.on_stop()
+
+
+def test_pasting_a_script_again_replaces_its_candle_listener_instead_of_adding_a_second(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire = start_sma(tmp_path, monkeypatch)
+    run_script(ns, "05_nifty_sma_cross.py", **{"FAST, SLOW = 5, 20": "FAST, SLOW = 3, 8"})        # pasted again
+    assert len(fake_dh) == 2 and fake_dh[0].stopped and not fake_dh[1].stopped                  # the first listener was stopped
+    ns["WINDOW"] = (dtime(0, 0), dtime(23, 59, 59))
+    for close in falling(10, start=25100.0):
+        fake_dh[1].fn(Update(added={"token": [FUT], "Close": [float(close)]}), False)
+    assert len(ns["closes"]) == 10                                                             # each candle counted once
+    ns["algo_stop"]("nifty_sma")
+    assert fake_dh[1].stopped                                                                  # stopping the automation stops its listener
+    svc.on_stop()
+
+
+def test_a_slot_with_no_price_says_so_instead_of_staying_silent(tmp_path, fake_dh, monkeypatch, capsys):
+    ns, app, svc, wire = start_sma(tmp_path, monkeypatch)
+    ns["ltp"].update({FUT: 25010.0, CE(5): 120.0})                                              # only the nearest strike has a price
+    ns["churn"]("CALL")
+    assert wait_for(lambda: len(wire.sent) == 4)
+    out = capsys.readouterr().out
+    assert out.count("skipped: no usable price") == 4 and "slot 1" in out and "slot 4" in out
+    svc.on_stop()

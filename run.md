@@ -76,8 +76,6 @@ Run `eod_save()` first if you need what was built.
 
 ---
 
----
-
 ## 3. Straddle (optional)
 
 ```python
@@ -172,6 +170,30 @@ for each portfolio it uses. The same number under two different users is fine. T
 Write a plain script in the terminal: `algo_start(3, "my_algo")`, then `pf_assign(...)` to get a portfolio from the book and `pf_activate(...)` to
 send the commands; it starts OFF (`nats_send(True, client="my_algo")` switches it on). See `howto.md` section 5; a copy-and-change template in
 `examples/03_algo_template.py`.
+
+**Several strategies at once.** Run as many as you like, each from its own script with its own `STRATEGY` name (`nifty_sma`, `banknifty_sma` ...). Each gets its
+own book, bridge, send switch (`nats_send(True/False, client="name")`), candle listener and console window (`console_<name>`); portfolio numbers never clash and
+stopping or re-pasting one does not touch the others. One catch: all scripts are pasted into the same terminal, so top-level variables with the same name
+(`closes`, `ltp`, `state`, `future`, `candle_listener`, and so on) are shared and the later script overwrites the earlier one's. Give each script its own names (a prefix such as `bn_`).
+
+**Pasting a script again is safe.** `watch("candles", on_candle, owner=STRATEGY)` ties the listener to the strategy, so a re-paste (or `algo_stop("name")`) replaces the
+old listener instead of adding a second. Without `owner=` every paste adds another listener and your function runs once per paste. A re-paste also restarts
+the automation OFF; its last line switches it on again.
+
+**After a new wheel is deployed (one time per deploy).** The session keeps running the code it loaded. Either restart Deephaven, or (market closed, nothing running) reload:
+```python
+algo_stop("name")                       # for each automation first: the reloaded code would not recognise a running one
+app = algo.connect(globals(), market="NSE")
+for cb in list(app._publish_cbs.get("candles", [])):         # drop candle listeners left by pastes made before owner= existed
+    w = getattr(cb, "__self__", None)
+    if type(w).__name__ == "_Watch":
+        w.stop()
+import importlib, algo.automation, algo.lookup, algo.api
+for m in (algo.automation, algo.lookup, algo.api):
+    importlib.reload(m)
+algo.api.install(globals(), "NSE")      # re-binds the functions; then paste the scripts again
+```
+`algo.reload()` is the blunt alternative: it stops every service, so run the day's start-up lines again afterwards. None of this is needed on a normal day.
 
 ---
 

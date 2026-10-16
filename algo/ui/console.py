@@ -1,9 +1,21 @@
-"""Operator console: one dashboard with summary, message window, order book, net positions and the automation controls.
+"""Operator console: summary, message window, order book, net positions and the controls, per STRATEGY.
+
+    app.run(algo.ui.Console())          # publishes `operator_console` (all strategies, with a strategy picker) and one
+                                        # `console_<strategy>` per strategy that has portfolios (each with its OWN four windows)
+
+A portfolio belongs to the strategy (the algo) the registry recorded for it; the order, trade and message tables are tied to a strategy through the
+PF number (PF = user * 10000 + portfolio number). A strategy that is started later (`algo_start`) gets its window by itself while this plugin is
+running; `console_open("name")` makes one by hand.
 
     app.run(algo.ui.Console())          # publishes `operator_console`
 
-One time window and one user id (both top-right of the Summary panel) filter every panel. The controls talk to the
-`Book` (state) and `Bridge` (commands) plugins directly; there are no lookups of names in the session globals.
+One time window and one user id (both top-right of the Summary panel) filter every panel.
+
+The tick box, Pause / Resume and Square up of a row, and the buttons of the Controls panel, are the SAME state the algos use:
+every command goes through the NATS service, and what it confirms is kept in the shared portfolio states (algo.core.pfstate).
+An algo that pauses, squares up or unsubscribes shows up here at once; a click here is seen by the algo (its book follows the
+shared states): a pause is respected, a square up lets the slot start again, an unticked slot gets no new orders.
+A row is tied to its portfolio by the option it is subscribed to. Rows without a portfolio are shown with the controls disabled.
 
 Needs in the session: strategy_events, orders_trade, orders_ack and the live feed table (default `fo_market_data`).
 """
@@ -11,15 +23,17 @@ from __future__ import annotations
 
 import base64
 import mimetypes
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from deephaven import agg, ui
 from deephaven.time import to_j_instant, to_j_zdt
 
+from algo.comms.nats_service import NO_SERVICE
+from algo.core.pfstate import pf_states
 from algo.core.plugin import Plugin
 from algo.ui import tables as q
-from algo.ui.filters import PF_PER_USER, Filters, time_conds, user_cond
+from algo.ui.filters import PF_PER_USER, Filters, Strategies, safe_strategy, strategy_cond, time_conds
 
 GREEN, RED, BLUE, ORANGE, AMBER, PURPLE, GREY, INK = (
     "#1a7f37", "#cf222e", "#1f5fbf", "#c2410c", "#b45309", "#8250df", "#6e7781", "#1f2328")
@@ -45,8 +59,6 @@ class ConsoleConfig:
     event_cols: dict = field(default_factory=lambda: dict(seq="KafkaOffset", ts="KafkaTimestamp", pf="PF", text="Payload"))
     logo_file: str = "logo.png"                  # in paths.market_data; missing = nothing shown
     logo_height: str = "72px"                    # keep the file small (< ~100 KB): it is sent to the browser with the page
-    book: str = "book"
-    bridge: str = "bridge"
     pf_per_user: int = PF_PER_USER
 
 
@@ -55,8 +67,11 @@ class Ctx:
     """Everything the components need, passed as one prop."""
     cfg: ConsoleConfig
     market: object
-    book: object                 # Portfolios
-    bridge: object               # Bridge
+    app: object                  # the App: the NATS service is looked up in it every time (it may be stopped and started)
+    states: object               # PfStates: what the confirmed commands did to each portfolio, shared with the algos
+    registry: object             # the Registry: (user, pf) -> the strategy (algo) it belongs to
+    strategies: object           # Strategies: the names that have portfolios
+    strategy: "str | None"       # the one strategy this dashboard is for, None = the all-strategies dashboard (with a picker)
     symbol_of: object            # callable token -> symbol text
     filters: Filters
     net_all: object              # whole-day net positions, never filtered (the per-position rules use it)
@@ -170,14 +185,48 @@ ORD_FORMATS = [
 ]
 
 
+WHY = {"off": "sending is OFF (nats_send(True))", "service_down": "the NATS service is not running", "disconnected": "NATS is disconnected",
+       "timeout": "no answer from the bridge: look before sending again", "blocked": "this user or portfolio is blocked",
+       "no_user": "the service has several users and none was named", "user_not_allowed": "this user is not allowed",
+       "full": "too many commands waiting for this portfolio", "no_responders": "nothing listens on this portfolio"}
+
+
+def mine(ctx: Ctx, user: int, pf: int) -> bool:
+    """Does this portfolio belong to the strategy the dashboard shows? (all of them, on the all-strategies dashboard)"""
+    if ctx.strategy is None:
+        return True
+    rec = ctx.registry.get(user, pf)
+    return bool(rec) and rec["algo"] == ctx.strategy
+
+
+def service(ctx: Ctx):
+    """The running NATS service, or the stand-in that answers service_down."""
+    svc = ctx.app.get("nats")
+    return svc if svc is not None else NO_SERVICE
+
+
+def send(ctx: Ctx, fut, what: str, set_warn=None) -> None:
+    """Tell the person when a command did not go through (the future's reply says why). Nothing raises."""
+    def done(f):
+        try:
+            if f.cancelled() or f.exception() is not None:
+                return
+            r = f.result()
+            if not r.ok and set_warn is not None:
+                set_warn(f"{what}: {WHY.get(r.status, r.status)}")
+        except Exception:
+            pass
+    fut.add_done_callback(done)
+
+
 def use_redraw(ctx: Ctx):
-    """Redraw the calling component whenever the portfolio book changes (pause, allow, new PF, send switch)."""
+    """Redraw the calling component whenever a portfolio changes (an algo or this console paused, squared up, subscribed ...)."""
     _, set_version = ui.use_state(0)
 
     def redraw():
         set_version(lambda n: n + 1)
 
-    ui.use_effect(lambda: ctx.book.on_change(redraw), [])
+    ui.use_effect(lambda: ctx.states.on_change(lambda user, pf, st: redraw()), [])
     return redraw
 
 
@@ -185,7 +234,7 @@ def use_redraw(ctx: Ctx):
 # panels
 # =================================================================================================
 @ui.component
-def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None):
+def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, title="Summary"):
     totals = ui.use_memo(
         lambda: net_tbl.agg_by([agg.sum_(["BuyVal", "SellVal", "Realised", "M2M", "Fills"])]).view([
             "Turnover = (BuyVal + SellVal) / 1.0E7",
@@ -229,11 +278,11 @@ def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None):
         body.insert(0, ui.flex(logo, filter_ctl if filter_ctl is not None else ui.html.div(),
                                justify_content="space-between", align_items="center",
                                UNSAFE_style={"flex": "0 0 auto", "padding": "2px 8px"}))
-    return ui.panel(ui.flex(*body, direction="column", height="100%"), title="Summary")
+    return ui.panel(ui.flex(*body, direction="column", height="100%"), title=title)
 
 
 @ui.component
-def message_window(msgs):
+def message_window(msgs, hide_strategy=False):
     kind, set_kind = ui.use_state("ALL")            # ALL, TRADE, ORDER, EVENT, ERROR, INFO
     type_filter = "" if kind == "ALL" else kind
 
@@ -254,7 +303,7 @@ def message_window(msgs):
                 show_search=True,
                 quick_filters={"Type": type_filter},
                 format_=MSG_FORMATS,
-                hidden_columns=["Seq", "Ts"],
+                hidden_columns=["Seq", "Ts"] + (["Strategy"] if hide_strategy else []),
                 always_fetch_columns=["Type"],
                 column_display_names={"Time": "TIME", "Pf": "PF", "Msg": "MESSAGE"},
                 frozen_columns=["Time", "Type"],
@@ -286,12 +335,12 @@ def order_book(book_tbl, order_time):
 def positions_grid(table, ctx: Ctx):
     """Net positions drawn as real rows, so each row can hold a checkbox (left of the symbol) and
     Pause / Square up buttons (right of M2M). Rows = positions only (tens)."""
-    book, bridge, sym = ctx.book, ctx.bridge, ctx.symbol_of
+    sym = ctx.symbol_of
     src = ui.use_memo(lambda: table.view(POS_COLS), [table])
     data = ui.use_table_data(src)
     full_src = ui.use_memo(lambda: ctx.net_all.view(["token", "NetQty"]), [])      # whole-day net, for the rules
     full = ui.use_table_data(full_src)
-    armed, set_armed = ui.use_state(None)           # PF whose Square up is waiting for its confirm click
+    armed, set_armed = ui.use_state(None)           # (user, PF) whose Square up is waiting for its confirm click
     warn, set_warn = ui.use_state("")               # why the last tick / untick was refused
     redraw = use_redraw(ctx)
 
@@ -299,48 +348,52 @@ def positions_grid(table, ctx: Ctx):
     rows = [{c: d[c][i] for c in POS_COLS} for i in range(len(d.get("token", [])))]
     fd = full if isinstance(full, dict) else {}
     full_net = {int(t): int(n) for t, n in zip(fd.get("token", []), fd.get("NetQty", []))}
-    has_portfolios = bool(book.current_pf_map())
+    by_option = ctx.states.by_option(keep=lambda u, p, s: mine(ctx, u, p))   # option token -> (user, pf, state): the portfolio of this strategy that trades the row
+    has_portfolios = len(by_option) > 0
 
-    def on_allow(token, net, on):
-        owner = book.owner_of(token, sym)
-        if not on and net != 0:                     # rule: cannot block automation while a position is open
+    def on_allow(token, net, on, user, pf):
+        """The tick box is subscribe / unsubscribe. An open position must be paused and squared up first."""
+        svc = service(ctx)
+        if not on and net != 0:                     # rule: cannot unsubscribe while a position is open
             set_warn(f"{sym(token)}: cannot untick, net position is {net:+,}. Pause and Square up first.")
-        elif owner is None:
+        elif pf is None:
             set_warn(f"{sym(token)}: no portfolio trades this instrument (yet), nothing to change.")
         else:
             set_warn("")
-            book.set_allow(owner, on)
-            ctx.bridge.log.info("%s automation %s", sym(owner), "ALLOWED" if on else "BLOCKED")
+            what = f"{'subscribe' if on else 'unsubscribe'} PF {pf}"
+            send(ctx, svc.subscribe(pf, token, user=user) if on else svc.unsubscribe(pf, token, user=user), what, set_warn)
         redraw()
 
-    def on_pause(pf, is_paused):
+    def on_pause(user, pf, is_paused):
         set_armed(None)
-        (bridge.unpause_pf if is_paused else bridge.pause_pf)(pf)
+        svc = service(ctx)
+        send(ctx, (svc.unpause if is_paused else svc.pause)(pf, user=user), f"{'resume' if is_paused else 'pause'} PF {pf}", set_warn)
         redraw()
 
-    def on_square(pf):
-        if pf not in book.paused:                           # rule: no square up until the PF is paused
-            bridge.log.warning("square up PF %s refused: press Pause first", pf)
+    def on_square(user, pf):
+        st = ctx.states.get(user, pf)
+        if st is None or not st.paused:             # rule: no square up until the PF is paused
+            set_warn(f"square up PF {pf} refused: press Pause first")
             set_armed(None)
-        elif armed != pf:
-            set_armed(pf)                                   # first click arms it, second click sends it
+        elif armed != (user, pf):
+            set_armed((user, pf))                   # first click arms it, second click sends it
         else:
             set_armed(None)
-            bridge.squareup_pf(pf)
+            send(ctx, service(ctx).squareup(pf, user=user), f"square up PF {pf}", set_warn)
         redraw()
 
     def line(r):
         token = int(r["token"])
         net = full_net.get(token, int(r["NetQty"]))         # rules use the whole-day position, not the window
         shown_net = int(r["NetQty"])
-        owner = book.owner_of(token, sym)                   # the option row -> the underlying future that is tracked
-        pf = book.pf_for_row(token, sym)                    # None = stock not tracked
-        has_pf = pf is not None
-        is_allowed = book.allow.get(owner, True) if owner is not None else True
-        is_paused = has_pf and pf in book.paused
+        entry = by_option.get(token)                        # the portfolio subscribed to this option, if any
+        user, pf, st = entry if entry is not None else (None, None, None)
+        has_pf = entry is not None
+        is_allowed = st.subscribed if has_pf else True      # the tick box: subscribed
+        is_paused = has_pf and st.paused
         return grid_row(
             ui.checkbox(str(r["Symbol"]), is_selected=is_allowed,
-                        on_change=lambda on: on_allow(token, net, on),
+                        is_disabled=not has_pf, on_change=lambda on: on_allow(token, net, on, user, pf),
                         UNSAFE_style={"fontSize": "14px", "height": "26px", "minHeight": "0", "paddingLeft": "6px",
                                       "whiteSpace": "nowrap"}),
             cell(fmt(r["BuyQty"], ",.0f"), bg=BUY_BG), cell(fmt(r["BuyAvg"], ",.2f"), bg=BUY_BG),
@@ -352,9 +405,9 @@ def positions_grid(table, ctx: Ctx):
             cell(fmt(r["Realised"], ",.0f"), color=sign_color(r["Realised"]), bold=True),
             cell(fmt(r["M2M"], ",.0f"), color=sign_color(r["M2M"]), bold=True),
             ui.flex(small_btn("Resume" if is_paused else "Pause", GREEN if is_paused else AMBER,
-                              lambda: on_pause(pf, is_paused), disabled=not has_pf), justify_content="center"),
-            ui.flex(small_btn("Confirm?" if armed == pf else "Square up", RED,
-                              lambda: on_square(pf), disabled=not is_paused), justify_content="center"),
+                              lambda: on_pause(user, pf, is_paused), disabled=not has_pf), justify_content="center"),
+            ui.flex(small_btn("Confirm?" if has_pf and armed == (user, pf) else "Square up", RED,
+                              lambda: on_square(user, pf), disabled=not is_paused), justify_content="center"),
             key=str(token),
         )
 
@@ -386,7 +439,7 @@ def positions_grid(table, ctx: Ctx):
         ),
         style={"position": "sticky", "bottom": "0", "background": "#eef1f4", "borderTop": "2px solid #c9d1d9", "zIndex": "2"},
     )
-    note = ([] if has_portfolios else [ui.text("no strategy running yet - checkboxes and buttons are disabled")]) + (
+    note = ([] if has_portfolios else [ui.text("no portfolio has been subscribed yet - checkboxes and buttons are disabled")]) + (
         [ui.html.div(warn, style={"color": RED, "fontSize": "13px", "fontWeight": "600", "padding": "2px 8px"})] if warn else [])
     return ui.html.div(                              # outer box scrolls, inner box keeps the columns from squeezing
         *note,
@@ -427,31 +480,35 @@ def net_positions(net_tbl, ctx: Ctx):
 
 @ui.component
 def control_panel(ctx: Ctx):
-    book, bridge = ctx.book, ctx.bridge
     confirm, set_confirm = ui.use_state(False)          # square off needs a second click
+    warn, set_warn = ui.use_state("")
     redraw = use_redraw(ctx)
 
-    sending = bridge.sending
-    pfs = book.current_pfs()                            # current portfolios; retired ones stay paused
-    n_paused, n_all = sum(1 for pf in pfs if pf in book.paused), len(pfs)
+    svc = service(ctx)
+    sending = svc.sending and svc.state != "service_down"
+    live = [(u, pf, st) for u, pf, st in ctx.states.items() if st.subscribed and mine(ctx, u, pf)]    # this strategy's portfolios that are subscribed now
+    n_paused, n_all = sum(1 for _, _, st in live if st.paused), len(live)
     all_paused = n_all > 0 and n_paused == n_all        # same rule as per position: Square off only when paused
 
     def handle_switch(on):
-        (bridge.send_on if on else bridge.send_off)()
+        (svc.send_on if on else svc.send_off)()
+        set_warn("" if svc.state != "service_down" else WHY["service_down"])
         redraw()
 
     def handle_pause_all():
         set_confirm(False)
-        (bridge.unpause_all if all_paused else bridge.pause_all)()
+        for u, pf, _ in live:
+            send(ctx, (svc.unpause if all_paused else svc.pause)(pf, user=u), f"{'resume' if all_paused else 'pause'} PF {pf}", set_warn)
         redraw()
 
     def handle_square_off():
         set_confirm(False)
-        cur = book.current_pfs()                        # checked again at click time
-        if not cur or any(pf not in book.paused for pf in cur):
-            bridge.log.warning("square off all refused: press Pause all first")
+        now = [(u, pf, st) for u, pf, st in ctx.states.items() if st.subscribed and mine(ctx, u, pf)]   # checked again at click time
+        if not now or any(not st.paused for _, _, st in now):
+            set_warn("square off all refused: press Pause all first")
         else:
-            bridge.exit_all()
+            for u, pf, _ in now:
+                send(ctx, svc.squareup(pf, user=u), f"square up PF {pf}", set_warn)
         redraw()
 
     def pbtn(label, color, on_press, outline=False, disabled=False):
@@ -471,7 +528,7 @@ def control_panel(ctx: Ctx):
         ui.flex(
             ui.flex(
                 ui.flex(
-                    ui.html.div("AUTOMATION", style={"color": GREY, "fontSize": "11px", "fontWeight": "bold"}),
+                    ui.html.div(f"SENDING  ({ctx.strategy})" if ctx.strategy else "SENDING", style={"color": GREY, "fontSize": "11px", "fontWeight": "bold"}),
                     ui.html.div("ON" if sending else "OFF",
                                 style={"color": status_color, "fontSize": "22px", "fontWeight": "700", "lineHeight": "1.1"}),
                     direction="column",
@@ -484,6 +541,7 @@ def control_panel(ctx: Ctx):
                     square, gap="size-100", wrap=True),
             ui.html.div(f"{n_paused}/{n_all} portfolios paused  (Square off needs all paused)",
                         style={"color": GREY, "fontSize": "11px"}),
+            *([ui.html.div(warn, style={"color": RED, "fontSize": "12px", "fontWeight": "600"})] if warn else []),
             direction="column", gap="size-150",
         ),
         title="Controls",
@@ -559,99 +617,76 @@ def time_picker(ctx: Ctx):
 
 
 @ui.component
-def user_picker(ctx: Ctx):
+def strategy_picker(ctx: Ctx):
+    """Which strategy the all-strategies dashboard shows: every strategy that has portfolios, or all of them."""
     filters = ctx.filters
-    draft, set_draft = ui.use_state("")
-    note, set_note = ui.use_state("")
-    cur, set_cur = ui.use_state(filters.user)
-    opened, set_opened = ui.use_state(False)
+    cur, set_cur = ui.use_state(filters.strategy)
+    names, set_names = ui.use_state(ctx.strategies.names())
+    ui.use_effect(lambda: ctx.strategies.on_change(lambda: set_names(ctx.strategies.names())), [])
 
-    def put(u):
-        filters.set_user(u)
-        set_cur(u)
+    def pick(key):
+        value = None if key in (None, "__all__") else str(key)
+        filters.set_strategy(value)
+        set_cur(value)
 
-    def apply_now():
-        text = draft.strip()
-        if text == "":
-            put(None)
-        elif text.lstrip("-").isdigit():
-            put(int(text))
-        else:
-            set_note("User id must be a number")
-            return
-        set_note("")
-        set_opened(False)
-
-    def clear_btn():
-        set_draft("")
-        set_note("")
-        put(None)
-        set_opened(False)
-
-    dlg = ui.dialog(
-        ui.heading("User id"),
-        ui.content(
-            ui.flex(
-                ui.text_field(label="User id, empty = all users", value=draft, on_change=set_draft, auto_focus=True),
-                ui.text(note or "Filters everything: Summary, Messages, Order book and Net positions "
-                                "(user id = first digits of the PF)."),
-                direction="column", gap="size-150",
-            ),
-        ),
-        ui.button_group(ui.button("Clear", variant="secondary", on_press=clear_btn),
-                        ui.button("Apply", variant="accent", on_press=apply_now)),
-    )
-    # plain text: an emoji outside the BMP breaks the Java -> Python hand-over
-    btn = ui.action_button(f"User {cur}" if cur is not None else "All users",
-                           UNSAFE_style={"fontWeight": "700", "color": BLUE, "borderColor": BLUE} if cur is not None else {})
-    return ui.dialog_trigger(btn, dlg, is_open=opened, on_open_change=set_opened)
+    items = [ui.item("All strategies", key="__all__")] + [ui.item(n, key=n) for n in names]
+    return ui.picker(*items, aria_label="Strategy", selected_key=cur or "__all__", on_change=pick, width="size-2400")
 
 
 # =================================================================================================
 # dashboard
 # =================================================================================================
-def build_dashboard(ctx: Ctx):
-    cfg, mk = ctx.cfg, ctx.market
+def build_dashboard(base: Ctx):
+    cfg, mk = base.cfg, base.market
+    fixed = base.strategy                              # a per-strategy dashboard has its strategy fixed; the other has a picker
 
     @ui.component
     def console():
-        window, set_window = ui.use_state(ctx.filters.window)
-        user, set_user = ui.use_state(ctx.filters.user)
+        window, set_window = ui.use_state(base.filters.window)
+        chosen, set_chosen = ui.use_state(base.filters.strategy)
+        strategy = fixed or chosen
 
         def follow():
-            return ctx.filters.on_change(lambda: (set_window(ctx.filters.window), set_user(ctx.filters.user)))
+            return base.filters.on_change(lambda: (set_window(base.filters.window), set_chosen(base.filters.strategy)))
 
         ui.use_effect(follow, [])
         a, b = window
+        strat = strategy_cond(strategy)
+
+        def net_all_fn():                              # the whole day of this strategy: what the per-position rules use
+            return q.net_positions(base.trades.where(strat), base.feed, base.symbols, mk.price_div) if strat else base.net_all
+
+        net_all = ui.use_memo(net_all_fn, [strategy])
+        ctx = ui.use_memo(lambda: replace(base, strategy=strategy, net_all=net_all), [strategy, net_all])
 
         def net_fn():
-            conds = time_conds(cfg.trade_time, window) + ([user_cond("PF", user, cfg.pf_per_user)] if user is not None else [])
-            return q.net_positions(ctx.trades.where(conds), ctx.feed, ctx.symbols, mk.price_div) if conds else ctx.net_all
+            conds = time_conds(cfg.trade_time, window) + strat
+            return q.net_positions(base.trades.where(conds), base.feed, base.symbols, mk.price_div) if time_conds(cfg.trade_time, window) else net_all
 
         def msg_fn():
             conds = ([f"Ts >= epochSecondsToInstant({a}L)"] if a is not None else []) + (
-                [f"Ts <= epochSecondsToInstant({b}L)"] if b is not None else [])
-            if user is not None:
-                conds.append(user_cond("Pf", user, cfg.pf_per_user))
-            return ctx.messages.where(conds) if conds else ctx.messages
+                [f"Ts <= epochSecondsToInstant({b}L)"] if b is not None else []) + strat
+            return base.messages.where(conds) if conds else base.messages
 
         def book_fn():
-            conds = time_conds(cfg.order_time, window) + ([user_cond("PF", user, cfg.pf_per_user)] if user is not None else [])
-            return q.order_book(ctx.acks, ctx.fills, ctx.symbols, mk.price_div, cfg.order_time, mk.tz, conds) if conds else ctx.book_all
+            conds = time_conds(cfg.order_time, window) + strat
+            return q.order_book(base.acks, base.fills, base.symbols, mk.price_div, cfg.order_time, mk.tz, conds) if conds else base.book_all
 
-        net_tbl = ui.use_memo(net_fn, [a, b, user])
-        msgs = ui.use_memo(msg_fn, [a, b, user])
-        book_tbl = ui.use_memo(book_fn, [a, b, user])
-        filters_bar = ui.flex(user_picker(ctx), time_picker(ctx), gap="size-100", align_items="center")
+        net_tbl = ui.use_memo(net_fn, [a, b, strategy, net_all])
+        msgs = ui.use_memo(msg_fn, [a, b, strategy])
+        book_tbl = ui.use_memo(book_fn, [a, b, strategy])
+        bar = [time_picker(ctx)] if fixed else [strategy_picker(ctx), time_picker(ctx)]
+        filters_bar = ui.flex(*bar, gap="size-100", align_items="center")
+        title = f"Summary: {strategy}" if strategy else "Summary: all strategies"
         return ui.dashboard(
             ui.column(
                 ui.row(
-                    ui.column(summary_window(net_tbl, book_tbl, ctx.logo_src, cfg.logo_height, filters_bar), width=72),
+                    ui.column(summary_window(net_tbl, book_tbl, ctx.logo_src, cfg.logo_height, filters_bar, title), width=72),
                     ui.column(control_panel(ctx), width=28),
                     height=26,
                 ),
                 ui.row(
-                    message_window(msgs),
+                    message_window(msgs, hide_strategy=bool(strategy)),
                     ui.column(ui.row(order_book(book_tbl, cfg.order_time), height=30),
                               ui.row(net_positions(net_tbl, ctx), height=70)),
                 ),
@@ -667,26 +702,52 @@ class Console(Plugin):
     def __init__(self, cfg: ConsoleConfig | None = None):
         super().__init__()
         self.cfg = cfg or ConsoleConfig()
-        self.requires = ("master", self.cfg.book, self.cfg.bridge)
+        self.requires = ("master", "registry")       # the NATS service is looked up when a button is pressed
+        self.base: Ctx | None = None
+        self.opened: set[str] = set()
 
     def start(self) -> None:
         app, cfg, mk = self.app, self.cfg, self.app.market
         events, trades, acks = app.table(cfg.events), app.table(cfg.trades), app.table(cfg.acks)
         feed = app.table(mk.feed)
+        smap = q.strategy_map(app.table("portfolio_registry"), cfg.pf_per_user)       # PF -> strategy, live from the registry
+        trades, acks = q.tag(trades, "PF", smap), q.tag(acks, "PF", smap)             # every row now carries its Strategy
         symbol_of = app.master.symbol_of
         symbols = q.symbol_table(symbol_of)
         fills = q.fills_per_order(trades)
-        filters = app.shared.setdefault("console_filters", Filters())
+        registry = app["registry"].state
+        strategies = Strategies()
+        for _, _, _, _, algo, _, _ in registry.portfolios():
+            if safe_strategy(algo):
+                strategies.add(algo)
+        self._undo.append(registry.on_change(lambda user, pf, rec: safe_strategy(rec.get("algo")) and strategies.add(rec["algo"])))
 
-        ctx = Ctx(cfg=cfg, market=mk, book=app[cfg.book].state, bridge=app[cfg.bridge],
-                  symbol_of=lambda t: symbol_of.get(int(t), str(t)), filters=filters,
-                  net_all=q.net_positions(trades, feed, symbols, mk.price_div),
-                  tz_label="IST" if mk.code == "NSE" else mk.tz, logo_src=self._logo(), time=TimeTools(mk.tz),
-                  trades=trades, acks=acks, feed=feed, symbols=symbols, fills=fills,
-                  messages=q.messages(events, cfg.event_cols, mk.tz),
-                  book_all=q.order_book(acks, fills, symbols, mk.price_div, cfg.order_time, mk.tz))
-        app.publish("operator_console", build_dashboard(ctx))
-        self.log.info("published `operator_console`")
+        self.base = Ctx(cfg=cfg, market=mk, app=app, states=pf_states(app.shared), registry=registry, strategies=strategies, strategy=None,
+                        symbol_of=lambda t: symbol_of.get(int(t), str(t)), filters=app.shared.setdefault(("console_filters", None), Filters()),
+                        net_all=q.net_positions(trades, feed, symbols, mk.price_div),
+                        tz_label="IST" if mk.code == "NSE" else mk.tz, logo_src=self._logo(), time=TimeTools(mk.tz),
+                        trades=trades, acks=acks, feed=feed, symbols=symbols, fills=fills,
+                        messages=q.tag(q.messages(events, cfg.event_cols, mk.tz), "Pf", smap),
+                        book_all=q.order_book(acks, fills, symbols, mk.price_div, cfg.order_time, mk.tz))
+        app.publish("operator_console", build_dashboard(self.base))
+        self.opened = set()
+        for name in strategies.names():
+            self.open(name)
+        self.log.info("published `operator_console` and a window for each of: %s", ", ".join(strategies.names()) or "(no strategy yet)")
+
+    def open(self, strategy: str) -> bool:
+        """Publish `console_<strategy>`: this strategy's own summary, net positions, messages and order book. Does nothing if it is there
+        already. Called by `algo_start` for a new strategy, and by `console_open(name)`."""
+        if self.base is None or strategy in self.opened:
+            return False
+        if not safe_strategy(strategy):
+            self.log.warning("no window for strategy %r: its name may only hold letters, digits, _ . -", strategy)
+            return False
+        ctx = replace(self.base, strategy=strategy, filters=self.app.shared.setdefault(("console_filters", strategy), Filters()))
+        self.app.publish(f"console_{strategy}".replace("-", "_").replace(".", "_"), build_dashboard(ctx))
+        self.base.strategies.add(strategy)
+        self.opened.add(strategy)
+        return True
 
     def _logo(self) -> str | None:
         path = f"{self.app.paths.market_data}/{self.cfg.logo_file}"
