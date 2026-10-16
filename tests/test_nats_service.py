@@ -298,6 +298,7 @@ def test_a_failed_swap_is_an_event_and_a_ui_action_gets_its_reply_back(tmp_path)
     book = Portfolios(str(tmp_path / "m.json"), str(tmp_path / "s.json"), 1000)
     b = Bridge(BridgeConfig())
     b.bind(svc, book)
+    b.send_on()
     book.track([10])
     pf = book.create(10)
     svc._run(b.swap(pf, 10, 55, {}, None, None))
@@ -365,7 +366,8 @@ def test_the_bridge_picks_up_a_service_that_is_stopped_and_started_again(tmp_pat
     assert b.state == "service_down"
     first, w1 = make()
     app.plugins["nats"] = first
-    assert b.state == "on" and b.nats is first
+    assert b.state == "off" and b.nats is first                  # the service is up, but this algo has not switched itself on
+    assert b.send_on() and b.state == "on"
     app.plugins.pop("nats")
     first.on_stop()
     assert b.state == "service_down"
@@ -374,7 +376,8 @@ def test_the_bridge_picks_up_a_service_that_is_stopped_and_started_again(tmp_pat
     assert b.pause_pf(pf) is None                          # not sent, not raised
     second, w2 = make()
     app.plugins["nats"] = second
-    assert b.nats is second and b.pause_pf(pf).result(5).ok and len(w2.sent) == 1 and w1.sent == []
+    assert b.nats is second and b.pause_pf(pf) is None            # a restarted service starts every algo OFF again
+    assert b.send_on() and b.pause_pf(pf).result(5).ok and len(w2.sent) == 1 and w1.sent == []
     second.on_stop()
 
 
@@ -574,6 +577,8 @@ def test_the_bridge_sends_as_its_own_user_and_has_to_name_one_when_there_are_sev
     four, nameless = Bridge(BridgeConfig(user=4)), Bridge(BridgeConfig())
     four.bind(svc, book)
     nameless.bind(svc, book)
+    four.send_on()
+    nameless.send_on()
     svc._run(four.swap(p4, 10, 55, {}, None, None))
     assert wire.sent and {p["USERIDENTIFIER"] for _, _, p in wire.sent} == {4}
     sent_before = len(wire.sent)
@@ -661,3 +666,75 @@ def test_a_cap_of_zero_means_no_cap():
     res = [f.result(30) for f in [svc.squareup(pf) for pf in range(1, 41)]]          # 40 at once: a cap of 10 would have refused 30
     assert all(r.ok for r in res)
     svc.on_stop()
+
+
+# ---- started once for everyone; each algo and the UI switches its own sending on --------------------------------------------
+def test_a_client_starts_off_and_only_its_own_switch_and_the_master_switch_let_it_send():
+    svc, wire = make()                                       # master switch on
+    assert svc.pause(1, client="rsi_stocks").result(5).status == "off"          # the algo has not switched itself on
+    assert "has not switched sending on" in svc.pause(1, client="rsi_stocks").result(5).data["detail"]
+    assert svc.enable("rsi_stocks") is True
+    assert svc.pause(1, client="rsi_stocks").result(5).ok and len(wire.sent) == 1
+    assert svc.pause(1).result(5).ok                                              # a typed command (no client): master switch only
+    svc.send_off()                                                                # the master switch stops everyone
+    assert svc.pause(1, client="rsi_stocks").result(5).status == "off" and svc.pause(1).result(5).status == "off"
+    svc.send_on()
+    assert svc.pause(1, client="rsi_stocks").result(5).ok                         # and back
+    svc.on_stop()
+
+
+def test_one_algo_switching_off_never_stops_another():
+    svc, wire = make()
+    svc.enable("rsi_stocks")
+    svc.enable("rsi_nifty")
+    svc.disable("rsi_nifty")
+    assert svc.pause(1, client="rsi_nifty").result(5).status == "off"
+    assert svc.pause(2, client="rsi_stocks").result(5).ok                         # the other algo carries on
+    assert svc.is_enabled("rsi_stocks") and not svc.is_enabled("rsi_nifty")
+    svc.on_stop()
+
+
+def test_a_client_cannot_switch_on_without_a_connection_and_a_restart_switches_everyone_off():
+    dry = NatsService(NatsConfig(dry_run=True))
+    assert dry.enable("rsi_stocks") is False and not dry.is_enabled("rsi_stocks")
+    first, _ = make()
+    first.enable("rsi_stocks")
+    second, _ = make()                                                            # a restarted service: a new object
+    assert second.is_enabled("rsi_stocks") is False                               # everyone has to say "send" again
+    first.on_stop()
+    second.on_stop()
+
+
+def test_new_users_can_be_added_to_the_running_service_without_a_restart():
+    svc, wire = make(users=(3,))
+    assert svc.pause(1, user=4).result(5).status == "user_not_allowed"
+    svc.add_users(4, 5)
+    svc.add_users(4)                                                              # again: nothing doubled
+    assert svc.cfg.users == (3, 4, 5)
+    assert svc.pause(1, user=4).result(5).ok
+    svc.on_stop()
+
+
+def test_the_bridge_has_its_own_switch_and_the_stand_in_never_allows_sending(tmp_path):
+    from algo.comms.nats_service import NO_SERVICE
+    from algo.strategy.book import Portfolios
+    from algo.strategy.bridge import Bridge
+    from algo.strategy.config import BridgeConfig
+    svc, wire = make()
+    book = Portfolios(str(tmp_path / "m.json"), str(tmp_path / "s.json"), 1000)
+    stocks, nifty = Bridge(BridgeConfig(), name="bridge_stocks"), Bridge(BridgeConfig(), name="bridge_nifty")
+    stocks.bind(svc, book)
+    nifty.bind(svc, book)
+    book.track([1, 2])
+    p1, p2 = book.create(1), book.create(2)
+    assert stocks.state == "off" and stocks.pause_pf(p1) is None                  # an algo starts OFF
+    assert stocks.send_on() is True and stocks.state == "on" and nifty.state == "off"
+    assert stocks.pause_pf(p1).result(5).ok and nifty.pause_pf(p2) is None         # one is sending, the other is not
+    nifty.send_on()
+    stocks.send_off()
+    assert nifty.pause_pf(p2).result(5).ok and stocks.pause_pf(p1) is None         # one stopping does not stop the other
+    svc.send_off()
+    assert nifty.state == "off" and nifty.pause_pf(p2) is None                      # the master switch stops all
+    svc.on_stop()
+    assert NO_SERVICE.enable("x") is False and NO_SERVICE.allowed("x") is False and NO_SERVICE.allowed() is False
+    assert NO_SERVICE.pause(1, client="x").result(1).status == "service_down" and NO_SERVICE.go(asyncio.sleep(0), client="x") is None

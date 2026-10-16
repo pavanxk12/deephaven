@@ -11,6 +11,8 @@ from datetime import time as dtime
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
+FIRST_PF = 1001        # the first portfolio number anybody gets: the reference point of every numbering
+
 CONTRACT_COLUMNS: Mapping[str, str] = {
     "token": "Token", "symbol": "Symbol", "expiry": "ExpiryDate", "inst": "InstType",
     "opt": "OptionType", "strike": "StrikePrice", "lot": "LotSize", "tick": "TickSize", "divisor": "Divisor",

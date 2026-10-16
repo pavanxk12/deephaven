@@ -190,7 +190,7 @@ def test_the_book_plugin_needs_the_registry_when_it_has_a_user_and_takes_its_num
     a.state.track([1])
     b.state.track([2])
     assert a.state.create(1) != b.state.create(2)
-    assert {registry.owner_of(3, p) for p in (1111, 1112)} == {"book_a", "book_b"}
+    assert {registry.owner_of(3, p) for p in (1001, 1002)} == {"book_a", "book_b"}
 
 
 def test_a_bridge_sends_as_the_user_of_its_book(tmp_path):
@@ -202,6 +202,7 @@ def test_a_bridge_sends_as_the_user_of_its_book(tmp_path):
     pf = book.create(10)
     bridge = Bridge(BridgeConfig())                                          # no user of its own
     bridge.bind(svc, book)
+    bridge.send_on()
     assert bridge.user == 4
     assert bridge.pause_pf(pf).result(5).ok and wire.sent[0][2]["USERIDENTIFIER"] == 4
     svc.on_stop()
@@ -238,12 +239,12 @@ def test_console_functions_hand_out_claim_and_list_and_never_raise_when_the_regi
     assert capsys.readouterr().out.count("registry is not running") == 3
     app.plugins["registry"] = types.SimpleNamespace(state=Registry(str(tmp_path / "reg.json")))
     n = ns["pf_create"](3, "rsi_stocks")
-    assert n == 1111
-    assert ns["pf_register"](3, n, "console") is False and ns["pf_register"](3, 1001, "console") is True
+    assert n == 1001
+    assert ns["pf_register"](3, n, "console") is False and ns["pf_register"](3, 1555, "console") is True
     ns["pf_list"](3)
     out = capsys.readouterr().out
-    assert "created portfolio 1111 for rsi_stocks" in out and "TAKEN by rsi_stocks" in out
-    assert "portfolio 1001  -  algo -  book console" in out and "portfolio 1111  -  algo rsi_stocks  book rsi_stocks" in out
+    assert "created portfolio 1001 for rsi_stocks" in out and "TAKEN by rsi_stocks" in out
+    assert "portfolio 1555  -  algo -  book console" in out and "portfolio 1001  -  algo rsi_stocks  book rsi_stocks" in out
     ns["pf_list"](9)
     assert "no portfolios registered for user 9" in capsys.readouterr().out
     assert callable(api.registry_start) and "registry_start" in ns
@@ -322,21 +323,18 @@ def test_two_algos_sharing_one_book_are_told_apart(tmp_path, reg):
     plain.label(1, algo="x", name="y")
 
 
-def test_the_strategy_records_its_name_and_the_stock_when_it_creates_and_when_it_reuses_a_portfolio(master, tmp_path):
-    from tests.test_strategy import RELIANCE_FUT, build
-    registry = Registry(str(tmp_path / "reg.json"))
-    s, book, bridge = build(master, tmp_path)
-    book.registry, book.user, book.owner = registry, 3, "book_stocks"
-    s.on_signal(RELIANCE_FUT, "OVERBOUGHT")                                  # creates the portfolio
-    (row,) = registry.portfolios(3)
-    assert row[:5] == (3, 1111, "book_stocks", "RELIANCE", "rsi_stocks")
-    registry.register(3, 1111, "book_stocks", algo="someone_before")         # recorded as used by another algo
-    book.set_live(RELIANCE_FUT, None)
-    s.on_signal(RELIANCE_FUT, "OVERBOUGHT")                                  # the same option again: the portfolio is reused
-    assert len(bridge.swaps) == 2 and bridge.swaps[1]["pf"] == 1111
-    assert registry.get(3, 1111)["algo"] == "rsi_stocks"                     # and it is recorded as ours again
-    s.on_signal(RELIANCE_FUT, "OVERSOLD")                                    # the other leg: a new portfolio, labelled too
-    assert registry.get(3, 1112)["algo"] == "rsi_stocks" and registry.get(3, 1112)["name"] == "RELIANCE"
+def test_the_book_records_the_algo_and_name_when_it_creates_and_again_when_it_reuses_a_portfolio(tmp_path, reg):
+    book = _book(tmp_path, "book_stocks", reg, 3)
+    book.track([10])
+    pf, old, created = book.assign(10, 55, name="RELIANCE", algo="rsi_stocks")                  # creates the portfolio
+    (row,) = reg.portfolios(3)
+    assert (pf, old, created) == (1111, None, True) and row[:5] == (3, 1111, "book_stocks", "RELIANCE", "rsi_stocks")
+    book.subscribe(pf, 55)
+    reg.register(3, pf, "book_stocks", algo="someone_before")                                   # recorded as used by another algo
+    assert book.assign(10, 55, name="RELIANCE", algo="rsi_stocks")[:2] == (pf, None)            # the same option again: the portfolio is reused
+    assert reg.get(3, pf)["algo"] == "rsi_stocks"                                               # and it is recorded as ours again
+    pf2, old2, _ = book.assign(10, 56, name="RELIANCE", algo="rsi_stocks")                      # the other option: a new portfolio, labelled too
+    assert (pf2, old2) == (1112, 1111) and reg.get(3, 1112)["algo"] == "rsi_stocks" and reg.get(3, 1112)["name"] == "RELIANCE"
 
 
 # ---- lean: the file is appended to, never rewritten --------------------------------------------------------------------
@@ -500,8 +498,12 @@ def test_the_algo_asks_the_book_and_never_creates_or_numbers_a_portfolio_itself(
     import inspect
     from pathlib import Path
     assert "pf" not in inspect.signature(Portfolios.assign).parameters         # there is no number for the algo to pass
-    source = (Path(__file__).resolve().parents[1] / "algo" / "strategy" / "rsi_options.py").read_text(encoding="utf-8")
-    assert "book.assign(" in source and "book.create(" not in source
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "algo" / "automation.py").read_text(encoding="utf-8")                     # what the scripts' pf_assign goes through
+    assert "state.assign(" in source and "state.create(" not in source and "registry.allocate(" not in source
+    for name in ("03_algo_template.py", "04_nifty_multistrike.py"):                            # and the scripts never number anything themselves
+        text = (root / "examples" / name).read_text(encoding="utf-8")
+        assert "pf_assign(" in text and "pf_create(" not in text and ".create(" not in text
 
 
 def test_two_users_books_assign_independently(tmp_path, reg):
@@ -515,12 +517,12 @@ def test_two_users_books_assign_independently(tmp_path, reg):
 # ---- create(user, strategy, name) -> the number: that is all an algo says ---------------------------------------------------
 def test_create_returns_the_number_and_remembers_who_asked_and_what_it_is_for(reg):
     pf = reg.create(3, "rsi_stocks", "RELIANCE")
-    assert pf == 1111
+    assert pf == 1001
     rec = reg.get(3, pf)
     assert (rec["owner"], rec["algo"], rec["name"]) == ("rsi_stocks", "rsi_stocks", "RELIANCE")
-    assert reg.create(3, "rsi_stocks", "TCS") == 1112 and reg.create(3, "rsi_nifty", "NIFTY", start=1555) == 1555
-    assert reg.create(4, "rsi_stocks", "RELIANCE") == 1111                                  # another user: its own numbers
-    assert reg.create(3, "console", "X") == 1113                                            # a screen asking too: never a duplicate
+    assert reg.create(3, "rsi_stocks", "TCS") == 1002 and reg.create(3, "rsi_nifty", "NIFTY", start=1555) == 1555
+    assert reg.create(4, "rsi_stocks", "RELIANCE") == 1001                                  # another user: its own numbers
+    assert reg.create(3, "console", "X") == 1003                                            # a screen asking too: never a duplicate
 
 
 def test_create_never_hands_out_the_same_number_to_two_strategies_asking_together(reg):
@@ -543,8 +545,8 @@ def test_create_through_the_plugin_is_what_an_algo_calls(tmp_path, fake_dh, monk
     monkeypatch.setattr(FakeTable, "last_by", lambda self, by: self, raising=False)
     app = App({}, NSE, Paths(market_data=str(tmp_path), work=str(tmp_path)))
     plugin = app.run(PortfolioRegistry(file=str(tmp_path / "reg.json")))
-    assert app["registry"].create(3, "rsi_stocks", "RELIANCE") == 1111
-    assert app.shared[("registry_rows", str(tmp_path / "reg.json"))].rows[-1][:5] == (3, 1111, "RELIANCE", "rsi_stocks", "rsi_stocks")
+    assert app["registry"].create(3, "rsi_stocks", "RELIANCE") == 1001
+    assert app.shared[("registry_rows", str(tmp_path / "reg.json"))].rows[-1][:5] == (3, 1001, "RELIANCE", "rsi_stocks", "rsi_stocks")
     app.stop("registry")
     with pytest.raises(RuntimeError, match="not running"):
         PortfolioRegistry(file="x").create(3, "a", "b")

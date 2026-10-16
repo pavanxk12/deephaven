@@ -1,6 +1,6 @@
 """Plugin base class: lifecycle plus the helpers every component needs.
 
-A plugin is one independent component (master, candles, indicators, a strategy...).
+A plugin is one independent component (master, candles, straddle, the NATS service, the book...).
 It declares what it `requires`, builds its output in `start()`, and everything it created
 (listeners, threads) is torn down automatically when it is stopped or replaced.
 """

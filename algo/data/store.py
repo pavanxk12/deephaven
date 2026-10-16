@@ -1,4 +1,4 @@
-"""End of day: save whole tables (candles, straddle series, indicators) to Parquet files, and load them back.
+"""End of day: save whole tables (candles, straddle series) to Parquet files, and load them back.
 
     eod_save()                        # candles_<day>.parquet, straddle_<day>.parquet (+ a small .meta.json each)
     eod_save(folder="/data/eod")      # somewhere else, e.g. a folder mounted from the host
@@ -22,8 +22,8 @@ from algo.core.plugin import Plugin
 _log = logmod.get("eod")
 
 # table in the session -> file prefix, and which running plugin built it (for the .meta.json)
-PREFIX = {"candles": "candles_", "straddle_series": "straddle_", "indicator_values": "indicators_"}
-PLUGIN = {"candles": "candles", "straddle_series": "straddle", "indicator_values": "indicators"}
+PREFIX = {"candles": "candles_", "straddle_series": "straddle_"}
+PLUGIN = {"candles": "candles", "straddle_series": "straddle"}
 DEFAULT_TABLES = ("candles", "straddle_series")
 
 

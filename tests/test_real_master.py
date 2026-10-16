@@ -58,7 +58,7 @@ def test_every_tick_is_usable_by_the_bridge(loaded):
     assert ticks and min(ticks) > 0
     assert not m.futs["tick"].isna().any() and not m.opt["tick"].isna().any()
     if mk is NSE:
-        assert min(ticks) >= 0.01                   # the US file lists option ticks of 0.0001: sizing refuses those (see sizing.py)
+        assert min(ticks) >= 0.01                   # the US file lists option ticks of 0.0001: a script's order sizing would refuse those
 
 
 def test_no_expiry_is_missing_or_in_the_past_of_the_file_date(loaded):

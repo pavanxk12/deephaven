@@ -3,7 +3,7 @@
 This reads the import statements of every module (nothing is run) and fails if a package imports one it must not know about:
 
     core      knows nothing of the others
-    data      master, candles, indicators, EOD       may use core only
+    data      master, candles, EOD                   may use core only
     series    the straddle                           may use core and data (it is built from candles)
     comms     the NATS service                       may use core only
     strategy  registry, book, bridge, algos          the registry may use core only; the rest may use core, comms, data

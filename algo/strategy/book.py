@@ -13,16 +13,26 @@ import os
 import threading
 from typing import Callable
 
+from algo.core.config import FIRST_PF
 from algo.core.files import replace_with_retry
 from algo.core.plugin import Plugin
 
 
 def _read_ints(path: str) -> dict[int, int]:
+    """A portfolio file (whole numbers to whole numbers). No file, or an empty one, is a fresh start. A file in another format is an error,
+    never an empty book: the book would carry on from nothing and then overwrite the file, losing what was in it."""
     try:
         with open(path) as f:
-            return {int(k): int(v) for k, v in json.load(f).items()}
-    except (FileNotFoundError, ValueError):
+            text = f.read()
+    except FileNotFoundError:
         return {}
+    if not text.strip():
+        return {}
+    try:
+        return {int(k): int(v) for k, v in json.loads(text).items()}
+    except (ValueError, TypeError, AttributeError) as e:
+        raise RuntimeError(f"{path} cannot be read as a portfolio file ({e!r}), so it was not loaded and will not be overwritten. "
+                           f"If it is in another format (for example token:slot keys), point the book at a different file") from None
 
 
 def _write_json(path: str, obj: dict) -> None:
@@ -35,7 +45,7 @@ def _write_json(path: str, obj: dict) -> None:
 
 
 class Portfolios:
-    def __init__(self, map_file: str, sub_file: str, pf_start: int = 1111, registry=None, user: int | None = None,
+    def __init__(self, map_file: str, sub_file: str, pf_start: int = FIRST_PF, registry=None, user: int | None = None,
                  owner: str = ""):
         self.map_file, self.sub_file, self.pf_start = map_file, sub_file, pf_start
         self.registry, self.user, self.owner = registry, user, owner      # set: numbers come from the registry, as `user`
@@ -237,7 +247,7 @@ class Book(Plugin):
     """Holds the `Portfolios` state. Its memory survives a restart of this plugin (kept in `app.shared`)."""
     name = "book"
 
-    def __init__(self, map_file: str | None = None, sub_file: str | None = None, pf_start: int = 1111,
+    def __init__(self, map_file: str | None = None, sub_file: str | None = None, pf_start: int = FIRST_PF,
                  name: str = "book", user: int | None = None, registry: str = "registry"):
         super().__init__(name)
         self.map_file, self.sub_file, self.pf_start = map_file, sub_file, pf_start

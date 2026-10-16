@@ -74,7 +74,7 @@ class MasterData:
         """Sorted token array of the chosen underlyings and kind ("FUT", "OPT", "EQ"); None = no restriction.
         `expiries=n` keeps, for every underlying, only the options of its n nearest expiries (futures and equities are not
         affected); options are about 99% of the instruments, so this is the biggest single saving.
-        Used to keep candles and indicators to the instruments that are actually needed."""
+        Used to keep candles to the instruments that are actually needed."""
         if expiries is not None and (isinstance(expiries, bool) or not isinstance(expiries, int) or expiries < 1):
             raise ValueError("expiries must be a whole number, 1 or more (1 = only each underlying's nearest expiry)")
         if symbols is None and kind is None and expiries is None:

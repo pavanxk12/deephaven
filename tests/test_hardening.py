@@ -9,9 +9,6 @@ from algo.data.candles import CandleAggregator, Candles, LttParser
 from algo.series.straddle import StraddleConfig, StraddleEngine
 from algo.strategy.book import Portfolios
 from algo.comms.nats_service import NatsConfig, NatsService
-from algo.strategy.config import RsiOptionsConfig
-from algo.strategy.picker import OptionPicker
-from algo.strategy.sizing import on_tick, option_params
 from tests.test_bridge import make
 from zoneinfo import ZoneInfo
 
@@ -98,44 +95,6 @@ def test_a_failing_row_is_counted_not_raised():
     c, agg, rows = candles_plugin()
     c._parse = lambda s: (_ for _ in ()).throw(RuntimeError("boom"))
     assert c._tick(agg, 1, 100, 5, GOOD) is None and c.skipped == 1
-
-
-# ---- division by zero and truncation in the order sizing ------------------------------------------
-@pytest.mark.parametrize("premium,tick", [(100, 0), (100, float("nan")), (100, -0.05), (100, 0.001), (0, 0.05),
-                                          (-5, 0.05), (float("nan"), 0.05), (None, 0.05), (float("inf"), 0.05)])
-def test_unusable_premium_or_tick_gives_no_order(premium, tick):
-    params, why = option_params(premium, tick, RsiOptionsConfig.stocks())
-    assert params is None and why
-
-
-def test_on_tick_never_divides_by_zero():
-    assert on_tick(1.0, 0.0) is False and on_tick(1.0, 0.004) is False and on_tick(1.05, 0.05) is True
-
-
-def test_sizing_values_sit_on_the_tick_after_the_bridges_truncation():
-    cfg = RsiOptionsConfig.stocks()
-    for premium in (0.35, 7.45, 99.95, 1234.56, 24999.9):
-        p, why = option_params(premium, 0.05, cfg)
-        assert p is not None, why
-        for k in ("ival", "jval", "sval", "trp", "lowerrange", "upperrange"):
-            assert int(p[k] * 100) % 5 == 0
-
-
-# ---- picker: a NaN price must not silently pick strike 0 ---------------------------------------------
-@pytest.mark.parametrize("price", [float("nan"), 0, -1, None, float("inf")])
-def test_picker_refuses_an_unusable_future_price(master, price):
-    import pandas as pd
-    p = OptionPicker(master, RsiOptionsConfig.stocks(), lambda t: None)
-    tok, why = p.pick("NIFTY", pd.Timestamp("2030-01-30"), price, "CALL", pd.Timestamp("2030-01-01"))
-    assert tok is None and "usable" in why
-
-
-def test_synthetic_ignores_a_nonsense_option_price(master):
-    import pandas as pd
-    ce, pe = 102, 103
-    p = OptionPicker(master, RsiOptionsConfig.nifty(), {ce: float("nan"), pe: 100.0}.get)
-    tok, why = p.pick("NIFTY", pd.Timestamp("2030-01-30"), 25000.0, "CALL", pd.Timestamp("2030-01-01"))
-    assert tok is not None and "no CE/PE price" in why                 # fell back to the future close
 
 
 # ---- straddle ------------------------------------------------------------------------------------------

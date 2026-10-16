@@ -42,6 +42,7 @@ def make(tmp_path, fail_on=None, **cfg):
     svc.connect()
     b = Bridge(BridgeConfig())
     b.bind(svc, book)
+    b.send_on()                                           # an algo starts OFF; this one switches itself on
     return b, book, fake
 
 

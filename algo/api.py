@@ -4,14 +4,14 @@
 
     master_build()                       contract master for today
     candles_start()                      1-minute candles start forming
-    indicators(EMA(9), RSI(5))           start computing these; calling it again ADDS to what is already computed
     straddle_start(0)                    straddle series for the nearest option expiry (1 = two nearest, 2 = three, ...)
 
-`EMA`, `RSI`, ... (everything in `algo.data.indicators.LIBRARY`) are plain functions that make an indicator;
-only `indicators(...)` starts the computation.
+Indicators are not a service: an automation computes the ones it needs from the candles it reads (see examples/03_algo_template.py).
+`algo_help()` lists every function by service.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from dataclasses import replace
@@ -19,15 +19,18 @@ from datetime import datetime, timedelta
 
 from algo.comms.nats_service import NatsConfig, NatsService
 from algo.core.app import App, MissingDependency, connect, current
-from algo.core.config import Paths, market_for
+from algo.core.config import FIRST_PF, Paths, market_for
 from algo.data.candles import Candles
-from algo.data.indicators import LIBRARY, Indicators
+from algo.lookup import (contract, contracts, expiries, last_candles, last_price, nearest_strikes,
+                         strikes)
 from algo.data.master import Master
 from algo.data.store import DEFAULT_TABLES, PREFIX, Eod, make_store, normalise_day, save_tables
+from algo.automation import (algo_exit, algo_pause, algo_portfolios, algo_sending, algo_start, algo_stop, algo_unpause,
+                             algo_unsubscribe, pf_activate, pf_assign, pf_cooling, pf_leg, pf_mark, pf_track, watch)
 from algo.series.straddle import Straddle, StraddleConfig
 from algo.strategy.registry import PortfolioRegistry
 
-HINTS = {"master": "master_build()", "candles": "candles_start()", "indicators": "indicators(EMA(9), RSI(14))",
+HINTS = {"master": "master_build()", "candles": "candles_start()",
          "nats": "nats_start()", "registry": "registry_start()"}
 
 
@@ -73,41 +76,14 @@ def candles_start(timeframe: str = "1min", multiplier: float | None = None, *, s
     equities are untouched. Options are about 99% of all instruments, so this is the biggest single saving
     (NSE, all underlyings: everything is ~1.8 GB of 1-minute candles a day, expiries=1 about 0.7 GB, futures alone 14 MB).
     The straddle needs options of its n+1 nearest expiries, so keep `expiries` at n+1 or more if you use straddle_start(n).
-    Calling it again restarts the builder (the candles table starts empty); indicators, the straddle and the strategy
-    follow the new table by themselves. `build_from`: epoch second of the first bar; default = the next full bar."""
+    Calling it again restarts the builder (the candles table starts empty); the straddle follows the new table by itself, and a script
+    that listens with watch("candles", fn) follows it too (a plain listener would be left on the old, silent table). `build_from`: epoch second of the first bar; default = the next full bar."""
     _run(Candles(timeframe, multiplier=multiplier, symbols=symbols, kind=kind, expiries=expiries, build_from=build_from))
 
 
 def candles_stop() -> None:
+    """Stop building candles."""
     _app().stop("candles")
-
-
-def indicators(*specs, timeframe: str | None = None, symbols=None, kind: str | None = None) -> None:
-    """Start computing indicators, e.g. indicators(EMA(9), RSI(5)). Calling it again adds to what is already running:
-        indicators(EMA(9), RSI(5))   then   indicators(EMA(6))   ->   EMA_9, RSI_5 and EMA_6 are all computed.
-    The result is the table `indicator_values`.
-    Bar size: each indicator can have its own, EMA(9, "5min") -> column EMA_9_5min, on 5-minute bars rolled up from the
-    candles (a whole multiple of the candle size). `timeframe="5min"` here is the default for the ones that name none.
-    Instruments: `symbols=["NIFTY"]` and/or `kind="FUT"` compute only for those (everything in `candles` by default);
-    each extra instrument costs memory for every indicator column, so narrow this to what you use.
-    With no arguments it lists what is computed."""
-    app = _app()
-    plugin = app.get("indicators")
-    if plugin is None:
-        _run(Indicators(specs, timeframe, symbols=symbols, kind=kind))
-    elif not specs and timeframe is None and symbols is None and kind is None:
-        print("computing:", ", ".join(plugin.columns()) or "(none)", f"[{plugin.describe().split(':')[0]}]")
-    else:
-        plugin.add(*specs, timeframe=timeframe, symbols=symbols, kind=kind)
-
-
-def indicators_remove(*columns: str) -> None:
-    """Stop computing columns, e.g. indicators_remove("EMA_6")."""
-    plugin = _app().get("indicators")
-    if plugin is None:
-        print("indicators are not running")
-    else:
-        plugin.remove(*columns)
 
 
 def straddle_start(n: int = 0, symbols=None, **config) -> None:
@@ -126,12 +102,13 @@ def straddle_start(n: int = 0, symbols=None, **config) -> None:
 
 
 def straddle_stop() -> None:
+    """Stop the straddle series."""
     _app().stop("straddle")
 
 
 def eod_save(day: str | None = None, folder: str | None = None, tables=None, snapshot: bool = True) -> None:
     """Save the whole candles and straddle tables to Parquet files: candles_<day>.parquet, straddle_<day>.parquet (each with
-    a Date column and a small .meta.json beside it). `tables=["candles", "straddle_series", "indicator_values"]` chooses.
+    a Date column and a small .meta.json beside it). `tables=["candles", "straddle_series"]` chooses.
     `folder` is where the files go; by default Paths.saved (set Paths(eod_dir=...) in algo.install to point it at a folder
     mounted from the host). `day` defaults to today in the exchange timezone ("2026-10-15" or "20261015").
     snapshot=True takes a frozen copy first (briefly needs the memory of one copy); False writes the live table."""
@@ -141,7 +118,7 @@ def eod_save(day: str | None = None, folder: str | None = None, tables=None, sna
 
 
 def eod_load(day: str | None = None, folder: str | None = None, tables=None) -> None:
-    """Load saved files back as tables. eod_load("2026-10-15") -> candles_20261015, straddle_20261015 (and indicators_...);
+    """Load saved files back as tables. eod_load("2026-10-15") -> candles_20261015, straddle_20261015;
     eod_load() merges every saved day -> candles_hist, straddle_hist."""
     app = _app()
     store = make_store(app, folder)
@@ -192,22 +169,8 @@ def _users(users) -> tuple:
     return tuple(out)
 
 
-def nats_start(ip: str | None = None, port: int | None = None, users=None, *, send: bool = False,
-               dry_run: bool | None = None, **config) -> None:
-    """Connect the one NATS service that everything sends portfolio commands through (strategies, the console, you).
-
-        nats_start("192.168.1.130", 4222, users=[3, 4])  the server's address and port, and the users that may send
-        nats_start()                                     again: reconnect with the SAME ip, port and settings as before
-        nats_start(port=4223)                            again, changing only the port
-        nats_start(dry_run=True)                         no connection, commands are only logged
-
-    One service carries any number of users and portfolios. Every command says which user it is for (pf_pause(1913, user=4));
-    with a single user it may be left out. A command for a user not listed here is refused (user_not_allowed).
-    The ip, port, users and other settings are remembered while the service runs (nats_start() with nothing reuses them);
-    nats_stop() forgets them. Naming users here UNBLOCKS them and every portfolio under them (you are allowing them again);
-    nats_start() with no users keeps every block. Sending always starts OFF; nats_send(True) turns it on (or nats_start(send=True)).
-    Other settings: timeout_s, max_in_flight, lane_depth, sender (see NatsConfig)."""
-    previous = _app().get("nats")
+def _nats_wanted(previous, ip, port, users, send, dry_run, config):
+    """The settings asked for: the running service's (or the defaults) with what was named changed. Returns (config, what was named)."""
     base = previous.cfg if previous is not None else NatsConfig()
     given = {k: v for k, v in (("ip", ip), ("port", port), ("dry_run", dry_run)) if v is not None}
     given.update(config)
@@ -224,13 +187,58 @@ def nats_start(ip: str | None = None, port: int | None = None, users=None, *, se
             raise ValueError(f"port must be a number like 4222, got {port!r}") from None
         if not 0 < given["port"] < 65536:
             raise ValueError(f"port must be between 1 and 65535, got {port!r}")
-    cfg = replace(base, send_on=send, **given)
-    print(f"NATS {cfg.ip}:{cfg.port}, users {', '.join(map(str, cfg.users))}"
-          + (" (same as the running connection)" if previous is not None and not given else ""))
+    return replace(base, send_on=send, **given), given
+
+
+def _nats_line(cfg) -> str:
+    return f"NATS {cfg.ip}:{cfg.port}, users {', '.join(map(str, cfg.users))}"
+
+
+def nats_start(ip: str | None = None, port: int | None = None, users=None, *, send: bool = True,
+               dry_run: bool | None = None, **config) -> None:
+    """Start the ONE NATS service that every algo and the UI send portfolio commands through. Start it once, for everyone:
+
+        nats_start("192.168.1.130", 4222, users=[3, 4])  the server's address and port, and ALL the users that may send
+
+    Safe to call again: if the service is already running with these settings (or none are given) nothing happens, so every
+    algo script may call it; it does NOT restart the service. Different settings raise an error that points to nats_restart(),
+    because restarting cuts off every algo. An algo should call nats_connect() instead.
+    Every command says which user it is for (pf_pause(1913, user=4)); with a single user it may be left out; a command for a user
+    not listed is refused (user_not_allowed). nats_start(dry_run=True) opens no connection and only logs.
+    The master switch starts ON, but each algo and the UI starts OFF and must switch itself on (bridge.send_on()).
+    Other settings: timeout_s, max_in_flight, lane_depth, sender (see NatsConfig)."""
+    previous = _app().get("nats")
+    cfg, given = _nats_wanted(previous, ip, port, users, send, dry_run, config)
+    if previous is not None:
+        running = previous.cfg
+        extra = set(cfg.users) - set(running.users)
+        same = replace(cfg, send_on=running.send_on, users=running.users) == running
+        if not given or (same and not extra):
+            print(f"{_nats_line(running)} is already running; nothing changed. An algo only needs nats_connect().")
+            return
+        if same and extra:
+            raise RuntimeError(f"the NATS service is running for users {list(running.users)}, not {sorted(extra)}. Add them without a "
+                               f"restart: nats_add_user({sorted(extra)[0]}).")
+        raise RuntimeError(f"the NATS service is already running ({_nats_line(running)}) and these settings differ. Starting it again "
+                           f"would cut off every algo; to change it on purpose call nats_restart(...).")
+    print(_nats_line(cfg))
+    _run(NatsService(cfg, lift_blocks=given.get("users", ()) if users is not None else ()))
+
+
+def nats_restart(ip: str | None = None, port: int | None = None, users=None, *, send: bool = True,
+                 dry_run: bool | None = None, **config) -> None:
+    """Stop the NATS service and start it again, on purpose: nats_restart(port=4223). The ip, port, users and other settings are
+    those of the running service unless you name them. It cuts off every algo for a moment, and every algo and the UI starts OFF
+    again and must switch itself on. Naming users here UNBLOCKS them and every portfolio under them (you are allowing them
+    again); a restart with no users keeps every block."""
+    previous = _app().get("nats")
+    cfg, given = _nats_wanted(previous, ip, port, users, send, dry_run, config)
+    print(_nats_line(cfg) + (" (restarting)" if previous is not None else ""))
     _run(NatsService(cfg, lift_blocks=given.get("users", ()) if users is not None else ()))
 
 
 def nats_stop() -> None:
+    """Stop the NATS service (every algo is cut off; the ip, port and users are forgotten)."""
     _app().stop("nats")
 
 
@@ -239,19 +247,56 @@ def _nats() -> "NatsService | None":
 
 
 def _service_down(what: str) -> None:
-    print(f"{what}: NOT sent - the NATS service is not running. Call nats_start() first.")
+    print(f"{what}: NOT sent - the NATS service is not running. Start it once with nats_start(ip, port, users=[...]).")
 
 
-def nats_send(on: bool = True) -> None:
-    """Turn sending on or off for everyone. Off: strategies still compute, nothing leaves the process."""
+def nats_connect(user: int | None = None, client: str | None = None) -> bool:
+    """What an algo or the UI calls instead of nats_start: it only CHECKS that the shared service is running (and that your user may
+    send), changes nothing, and says so. Returns True when you can go on.  nats_connect(user=4, client="bridge_nifty")"""
+    svc = _nats()
+    if svc is None:
+        print("The NATS service is not running. Start it once with nats_start(ip, port, users=[...]); do not start it from an algo.")
+        return False
+    if user is not None:
+        (uid,) = _users(user)
+        if uid not in svc.cfg.users:
+            print(f"user {uid} may not send on the running NATS service (users {list(svc.cfg.users)}). "
+                  f"Add it without a restart: nats_add_user({uid}).")
+            return False
+    line = f"connected to the NATS service: {svc.cfg.ip}:{svc.cfg.port}, users {list(svc.cfg.users)}, state {svc.state}"
+    if client is not None:
+        line += f"; {client} sending {'ON' if svc.is_enabled(client) else 'OFF (switch it on: nats_send(True, client=...))'}"
+    print(line)
+    return True
+
+
+def nats_add_user(user) -> None:
+    """Let one more user (or a list) send on the running service, without restarting it."""
+    svc = _nats()
+    if svc is None:
+        return _service_down("nats_add_user")
+    svc.add_users(*_users(user))
+    print(f"users now {list(svc.cfg.users)}")
+
+
+def nats_send(on: bool = True, client: str | None = None) -> None:
+    """The switches. Every algo and the UI has its own, and they all start OFF; the service also has a master switch for everyone.
+
+        nats_send(True, client="bridge_nifty")    this algo may send (nats_send(False, client=...) stops only this algo)
+        nats_send(False)                          the master switch: nothing is sent for anyone;  nats_send(True) lets them again
+
+    A command goes out only when the master switch and its own algo's switch are both on."""
     svc = _nats()
     if svc is None:
         return _service_down("nats_send")
-    bridge = _app().get("bridge")
-    if bridge is not None:                                # the strategy bridge also re-checks tokens already in a signal zone
-        (bridge.send_on if on else bridge.send_off)()
-    else:
+    if client is None:
         (svc.send_on if on else svc.send_off)()
+        return
+    plugin = _app().get(client)
+    if plugin is not None and hasattr(plugin, "send_on"):         # a Bridge: its strategies re-check tokens already in a signal zone
+        (plugin.send_on if on else plugin.send_off)()
+    else:
+        (svc.enable if on else svc.disable)(client)
 
 
 def _answer(call, what: str, paused: "tuple[int, bool] | None" = None) -> None:
@@ -282,18 +327,22 @@ def pf_subscribe(pf: int, option: int, user: int | None = None, **params) -> Non
 
 
 def pf_pause(pf: int, user: int | None = None) -> None:
+    """Pause one portfolio: pf_pause(1913, user=4)."""
     _answer(lambda s: s.pause(pf, user=user), f"PF {pf} pause", (pf, True))
 
 
 def pf_unpause(pf: int, user: int | None = None) -> None:
+    """Unpause one portfolio: pf_unpause(1913, user=4)."""
     _answer(lambda s: s.unpause(pf, user=user), f"PF {pf} unpause", (pf, False))
 
 
 def pf_squareup(pf: int, user: int | None = None) -> None:
+    """Square up one portfolio: pf_squareup(1913, user=4)."""
     _answer(lambda s: s.squareup(pf, user=user), f"PF {pf} squareup")
 
 
 def pf_unsubscribe(pf: int, option: int, user: int | None = None, **params) -> None:
+    """Unsubscribe a portfolio from its option: pf_unsubscribe(1913, 47162, user=4)."""
     _answer(lambda s: s.unsubscribe(pf, option, params or None, user=user), f"PF {pf} unsubscribe {option}")
 
 
@@ -333,13 +382,32 @@ def nats_unblock(user=None, pf=None) -> None:
 
 
 def registry_start(file: str | None = None) -> None:
-    """Start the portfolio registry: the one place that hands out portfolio numbers, so a user never has two portfolios with the
+    """Start the portfolio registry ONCE: the one place that hands out portfolio numbers, so a user never has two portfolios with the
     same number, whichever strategy or screen creates them. It keeps its numbers in a file, so a restart remembers them, and
-    shows them as the table `portfolio_registry`. A Book(user=...) needs it running."""
+    shows them as the table `portfolio_registry`. A Book(user=...) needs it running.
+    Safe to call again: if it is already running (with this file, or none named) nothing happens. An algo should call
+    registry_connect() instead."""
+    plugin = _app().get("registry")
+    if plugin is not None:
+        if file is None or file == plugin.file:
+            print(f"The portfolio registry is already running; nothing changed. {plugin.describe()}. An algo only needs registry_connect().")
+            return
+        raise RuntimeError("the portfolio registry is already running with another file; registry_stop() first if you mean to change it")
     _run(PortfolioRegistry(file=file))
 
 
+def registry_connect() -> bool:
+    """What an algo calls instead of registry_start: checks that the registry is running and changes nothing."""
+    plugin = _app().get("registry")
+    if plugin is None:
+        print("The portfolio registry is not running. Start it once with registry_start(); do not start it from an algo.")
+        return False
+    print(f"connected to the portfolio registry: {plugin.describe()}")
+    return True
+
+
 def registry_stop() -> None:
+    """Stop the portfolio registry (its numbers stay in the file)."""
     _app().stop("registry")
 
 
@@ -351,8 +419,8 @@ def _registry():
     return plugin.state
 
 
-def pf_create(user: int, strategy: str, name: str = "", start: int = 1111) -> int | None:
-    """Create a portfolio and get its number: pf_create(3, "rsi_stocks", "RELIANCE") -> 1111.
+def pf_create(user: int, strategy: str, name: str = "", start: int = FIRST_PF) -> int | None:
+    """Create a portfolio and get its number: pf_create(3, "rsi_stocks", "RELIANCE") -> 1001.
     The number is the next free one for that user, reserved at once. `strategy` is who asks (an algo, or "console"), `name` what it
     trades; `start` is where this strategy's numbers begin. Returns None if the registry is not running."""
     reg = _registry()
@@ -391,18 +459,48 @@ def algo_status() -> None:
     _app().status()
 
 
-FUNCTIONS = (master_build, candles_start, candles_stop, indicators, indicators_remove,
-             straddle_start, straddle_stop, eod_save, eod_load, eod_auto, nats_start, nats_stop, nats_send,
+# The functions by service, for algo_help(). Every function in FUNCTIONS must be in exactly one group (a test checks it).
+GROUPS = {
+    "MASTER (contracts)": ("master_build", "contract", "contracts", "expiries", "strikes", "nearest_strikes"),
+    "CANDLES": ("candles_start", "candles_stop", "last_price", "last_candles"),
+    "STRADDLE and END OF DAY": ("straddle_start", "straddle_stop", "eod_save", "eod_load", "eod_auto"),
+    "PORTFOLIOS (the book)": ("registry_start", "registry_connect", "registry_stop", "pf_create", "pf_register", "pf_list"),
+    "NATS (commands)": ("nats_start", "nats_connect", "nats_add_user", "nats_restart", "nats_stop", "nats_send", "pf_subscribe", "pf_pause",
+                        "pf_unpause", "pf_squareup", "pf_unsubscribe", "pf_apply", "nats_block", "nats_unblock"),
+    "AUTOMATIONS (a script you write)": ("algo_start", "algo_stop", "pf_track", "pf_assign", "pf_activate", "pf_leg", "pf_mark", "pf_cooling",
+                                         "algo_sending", "watch", "algo_portfolios", "algo_pause", "algo_unpause", "algo_exit", "algo_unsubscribe"),
+    "WHAT IS RUNNING": ("algo_status", "algo_help"),
+}
+
+
+def algo_help(name: str | None = None) -> None:
+    """Every function by service, one line each: algo_help().  algo_help("pf_create") shows the whole description of one."""
+    by_name = {f.__name__: f for f in FUNCTIONS}
+    if name is not None:
+        fn = by_name.get(name)
+        print(f"{name}: unknown function" if fn is None else f"{name}{inspect.signature(fn)}\n{inspect.getdoc(fn) or ''}")
+        return
+    for group, names in GROUPS.items():
+        print(f"\n{group}")
+        for n in names:
+            doc = (inspect.getdoc(by_name[n]) or "").splitlines()
+            print(f"  {n + '()':<20} {doc[0][:95] if doc else ''}")
+    print("\nalgo_help('name') shows the full description of one function.")
+
+
+FUNCTIONS = (master_build, contract, contracts, expiries, strikes, nearest_strikes, last_price, last_candles,
+             candles_start, candles_stop,
+             straddle_start, straddle_stop, eod_save, eod_load, eod_auto, nats_start, nats_restart, nats_connect, nats_add_user, nats_stop, nats_send,
              pf_subscribe, pf_pause, pf_unpause, pf_squareup, pf_unsubscribe, pf_apply, nats_block, nats_unblock,
-             registry_start, registry_stop, pf_create, pf_register, pf_list, algo_status)
+             registry_start, registry_connect, registry_stop, pf_create, pf_register, pf_list, algo_start, algo_stop, pf_track,
+             pf_assign, pf_activate, pf_leg, pf_mark, pf_cooling, algo_sending, watch, algo_portfolios, algo_pause, algo_unpause, algo_exit,
+             algo_unsubscribe, algo_status, algo_help)
 
 
 def install(ns: dict, market: str = "NSE", paths: Paths | None = None, level: int = logging.INFO) -> App:
-    """Connect to the session and put the functions above (and EMA, RSI, ...) into `ns`."""
+    """Connect to the session and put the functions above into `ns`."""
     app = connect(ns, market, paths, level)
     for fn in FUNCTIONS:
         ns[fn.__name__] = fn
-    ns.update(LIBRARY)
-    print("algo ready - call:", ", ".join(f"{f.__name__}()" for f in FUNCTIONS))
-    print("indicator functions:", ", ".join(LIBRARY))
+    print("algo ready. algo_help() lists every function by service (master, candles, straddle, portfolios, NATS).")
     return app

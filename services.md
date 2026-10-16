@@ -3,33 +3,35 @@
 Written for: you, the person running the stack. One page that says what every part does, what it depends on, how much memory and CPU it takes,
 and what changed in the last pass.
 
+Using them day to day: **`howto.md`** (plain function calls for each service) and `algo_help()` in the terminal.
+
 ## 1. They are independent
 
 Each service is its own plugin. They find each other **by name in the app, only when they need to**, and none of the data services knows the
 others exist.
 
 ```
- master ──► candles ──► indicators        (data: each one is built from the one before it)
+ master ──► candles                      (data: each one is built from the one before it)
                   └───► straddle
  nats service        (sends commands; knows nothing about the data)
  registry            (hands out portfolio numbers; knows nothing about the data or NATS)
- book / bridge / algo (use the registry and NATS; read candles and indicators)
+ book / bridge / algo (use the registry and NATS; read candles; indicators are the algo's own)
  console / UI         (reads and clicks; uses the others)
 ```
 
 | if this stops, is busy or breaks | what happens to the others |
 |---|---|
-| **NATS service** (stopped, or the real NATS server is down) | candles, indicators, straddle, master, registry: **not touched**. Algos keep computing signals; their commands come back as an error status (`service_down` or `disconnected`) and a swap rolls back and retries later. |
-| **registry** | candles, indicators, straddle, NATS: **not touched**. Only creating a *new* portfolio number fails, with a clear message. |
-| **candles** | indicators and the straddle stop getting new rows (they are built from candles) but do not break; they follow when candles restart. NATS and the registry are not touched. |
+| **NATS service** (stopped, or the real NATS server is down) | candles, straddle, master, registry: **not touched**. Algos keep computing signals; their commands come back as an error status (`service_down` or `disconnected`) and a swap rolls back and retries later. |
+| **registry** | candles, straddle, NATS: **not touched**. Only creating a *new* portfolio number fails, with a clear message. |
+| **candles** | the straddle stops getting new rows (it is built from candles) but does not break; it follows when candles restart. NATS and the registry are not touched. |
 | **an algo** | the others do not know it exists. |
 
 **Speed.** The NATS service runs on its own thread and its own event loop. A Deephaven listener only *hands* it a command and returns at once, so
 sending (or waiting for NATS) never holds up a table update. The registry does a tiny file append per new portfolio. Neither shares a lock with
-candles or indicators.
+candles.
 
 **This is checked, not just claimed.** `tests/test_independence.py` reads every module's import lines and fails if a package imports one it must
-not know about: `core` imports nothing of the others; `data` (master, candles, indicators, EOD) uses `core` only; `comms` (NATS) and the
+not know about: `core` imports nothing of the others; `data` (master, candles, EOD) uses `core` only; `comms` (NATS) and the
 registry use `core` only; the data modules never mention NATS, the registry or a strategy. So a later change cannot quietly tie them together.
 
 **Shared limit, honestly:** they all run inside one Deephaven process, so they share its memory and its table-update thread. A listener doing
@@ -50,20 +52,16 @@ Builds 30s / 1min / 5min / 15min candles from the live feed. Numbers only, one r
 bar after you start it. **Memory:** about 230 bytes per instrument for the open bar, and **56 bytes per candle row**. This table is by far the
 biggest memory item of everything, so it has a size lever:
 
-| NSE, 1-minute candles, one session | instruments | candles | + EMA and RSI |
-|---|---|---|---|
-| everything (default) | 85,591 | about 1.8 GB | about 0.5 GB |
-| `expiries=1` (each underlying's nearest option expiry) | 33,275 | about 0.7 GB | about 0.2 GB |
-| `symbols=["NIFTY","BANKNIFTY"]`, `expiries=2` | 3,139 + futures | about 66 MB | about 19 MB |
-| `kind="FUT"` (futures only) | 671 | 14 MB | 4 MB |
+| NSE, 1-minute candles, one session | instruments | candles |
+|---|---|---|
+| everything (default) | 85,591 | about 1.8 GB |
+| `expiries=1` (each underlying's nearest option expiry) | 33,275 | about 0.7 GB |
+| `symbols=["NIFTY","BANKNIFTY"]`, `expiries=2` | 3,139 + futures | about 66 MB |
+| `kind="FUT"` (futures only) | 671 | 14 MB |
 
 This pass added **`expiries=`** (`candles_start("1min", expiries=1)`) and a log line at start with the estimated size, which is a warning when it
 is over 500 MB. Nothing changes if you do not use it. The straddle needs options of its `n+1` nearest expiries, so `straddle_start` warns if candles
 were started with fewer. (Numbers are for every instrument ticking all session; the real feed may carry fewer.)
-
-### Indicators (`indicators(EMA(9), RSI(14))`)
-SMA, EMA, RSI, MACD, ATR, PCT as columns of one table, each call adds to what is running. **Memory:** 8 bytes per row per indicator column, so
-scope it: `indicators(RSI(14), kind="FUT")` costs about 4 MB instead of about 0.5 GB. Unchanged in this pass.
 
 ### Straddle (`straddle_start`)
 V and D series per underlying and expiry, built from candles. Unchanged in this pass.
@@ -71,8 +69,13 @@ V and D series per underlying and expiry, built from candles. Unchanged in this 
 ### EOD (`eod_save`, `eod_load`, `eod_auto`)
 Saves candles and straddle to Parquet, written through a temporary file and a rename. Unchanged in this pass.
 
-### NATS service (`nats_start`, `pf_pause` ...) — see `nats.md`
+### NATS service (`nats_start`, `nats_connect`, `pf_pause` ...) — see `nats.md`
 One connection for every algo and the UI, for subscribe, pause, unpause, squareup, unsubscribe, apply.
+- **Started once, connected to by everyone:** `nats_start(...)` is run once for all the users and is safe to call again (it does nothing); an algo
+  calls `nats_connect(user=..., client=...)`, which only checks. `nats_restart(...)` is the deliberate restart, `nats_add_user(...)` adds a user
+  without one. The registry works the same way (`registry_start` / `registry_connect`).
+- **A switch for each algo and the UI:** they all start OFF and each says `nats_send(True, client="bridge_nifty")` for itself, so one algo
+  stopping never stops another. There is also a master switch (`nats_send(False)`) for everyone. A command goes out only when both are on.
 - **Users and portfolios:** started with the users that may send (`users=[3,4]`); every command is for one user; a portfolio is user + number.
 - **Order and speed:** one event loop on one thread, one queue per (user, portfolio) so commands for one portfolio stay in order and different
   portfolios run side by side, and a cap of 64 requests on the wire in all.
@@ -96,7 +99,13 @@ The one place that hands out portfolio numbers so a user never has two portfolio
   from the first version is converted automatically.
 - **Memory:** about 420 bytes per portfolio.
 
-### Book and bridge (the strategy side)
+### Automations as plain scripts (`algo/automation.py`) — see `howto.md` section 5
+Functions, no class to define: `algo_start(user, strategy)` registers an automation (its own book and its own sending switch, OFF at every start),
+`pf_assign(...)` asks the book for the portfolio (new, the same, or a replacement), `pf_activate(...)` queues the whole command sequence through the
+NATS service and returns at once, and `pf_leg`, `pf_cooling`, `algo_sending`,
+`algo_portfolios`, `algo_exit` ... look after it. It adds no new service: it is the book and the NATS service behind plain functions.
+
+### Book and bridge
 - **Book:** the per-algo bookkeeping (which stock has which portfolio, caps, paused flags). With `Book(user=3)` it takes its numbers from the
   registry, so two strategies for the same user can never be given the same number, and it records the algo and stock name for each portfolio.
 - **Bridge:** the order of commands for a swap, retire or exit. It sends through the NATS service, found by name each time, so stopping and
@@ -121,4 +130,4 @@ Not measured: a live Deephaven (table memory is the arithmetic above), and a rea
 ## 4. What I did not change
 
 Master's lookup dictionaries (about 7 MB each) could be replaced by arrays to save roughly 15 MB; not worth the risk to working code. The
-feed, EOD, straddle and indicator maths are untouched. Nothing here is deployed to the host or committed.
+feed, EOD, straddle maths are untouched. Nothing here is deployed to the host or committed.

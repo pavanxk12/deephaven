@@ -1,13 +1,13 @@
 [project]
 name = "algo"
 version = "0.1.0"
-description = "Plugin framework for the Deephaven trading stack: master, candles, indicators, series, strategies, console."
+description = "Deephaven trading stack: master, candles, straddle, the NATS service, the book (portfolio numbers), end of day, console."
 requires-python = ">=3.10"
 dependencies = ["pandas", "numpy"]
 
 [project.optional-dependencies]
 runtime = ["nats-py"]      # installed in the Deephaven image; needed only by the bridge
-dev = ["pytest", "TA-Lib"]       # TA-Lib is only a checker (tests/test_talib_parity.py), never used at runtime
+dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 include = ["algo*"]

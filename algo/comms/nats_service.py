@@ -3,6 +3,10 @@
     nats.subscribe(pf, option)     nats.pause(pf)      nats.unpause(pf)
     nats.squareup(pf)              nats.apply(pf, {...})     nats.unsubscribe(pf, option)
 
+The service is started ONCE for everyone (nats_start); an algo or the UI only connects to it (nats_connect). Each of them is a
+named client and has its own sending switch, which starts OFF: `svc.enable("rsi_nifty")` / `svc.disable("rsi_nifty")`. Commands go
+out only while the service's master switch is on AND the client's own switch is on, so one algo stopping never stops another.
+
 Every command is sent AS a user (`user=3`; optional when the service has only one). The service is started with the users it
 allows, a command for any other user is refused, and `block(user=..)` / `block(user=.., pf=..)` stop a user (every portfolio under
 it) or some of one user's portfolios. A portfolio number belongs to a user: user + portfolio is the unique id.
@@ -170,19 +174,19 @@ class NoService:
         fut.set_result(Reply(False, "service_down", int(pf), label))
         return fut
 
-    def send(self, pf, cmd, payload=None, *, user=None): return self._down(pf, cmd)
-    def subscribe(self, pf, option, params=None, *, user=None): return self._down(pf, "subscribe")
-    def unsubscribe(self, pf, option, params=None, *, user=None): return self._down(pf, "unsubscribe")
-    def pause(self, pf, *, user=None): return self._down(pf, "pause_unpause")
-    def unpause(self, pf, *, user=None): return self._down(pf, "pause_unpause")
-    def squareup(self, pf, *, user=None): return self._down(pf, "squareup")
-    def apply(self, pf, params, *, user=None): return self._down(pf, "apply")
-    def submit(self, pf, job, *, user=None, label="job"): return self._down(pf, label)
+    def send(self, pf, cmd, payload=None, *, user=None, client=None): return self._down(pf, cmd)
+    def subscribe(self, pf, option, params=None, *, user=None, client=None): return self._down(pf, "subscribe")
+    def unsubscribe(self, pf, option, params=None, *, user=None, client=None): return self._down(pf, "unsubscribe")
+    def pause(self, pf, *, user=None, client=None): return self._down(pf, "pause_unpause")
+    def unpause(self, pf, *, user=None, client=None): return self._down(pf, "pause_unpause")
+    def squareup(self, pf, *, user=None, client=None): return self._down(pf, "squareup")
+    def apply(self, pf, params, *, user=None, client=None): return self._down(pf, "apply")
+    def submit(self, pf, job, *, user=None, client=None, label="job"): return self._down(pf, label)
 
-    async def lane(self, pf, job, *, user=None):
+    async def lane(self, pf, job, *, user=None, client=None):
         raise RuntimeError("the NATS service is not running")
 
-    def go(self, coro):
+    def go(self, coro, client=None):
         coro.close()
         return None
 
@@ -191,6 +195,18 @@ class NoService:
 
     def send_off(self) -> None:
         pass
+
+    def enable(self, client) -> bool:
+        return False
+
+    def disable(self, client) -> None:
+        pass
+
+    def is_enabled(self, client) -> bool:
+        return False
+
+    def allowed(self, client=None) -> bool:
+        return False
 
     def note(self, pf, cmd, status, detail="", user=0) -> None:
         pass
@@ -228,6 +244,7 @@ class NatsService(Plugin):
         self._drains: set = set()                         # the tasks that run the lanes, loop thread only
         self._closing = False
         self._stopped = False
+        self._enabled: set = set()                        # clients (algos, the UI) that have switched their own sending on
         self.counts = {"sent": 0, "ok": 0, "failed": 0, "timeout": 0, "dropped": 0}
         self.in_flight = self.queued = self.running = 0     # on the wire / waiting in a lane / being run by a lane
         self.rtt_ms = self.rtt_max_ms = 0.0
@@ -378,50 +395,81 @@ class NatsService(Plugin):
         return True
 
     def send_off(self) -> None:
-        """Nothing new is accepted. Jobs already waiting or running finish."""
+        """The master switch, for everyone: nothing new is accepted. Jobs already waiting or running finish."""
         self.sending = False
-        self.log.info("sending OFF: no new commands are accepted")
+        self.log.info("sending OFF for everyone: no new commands are accepted")
+
+    # ---- the switch of each client (an algo, the UI) ---------------------------------------------------
+    def enable(self, client: str) -> bool:
+        """This client may send (it starts OFF). Only the master switch and this switch decide; other clients are not affected."""
+        if self.transport is None:
+            self.log.warning("%s: cannot turn sending ON: dry run or no NATS connection", client)
+            return False
+        self._enabled.add(client)
+        self.log.info("%s: sending ON", client)
+        return True
+
+    def disable(self, client: str) -> None:
+        self._enabled.discard(client)
+        self.log.info("%s: sending OFF", client)
+
+    def is_enabled(self, client: str) -> bool:
+        return client in self._enabled
+
+    def allowed(self, client: str | None = None) -> bool:
+        """May a command from `client` go out? The master switch must be on, and the client's own switch if it names one."""
+        return self.sending and (client is None or client in self._enabled)
+
+    def add_users(self, *users: int) -> None:
+        """Let more users send, without restarting (an algo for a user that was not named in nats_start)."""
+        new = _ints(list(users))
+        self.cfg.users = (*self.cfg.users, *sorted(new - set(self.cfg.users)))
+        self.log.info("users now %s", list(self.cfg.users))
 
     # ---- the six commands ---------------------------------------------------------------------
     # `user` is the user the command is sent as. It may be left out when the service has only one user.
-    def subscribe(self, pf: int, option: int, params: dict | None = None, *, user: int | None = None) -> Future:
-        return self.send(pf, "subscribe", {**self.cfg.sub_payload, **(params or {}), "T1": int(option)}, user=user)
+    # `client` names the algo or screen sending (its own switch applies); None = a typed operator command, master switch only.
+    def subscribe(self, pf: int, option: int, params: dict | None = None, *, user: int | None = None,
+                  client: str | None = None) -> Future:
+        return self.send(pf, "subscribe", {**self.cfg.sub_payload, **(params or {}), "T1": int(option)}, user=user, client=client)
 
-    def unsubscribe(self, pf: int, option: int, params: dict | None = None, *, user: int | None = None) -> Future:
-        return self.send(pf, "unsubscribe", {**self.cfg.sub_payload, **(params or {}), "T1": int(option)}, user=user)
+    def unsubscribe(self, pf: int, option: int, params: dict | None = None, *, user: int | None = None,
+                    client: str | None = None) -> Future:
+        return self.send(pf, "unsubscribe", {**self.cfg.sub_payload, **(params or {}), "T1": int(option)}, user=user, client=client)
 
-    def pause(self, pf: int, *, user: int | None = None) -> Future:
-        return self.send(pf, "pause_unpause", {"Action": "Pause"}, user=user)
+    def pause(self, pf: int, *, user: int | None = None, client: str | None = None) -> Future:
+        return self.send(pf, "pause_unpause", {"Action": "Pause"}, user=user, client=client)
 
-    def unpause(self, pf: int, *, user: int | None = None) -> Future:
-        return self.send(pf, "pause_unpause", {"Action": "UnPause"}, user=user)
+    def unpause(self, pf: int, *, user: int | None = None, client: str | None = None) -> Future:
+        return self.send(pf, "pause_unpause", {"Action": "UnPause"}, user=user, client=client)
 
-    def squareup(self, pf: int, *, user: int | None = None) -> Future:
-        return self.send(pf, "squareup", user=user)
+    def squareup(self, pf: int, *, user: int | None = None, client: str | None = None) -> Future:
+        return self.send(pf, "squareup", user=user, client=client)
 
-    def apply(self, pf: int, params: dict, *, user: int | None = None) -> Future:
-        return self.send(pf, "apply", dict(params), user=user)
+    def apply(self, pf: int, params: dict, *, user: int | None = None, client: str | None = None) -> Future:
+        return self.send(pf, "apply", dict(params), user=user, client=client)
 
     # ---- general entry points -----------------------------------------------------------------
-    def send(self, pf: int, cmd: str, payload: dict | None = None, *, user: int | None = None) -> Future:
+    def send(self, pf: int, cmd: str, payload: dict | None = None, *, user: int | None = None,
+             client: str | None = None) -> Future:
         """One command on `pf`'s lane. Any thread may call this; it never blocks."""
-        return self.submit(pf, lambda call: call(cmd, payload), user=user, label=cmd)
+        return self.submit(pf, lambda call: call(cmd, payload), user=user, client=client, label=cmd)
 
-    def submit(self, pf: int, job: Job, *, user: int | None = None, label: str = "job") -> Future:
+    def submit(self, pf: int, job: Job, *, user: int | None = None, client: str | None = None, label: str = "job") -> Future:
         """Several commands that must run back to back on one portfolio, nothing from that portfolio in between:
 
             async def job(call):
                 await call("pause_unpause", {"Action": "Pause"})
                 return await call("apply", {...})
 
-        `call(cmd, payload)` returns a Reply. Refused (not queued) while sending is off, or for a user that is not allowed
-        or is blocked, or a blocked portfolio."""
-        return self._submit(int(pf), job, label, user, gated=True)
+        `call(cmd, payload)` returns a Reply. Refused (not queued) while sending is off for everyone or for this `client`, or for a
+        user that is not allowed or is blocked, or a blocked portfolio."""
+        return self._submit(int(pf), job, label, user, True, client)
 
-    async def lane(self, pf: int, job: Job, *, user: int | None = None):
+    async def lane(self, pf: int, job: Job, *, user: int | None = None, client: str | None = None):
         """For a workflow that is already running on the loop (it spans portfolios): run `job` on `pf`'s lane and return its
-        result. Not stopped by the send switch (a started workflow finishes); raises if the job was refused."""
-        res = await asyncio.wrap_future(self._submit(int(pf), job, "job", user, gated=False))
+        result. Not stopped by the send switches (a started workflow finishes); raises if the job was refused."""
+        res = await asyncio.wrap_future(self._submit(int(pf), job, "job", user, False, client))
         if isinstance(res, Reply) and res.status in REFUSED:
             raise RuntimeError(f"PF {pf}: {res.status}")
         return res
@@ -507,11 +555,11 @@ class NatsService(Plugin):
             return 0, "user_not_allowed"
         return (u, "") if u in users else (0, "user_not_allowed")
 
-    def go(self, coro: Awaitable) -> "Future | None":
+    def go(self, coro: Awaitable, client: str | None = None) -> "Future | None":
         """Run a free-form coroutine on the loop (a workflow that spans portfolios, which calls `lane` itself).
-        Returns None, and drops it, while sending is off."""
+        Returns None, and drops it, while sending is off for everyone or for this `client`."""
         loop = self.loop
-        if self.cfg.dry_run or not self.sending or loop is None:
+        if self.cfg.dry_run or not self.allowed(client) or loop is None:
             coro.close()                                  # avoid Python's "never awaited" warning
             return None
         try:
@@ -528,7 +576,7 @@ class NatsService(Plugin):
         return fut
 
     # ---- the lanes (loop thread) --------------------------------------------------------------
-    def _submit(self, pf: int, job: Job, label: str, user, gated: bool) -> Future:
+    def _submit(self, pf: int, job: Job, label: str, user, gated: bool, client: str | None = None) -> Future:
         fut: Future = Future()
         uid, why = self._resolve(user)
         if not why and (uid in self.blocked_users or (uid, pf) in self.blocked_pfs):
@@ -545,9 +593,10 @@ class NatsService(Plugin):
             self.log.info("[DRY] %s PF %s user %s", label, pf, uid)
             fut.set_result(Reply(True, "dry", pf, label, user=uid))
             return fut
-        if gated and not self.sending:
-            self.log.debug("[OFF] %s PF %s NOT sent", label, pf)
-            fut.set_result(Reply(False, "off", pf, label, user=uid))
+        if gated and not self.allowed(client):
+            why_off = "sending is off for everyone" if not self.sending else f"{client} has not switched sending on"
+            self.log.debug("[OFF] %s PF %s NOT sent: %s", label, pf, why_off)
+            fut.set_result(Reply(False, "off", pf, label, {"detail": why_off}, uid))
             return fut
         loop = self.loop
         try:

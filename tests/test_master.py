@@ -96,24 +96,6 @@ def test_large_fractional_strikes_do_not_lose_digits_in_the_symbol():
     assert len(names) == 4                                              # two strikes, CE and PE: nothing merged
 
 
-def test_the_picker_chooses_between_fractional_strikes():
-    from algo.strategy.config import RsiOptionsConfig
-    from algo.strategy.picker import OptionPicker
-    m = classify(normalise(fractional_contracts(), NSE))
-    p = OptionPicker(m, RsiOptionsConfig.stocks(), lambda t: None)
-    exp, today = pd.Timestamp("2030-01-30"), pd.Timestamp("2030-01-01")
-    assert m.symbol_of[p.pick("PENNY", exp, 16.3, "CALL", today)[0]] == "PENNY 30JAN30 16.25 CE"
-    assert m.symbol_of[p.pick("PENNY", exp, 16.4, "PUT", today)[0]] == "PENNY 30JAN30 16.5 PE"
-
-
-def test_a_fractional_strike_sizes_on_the_tick():
-    from algo.strategy.config import RsiOptionsConfig
-    from algo.strategy.sizing import option_params
-    params, why = option_params(0.85, 0.05, RsiOptionsConfig.stocks())
-    assert params is not None, why
-    assert all(int(params[k] * 100) % 5 == 0 for k in ("ival", "trp", "lowerrange", "upperrange"))
-
-
 def test_tokens_for_narrows_to_the_wanted_instruments(master):
     import numpy as np
     assert master.tokens_for() is None

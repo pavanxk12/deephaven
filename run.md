@@ -1,7 +1,9 @@
 # How to run it
 
+**Short version: `howto.md`.** In the terminal, `algo_help()` lists every function by service.
+
 Every command below is typed in the **Deephaven console** (the Python console in the web IDE), except the last section.
-Order: **master → candles → indicators** (then the straddle and the end-of-day save if you want them).
+Order: **master → candles** (then the straddle and the end-of-day save if you want them). Indicators are not a service: your script computes them from the candles.
 Each step needs the one before it; calling them out of order gives a message that names which one to call first.
 
 ---
@@ -44,7 +46,7 @@ master_build("US", file="20261015DB_US.db3")   # name the file when more than on
 ```
 **What the folder `/data/fo_market_data` (host: `./deephaven/fo_market_data`) holds:** the contract file `<yyyymmdd>.db3` (or
 `*<yyyymmdd>*.db3`, e.g. `20261015DB.db3`; the date is today in the market's own timezone, New York's date for the US),
-the saved days `candles_<day>.parquet` / `straddle_<day>.parquet` for `eod_load`, and `stocks.txt` / `logo.png` for the strategy
+the saved days `candles_<day>.parquet` / `straddle_<day>.parquet` for `eod_load`, and `stocks.txt` / `logo.png` for your scripts
 and console. If two files match one day (an NSE one and a US one), it uses the last by name and logs a warning that lists them;
 a file that belongs to the other market is refused with a message, never read as the wrong market.
 Result: the dict `master`, and everything below uses it. Look at it: `algo_status()`.
@@ -69,72 +71,14 @@ candles_start("1min", symbols=["NIFTY"], kind="OPT")         # NIFTY options onl
 candles_stop()
 ```
 Result: the table `candles` (`Minute, Symbol, token, Open, High, Low, Close, Volume`).
-**Calling `candles_start` again restarts the candles empty**; indicators and the straddle rebuild on the new table by themselves.
+**Calling `candles_start` again restarts the candles empty**; the straddle rebuilds on the new table by itself.
 Run `eod_save()` first if you need what was built.
 
 ---
 
-## 3. Indicators
-
-`EMA(9)`, `RSI(14)` ... only *describe* an indicator. `indicators(...)` starts the computation, and **each call adds to what is
-already running**. The result is the table `indicator_values`.
-
-```python
-indicators(EMA(9), RSI(14))                                  # start these
-indicators(SMA(20), ATR(14))                                 # ADDS these; EMA_9 and RSI_14 keep running
-indicators(MACD(12, 26), MACD_SIGNAL(12, 26, 9), MACD_HIST(12, 26, 9))
-indicators(PCT())                                            # percent from the first bar's open   -> PCT_OPEN
-indicators(PCT("5min"), PCT("10min"))                        # percent against the close 5 / 10 minutes earlier
-indicators(PCT(5))                                           # percent against the close 5 bars earlier
-```
-
-| call | column | meaning |
-|---|---|---|
-| `SMA(n)` | `SMA_n` | average of the last n closes |
-| `EMA(n)` | `EMA_n` | exponential average |
-| `RSI(n)` | `RSI_n` | RSI, 0 to 100 (Wilder) |
-| `MACD(f, s)` | `MACD_f_s` | EMA(f) − EMA(s) |
-| `MACD_SIGNAL(f, s, g)` | `MACD_SIGNAL_f_s_g` | EMA(g) of the MACD line |
-| `MACD_HIST(f, s, g)` | `MACD_HIST_f_s_g` | MACD line − signal |
-| `ATR(n)` | `ATR_n` | average true range (Wilder) |
-| `PCT()` | `PCT_OPEN` | percent from the first bar's open |
-| `PCT("5min")` | `PCT_5min` | percent against the close 5 minutes earlier (`"90s"`, `"10min"`, `"2h"` ... up to 6 h) |
-| `PCT(5)` | `PCT_5` | percent against the close 5 bars earlier |
-
-**Bar size per indicator** (the default is the candle size; a size must be a whole multiple of it):
-
-```python
-indicators(EMA(9, "5min"), RSI(14, "15min"))                 # own bar size  -> EMA_9_5min, RSI_14_15min
-indicators(EMA(21), timeframe="5min")                        # default bar size for the ones that name none
-```
-
-**Only some instruments** (saves memory; can be narrower than the candles):
-
-```python
-indicators(EMA(9), RSI(14), kind="FUT")
-indicators(symbols=["NIFTY", "BANKNIFTY"])                   # change the scope of everything already running
-```
-
-**Look at it, remove it:**
-
-```python
-indicators()                                                 # lists what is being computed
-indicators_remove("EMA_9")                                   # stop one (use the column name)
-```
-
-**Read the values:**
-
-```python
-indicator_values                                             # the whole table
-indicator_values.last_by("token")                            # latest row per instrument
-indicator_values.where("Symbol = `NIFTY 27OCT26 FUT`").view(["Minute", "EMA_9", "RSI_14"])
-candles.natural_join(indicator_values, on=["token", "Minute"], joins=["EMA_9", "RSI_14"])   # next to the candle
-```
-A blank value (a Deephaven null) means "not enough history yet".
-
 ---
 
-## 4. Straddle (optional)
+## 3. Straddle (optional)
 
 ```python
 straddle_start(0)                        # nearest option expiry only
@@ -146,11 +90,11 @@ Result: the table `straddle_series`. Weekly options use the monthly future; a sy
 
 ---
 
-## 5. End of day (optional)
+## 4. End of day (optional)
 
 ```python
 eod_save()                               # candles + straddle -> candles_<day>.parquet, straddle_<day>.parquet (+ .meta.json)
-eod_save(tables=["candles", "straddle_series", "indicator_values"])
+eod_save(tables=["candles"])
 eod_save(day="2026-10-14", folder="/data/eod")
 eod_auto()                               # saves every day 5 minutes after the close;  eod_auto("15:40"),  eod_auto(stop=True)
 eod_load("2026-10-15")                   # -> candles_20261015, straddle_20261015
@@ -159,17 +103,23 @@ eod_load()                               # every saved day merged -> candles_his
 
 ---
 
-## 6. NATS: the one connection for commands (optional)
+## 5. NATS: the one connection for commands (optional)
 
 Strategies, the console and you all send portfolio commands through one service, so there is one connection and one set of rules.
 
 ```python
-nats_start()                                   # connect (sending starts OFF)
-nats_start("192.168.1.130", 4222, users=[3, 4])   # ip, port, the users that may send; remembered until nats_stop()
-nats_start()                                   # again: same ip, port and settings as before
+# ---- ONCE, for everyone (examples/00_services.py) ----
+nats_start("192.168.1.130", 4222, users=[3, 4])   # starts the shared service for ALL the users. Calling it again changes nothing.
 nats_start(dry_run=True)                       # no connection, commands are only logged
-nats_send(True)                                # sending ON for everyone;  nats_send(False) = OFF
+nats_add_user(5)                               # one more user, without a restart
+nats_restart(port=4223)                        # on purpose: stop and start again (cuts every algo off, all go back to OFF)
 nats_stop()
+
+# ---- in every algo script ----
+nats_connect(user=4, client="bridge_nifty")    # only checks the service is up and user 4 may send; starts nothing
+nats_send(True, client="bridge_nifty")         # THIS algo may send (every algo and the UI starts OFF)
+nats_send(False, client="bridge_nifty")        # stops only this algo
+nats_send(False)                               # the master switch: nothing is sent for anyone;  nats_send(True) lets them again
 
 pf_subscribe(1913, 47162, user=4)              # portfolio 1913 -> option token 47162, sent as user 4
 pf_pause(1913, user=4)                         # user= may be left out when the service has a single user
@@ -200,7 +150,7 @@ order; none is replaced or dropped. Each portfolio queue holds at most `lane_dep
 
 ---
 
-## 7. Portfolio numbers: one registry (optional)
+## 6. Portfolio numbers: one registry (optional)
 
 A user never has two portfolios with the same number, whichever strategy or screen creates them. Details in `registry.md`.
 
@@ -212,8 +162,16 @@ pf_register(3, 1001)                           # claim a number you already use 
 pf_register(3, 1001, algo="rsi_stocks", name="TCS")      # yours already: records the algo and what it trades
 pf_list(3)                                     # user, number, name, algo and book for user 3;  pf_list() for everyone
 ```
-Books take their numbers from it: `algo.Book(user=3, name="book_stocks", pf_start=1111)`, and the algo records its own name and the stock for each
-portfolio it uses. The same number under two different users is fine. The tables are `portfolio_registry` (current) and `portfolio_registry_log` (every change).
+An automation takes its numbers from it: `algo_start(3, "stocks", pf_start=1001)` then `pf_assign(...)`, and the registry records its name and the stock
+for each portfolio it uses. The same number under two different users is fine. The tables are `portfolio_registry` (current) and `portfolio_registry_log` (every change).
+
+---
+
+## 7. Writing your own algo (optional)
+
+Write a plain script in the terminal: `algo_start(3, "my_algo")`, then `pf_assign(...)` to get a portfolio from the book and `pf_activate(...)` to
+send the commands; it starts OFF (`nats_send(True, client="my_algo")` switches it on). See `howto.md` section 5; a copy-and-change template in
+`examples/03_algo_template.py`.
 
 ---
 
@@ -224,7 +182,6 @@ portfolio it uses. The same number under two different users is fine. The tables
 import algo; algo.install(globals(), "NSE")
 master_build("NSE")
 candles_start("1min")
-indicators(EMA(9), EMA(18), RSI(14), ATR(14), PCT(), PCT("5min"))
 straddle_start(1)
 eod_auto()
 algo_status()
@@ -235,7 +192,6 @@ algo_status()
 import algo; algo.install(globals(), "US")
 master_build("US")
 candles_start("1min")
-indicators(EMA(9), RSI(14), PCT())
 straddle_start(0)
 eod_auto()
 algo_status()
@@ -259,12 +215,14 @@ and run the steps again.
 
 | message | meaning |
 |---|---|
-| `indicators needs ['candles']. Call candles_start() first.` | you skipped a step; run the one it names |
+| `straddle needs ['candles']. Call candles_start() first.` | you skipped a step; run the one it names |
 | `unknown market ...` | the exchange must be `"NSE"` or `"US"` |
 | `no .db3 for <day> in /data/fo_market_data` | today's contract file is not there yet |
 | `... lists exchange [...], which is not NSE` (or US) | the file is the other market's; pass `file=` with the right name |
-| `bar size ... must be a whole multiple of the candle size` | an indicator's size such as `"30s"` on 1-minute candles |
-| `... NOT sent - the NATS service is not running. Call nats_start() first.` | a `pf_...` or `nats_send` call before `nats_start()` (nothing raises) |
+| `... NOT sent - the NATS service is not running. Start it once with nats_start(...)` | a `pf_...`, `nats_send` or `nats_add_user` call before the service was started (nothing raises) |
+| `the NATS service is already running (...) and these settings differ ... nats_restart(...)` | an algo script called `nats_start` with other settings; it must not restart the shared service |
+| `the NATS service is running for users [...], not [9]. Add them ... nats_add_user(9)` | `nats_start(users=...)` named a user the running service does not have |
+| `user 9 may not send on the running NATS service` | `nats_connect(user=9)`; add the user with `nats_add_user(9)` |
 | `... (NATS is down; it reconnects by itself, send again when it is back)` | the NATS server cannot be reached right now |
 | `... (several users are allowed: add user=...)` | `pf_...` without `user=` while `nats_start` was given several users |
 | `... (that user was not given to nats_start)` | `user=` names a user that is not one of the service's users |

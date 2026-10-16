@@ -1,15 +1,15 @@
-# Master, candles and indicators: how it works inside
+# Master and candles: how it works inside
 
-This covers only the three data steps, in the order you run them:
+This covers the two data steps, in the order you run them:
 
 ```python
 master_build("NSE")                         # 1. the contract master
 candles_start("1min", symbols=["NIFTY"])    # 2. candles form from the live feed
-indicators(EMA(9), RSI(14))                 # 3. indicators are computed on the candles
 ```
+Indicators are not a service. A script computes the ones it needs from the candles it reads (`examples/03_algo_template.py` does an RSI).
 
-Code: `algo/data/master.py`, `algo/data/candles.py`, `algo/data/indicators.py`, `algo/data/symbols.py`,
-`algo/api.py` (the three functions above), `algo/core/` (plugin and app plumbing).
+Code: `algo/data/master.py`, `algo/data/candles.py`, `algo/data/symbols.py`, `algo/api.py` (the two functions above),
+`algo/core/` (plugin and app plumbing).
 
 ---
 
@@ -65,8 +65,8 @@ What this means for the code:
     missed. For liquid, fast instruments the High / Low may be slightly narrower than the exchange's.
   * If you need exact highs and lows, the source should be an **append-only stream** of every trade (the Kafka topic behind
     this table), not the last-value table. `Candles` would then read only `added` rows. I have not built that; say if you want it.
-* **A quiet token produces no candle** for a bar in which it did not trade (no forward fill). Indicators then see only the
-  bars that exist for that token: an illiquid option's "EMA 9" spans nine traded bars, not nine minutes.
+* **A quiet token produces no candle** for a bar in which it did not trade (no forward fill). A script that computes an indicator
+  from the candles then sees only the bars that exist for that token: an illiquid option's "EMA 9" spans nine traded bars, not nine minutes.
 * **Time is the feed's own.** Bars are cut by `ltt`, and a bar is closed when the latest `ltt` seen moves 10 s past it.
 * **The table that creates the feed is not in this repo** (it is set up by your `init.py` / Kafka consumer), so "updated in
   place, keyed by token" is read from how the old scripts and the console use it (they `natural_join` it on `token`, which
@@ -98,16 +98,12 @@ dropped. A token in the master that never trades never produces a candle.
         |                                      v
         |                              table `candles`   (Deephaven table, grows all day)
         |                                      |
-        |                                      v
-        +--- symbols / kind filter ----> indicators(...)
-                                               |  Deephaven engine operations (update_by ...)
-                                               v
-                                       table `indicator_values`
+        +--- symbols / kind / expiries ---->  read by the straddle, by end of day, and by your scripts
 ```
 
 Rules of the design:
 
-* **Candles are the source of everything derived.** Indicators (and the straddle, strategy) read `candles`; `candles` never reads them.
+* **Candles are the source of everything derived.** The straddle, end of day and your scripts read `candles`; `candles` never reads them.
 * **Heavy numeric work stays in vectors or in the Deephaven engine.** Python only does what is inherently sequential
   (building a candle tick by tick).
 * **Nothing is stored that is not used.** The candle table holds numbers only; helper columns are lazy formulas.
@@ -115,20 +111,20 @@ Rules of the design:
 
 ---
 
-## 2. Plumbing shared by all three (`algo/core`)
+## 2. Plumbing shared by the services (`algo/core`)
 
 | piece | what it does |
 |---|---|
-| `algo.install(globals(), "NSE")` | creates the one `App` for the session and puts `master_build`, `candles_start`, `indicators`, `EMA`, `RSI` ... into the console |
+| `algo.install(globals(), "NSE")` | creates the one `App` for the session and puts `master_build`, `candles_start` ... into the console (`algo_help()` lists them) |
 | `App` | holds the running plugins (`app.plugins`), the published tables (`app.tables`), the market (`NSE`/`US`), paths and a small `shared` dict |
 | `Plugin` | base class: `start()`, automatic clean-up of everything it created (`listen`, `spawn`, `follow`), `describe()` for `algo_status()` |
 | `app.run(plugin)` | checks `requires`, **stops an older plugin of the same name first**, calls `start()`, registers it; if `start()` fails the plugin is torn down and not registered |
 | `app.publish(name, table)` | stores the table and puts it in the session as a variable; **if the name already existed it tells everyone who `follow`s it** |
 | `Plugin.listen(table, fn)` | a Deephaven table listener, wrapped so an exception inside `fn` is logged and cannot kill the listener; stopped automatically with the plugin |
-| `Plugin.follow(name, cb)` | "call me when another plugin republishes this table" (how indicators notice a candle restart) |
+| `Plugin.follow(name, cb)` | "call me when another plugin republishes this table" (how the straddle notices a candle restart) |
 
-`requires`: master needs nothing, candles need `master`, indicators need `candles`. Calling a function out of order gives
-a message such as *"indicators needs ['candles']. Call candles_start() first."*
+`requires`: master needs nothing, candles need `master`, the straddle needs both. Calling a function out of order gives
+a message such as *"straddle needs ['candles']. Call candles_start() first."*
 
 ---
 
@@ -268,130 +264,33 @@ are told.
 
 ---
 
-## 5. `indicators(...)` (`algo/data/indicators.py`)
-
-Reads `candles`, produces `indicator_values`. **All the arithmetic is done by Deephaven's engine** (incremental, in Java), not
-by Python; Python only builds the query once and publishes it.
-
-### Calling it
-
-```python
-indicators(EMA(9), RSI(14))                     # starts the computation
-indicators(SMA(20), ATR(14))                    # ADDS (existing columns untouched); the table is rebuilt
-indicators(EMA(9, "5min"))                      # own bar size -> column EMA_9_5min
-indicators(EMA(21), timeframe="5min")           # default bar size for the ones that name none
-indicators(RSI(14), symbols=["NIFTY"], kind="FUT")   # compute only for these instruments
-indicators()                                    # list;      indicators_remove("EMA_9") removes
-```
-`EMA(9)` only *describes* an indicator (a small object). `indicators(...)` is what starts it. Duplicates (same column) are
-ignored; a bad argument (`indicators(9)`, an impossible bar size) raises and **leaves the running set unchanged**.
-
-### The pipeline (`build_indicator_table`)
-
-```
- candles
-   |  where_in(token table)                 only when symbols=/kind= was given          (engine, join-like filter)
-   v
- _bars        view:  Px = Close*1.0, Op = Open*1.0, One = 1  (+ Hi, Lo only if ATR)    (lazy formulas)
-              coarser bars: lowerBin(Minute, N*SECOND)  ->  agg_by first / last (+max / min)  (engine aggregation)
-   v
- update_by(by = token)    cum_sum  Cnt = One  (+ PxSum = Px only if EMA)              (engine, one pass per token)
-                          delta    D = Px     only if RSI / ATR
-   v
- update_view              Gain, Loss (RSI)                                             (lazy formulas, no memory per row)
-   v
- steps, step by step      step i of EVERY indicator runs together:
-                            "ops"    -> one update_by  (ema_tick, rolling_avg_tick, forward_fill)
-                            "update" -> one update_view (ATR true range, MACD line)
-   v
- view                     Minute, Symbol, token, then each indicator's final expression
-   v
- (coarser groups)         each coarser bar size is computed the same way, then natural_join on (token, bar start)
-```
-
-Per token state is kept by `update_by(..., by="token")`, which is why many tokens and many indicators in one table do not
-mix. All the operations are in a single `update_by` per step, so adding an indicator adds columns, not passes.
-
-### What each indicator computes
-
-| call | column | formula | blank until |
-|---|---|---|---|
-| `SMA(n)` | `SMA_n` | `rolling_avg_tick` over the last n bars | never: the average of the bars there are until n |
-| `EMA(n)` | `EMA_n` | `ema_tick` with alpha 2/(n+1); until n bars the running average `PxSum / Cnt` | never |
-| `RSI(n)` | `RSI_n` | 100 - 100/(1 + AvgGain/AvgLoss), Wilder smoothing (alpha 1/n); AvgLoss = 0 gives 100 if there were gains, else 50 | n price changes |
-| `MACD(f, s)` | `MACD_f_s` | EMA(f) - EMA(s) | s bars |
-| `MACD_SIGNAL(f, s, g)` | `MACD_SIGNAL_f_s_g` | EMA(g) of the MACD line | s + g - 1 bars |
-| `MACD_HIST(f, s, g)` | `MACD_HIST_f_s_g` | MACD line - signal | s + g - 1 bars |
-| `ATR(n)` | `ATR_n` | Wilder smoothing of true range = max(H-L, abs(H-prevC), abs(L-prevC)); first bar H-L; prevC = Px - D | n bars |
-| `PCT()` | `PCT_OPEN` | 100 * (Px - first bar's Open) / first bar's Open, per token | the first bar |
-| `PCT("5min")` | `PCT_5min` | 100 * (Px - close of the latest bar at or before now - 5 min) / that close; as-of join on (token, time) | a bar that old exists |
-| `PCT(5)` | `PCT_5` | 100 * (Px - close 5 bars earlier) / that close; join on (token, bar number - 5) | 5 bars |
-
-`ema_tick(decay_ticks)`: the engine weight per bar is `exp(-1/decay_ticks)`, and `decay_ticks(alpha) = -1/ln(1-alpha)`
-makes that equal `1 - alpha`. A blank is a Deephaven null. Every division has a guard or a denominator that cannot be zero
-(`Cnt >= 1`, `AvgL == 0` test, and a zero or missing reference price gives a blank in PCT).
-
-### Stored versus lazy (this is the memory)
-
-| column | stored? | present when |
-|---|---|---|
-| `Cnt` | stored (long) | always |
-| `PxSum` | stored (double) | an EMA is computed |
-| `D` | stored (double) | RSI or ATR is computed |
-| `DayOpen_PCT_OPEN` | stored (double) | `PCT()` |
-| each indicator's smoothing state (`EMA_9_raw`, `AvgG_`, `AvgL_`, `MACD_.._f/_s/_g`, `ATR_.._atr`, `SMA_.._raw`) | stored (double) | that indicator |
-| `Px Op One Hi Lo`, `Gain Loss`, `OpenFirst`, ATR true range, MACD line, every final expression | **lazy** (`view` / `update_view`) | evaluated when read, no memory per row |
-| `Symbol` | reference into the small symbol table | |
-
-### Bar sizes
-
-* `candles_start("1min")` and `EMA(9)` -> the table has one row per 1-minute bar.
-* A size must be a **whole multiple of the candle size** (`EMA(9, "5min")` on 1-minute candles works; `"30s"` on 1-minute
-  candles is refused).
-* With mixed sizes the table has one row per bar of the **finest** size, and a coarser column shows the value of the coarser
-  bar that row belongs to (still forming, or final once closed; earlier rows of a closed coarse bar also show the final value).
-
-### Threads and cost
-
-* **No thread is created by this plugin.** Building the table is a query definition done on your console thread; after that
-  the engine updates it on its own threads as candles arrive.
-* Adding or removing an indicator, or changing symbols / kind / timeframe, **rebuilds the table over the whole day** and
-  republishes it (an `update_by` over the existing rows). Nothing else is touched.
-* Cost per indicator column is roughly one double per row per stored state column; narrowing `symbols=` / `kind=` reduces it
-  proportionally.
-
----
-
-## 6. What follows what (restart cascade)
+## 5. What follows what (restart cascade)
 
 ```
  candles_start(...)  -- publishes a NEW candles table -->  app.on_publish("candles") callbacks
-                                                              |- indicators : rebuild on the new table (same indicator set, same scope)
-                                                              |- straddle   : restart on the new table
-                                                              `- strategy   : move its listener to the new table
- indicators(...)     -- republishes indicator_values   -->  strategy moves its listener to the new table
+                                                              |- straddle      : restart on the new table
+                                                              `- your scripts  : a listener made with watch("candles", fn) moves to the
+                                                                               new table; a plain listen() would stay on the old, silent one
 ```
 
 The old tables are released when their listeners are stopped (nothing else holds them). Restarting candles loses the candles
-built so far; indicators then restart from the first new bar (EMA/SMA start as running averages, RSI/ATR/MACD blank, `PCT_OPEN`
-measured from the first new bar). Run `eod_save()` first if you need the day (see the README, "End of day").
+built so far; the straddle restarts from the first new bar. Run `eod_save()` first if you need the day (see the README, "End of day").
 
 ---
 
-## 7. Error handling at a glance
+## 6. Error handling at a glance
 
 | layer | what is guarded |
 |---|---|
 | `app.run` | missing dependency (message names the function to call), failed start (torn down, not registered) |
 | listener wrapper | any exception in a callback is logged with its traceback, the listener keeps running |
 | candles | per-batch numpy mask, per-row `try/except` in `_feed`, bounded caches, argument validation |
-| indicators | argument types and lengths validated in the constructors; `add` / `remove` roll the set back if the rebuild fails |
 | master | unreadable cache is ignored and rebuilt; cache writes are atomic; all-NaT expiry raises with a hint |
 | numbers | `algo/core/nulls.py`: one definition of "not a number" (None, NaN, inf, Deephaven null sentinels), used everywhere |
 
 ---
 
-## 8. What is verified and how
+## 7. What is verified and how
 
 | what | test file | how |
 |---|---|---|
@@ -400,13 +299,7 @@ measured from the first new bar). Run `eod_save()` first if you need the day (se
 | candle state machine, time parsing | `test_candles.py` | pure Python |
 | batch (numpy) path equals the row-by-row rules | `test_candles_vector.py` | randomised dirty data, 8 seeds, with and without the instrument filter |
 | bad rows, multiplier, threads | `test_hardening.py` | NaN / inf / None / garbage rows, 8 threads creating portfolios |
-| indicator query shape | `test_indicator_library.py` | recording stand-in for the engine |
-| **indicator numbers** | `test_indicator_math.py` | the real `build_indicator_table` run on a pandas stand-in for the engine, 3 tokens x 7 indicators, compared with textbook formulas |
-| independent check | `test_talib_parity.py` | TA-Lib (skipped if not installed): SMA exact, EMA 1e-9, RSI / ATR / MACD 1e-7 after the seed has decayed |
+| the RSI in the example scripts | `test_examples.py` | against the published values of the textbook 14-period example, and against the definition |
 
-**Not verified here:** the behaviour of Deephaven's own operators (`ema_tick`, `update_by`, `natural_join`, `where_in`) on a
-live server, memory use on a live server (the numbers above are estimates from row sizes), and the live feed's real
+**Not verified here:** the behaviour of Deephaven's own operators (`natural_join`, `where_in`, listeners) on a live server, memory use on a live server (the numbers above are estimates from row sizes), and the live feed's real
 column types. Run it once on the container and compare a few values with the old scripts.
-
-**One documented difference from TA-Lib / charting platforms:** the engine's EMA starts from the first value, TA-Lib starts
-from a simple average of the first n bars. The gap shrinks every bar, so the first bars after a candle restart differ slightly.

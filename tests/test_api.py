@@ -1,4 +1,4 @@
-"""The session functions (master_build, candles_start, indicators, straddle_start) and the plugin plumbing behind them."""
+"""The session functions (master_build, candles_start, straddle_start, nats_*, pf_*) and the plugin plumbing behind them."""
 import pytest
 
 import algo
@@ -7,7 +7,6 @@ from algo.core import app as app_module
 from algo.core.app import App
 from algo.core.config import NSE, Paths
 from algo.core.plugin import Plugin
-from algo.data.indicators import EMA, RSI, Indicators, group_by_bar, resolve_timeframe
 
 
 @pytest.fixture
@@ -20,117 +19,14 @@ def session(monkeypatch):
     return ns, app
 
 
-@pytest.fixture
-def no_build(monkeypatch):
-    """Indicators without a Deephaven query: record builds instead."""
-    builds = []
-    monkeypatch.setattr(Indicators, "_build", lambda self: builds.append(self.columns()))
-    return builds
-
-
 # ---- install ----------------------------------------------------------------------------------------
-def test_install_puts_the_functions_and_indicator_makers_in_the_session(session):
+def test_install_puts_the_functions_in_the_session_and_no_indicator_makers(session):
     ns, _ = session
-    for name in ("master_build", "candles_start", "candles_stop", "indicators", "indicators_remove",
-                 "straddle_start", "straddle_stop", "algo_status", "EMA", "RSI"):
+    for name in ("master_build", "candles_start", "candles_stop", "straddle_start", "straddle_stop", "algo_status", "algo_help",
+                 "contract", "pf_create", "nats_send", "algo_start"):
         assert callable(ns[name])
-    assert ns["EMA"](9).column == "EMA_9" and ns["RSI"](5).column == "RSI_5"
-
-
-# ---- indicators() adds, never replaces --------------------------------------------------------------
-def test_indicators_called_again_adds_to_the_running_set(session, no_build):
-    ns, app = session
-    ns["indicators"](ns["EMA"](9), ns["RSI"](5))
-    ns["indicators"](ns["EMA"](6))
-    assert app["indicators"].columns() == ["EMA_9", "RSI_5", "EMA_6"]
-    assert no_build == [["EMA_9", "RSI_5"], ["EMA_9", "RSI_5", "EMA_6"]]
-
-
-def test_a_repeated_indicator_is_not_computed_twice_or_rebuilt(session, no_build):
-    ns, app = session
-    ns["indicators"](EMA(9))
-    ns["indicators"](EMA(9))
-    assert app["indicators"].columns() == ["EMA_9"] and len(no_build) == 1
-
-
-def test_indicators_without_arguments_only_lists(session, no_build, capsys):
-    ns, _ = session
-    ns["indicators"](EMA(9))
-    ns["indicators"]()
-    assert "EMA_9" in capsys.readouterr().out and len(no_build) == 1
-
-
-def test_remove_drops_one_column_and_keeps_the_rest(session, no_build):
-    ns, app = session
-    ns["indicators"](EMA(9), RSI(5), EMA(6))
-    ns["indicators_remove"]("RSI_5", "NOPE")
-    assert app["indicators"].columns() == ["EMA_9", "EMA_6"]
-
-
-def test_a_bare_number_is_rejected_and_nothing_changes(session, no_build):
-    ns, app = session
-    ns["indicators"](EMA(9))
-    with pytest.raises(TypeError, match="not an indicator"):
-        ns["indicators"](9)
-    assert app["indicators"].columns() == ["EMA_9"]
-
-
-def test_a_failed_rebuild_rolls_the_set_back(session, no_build, monkeypatch):
-    ns, app = session
-    ns["indicators"](EMA(9))
-    monkeypatch.setattr(Indicators, "_build", lambda self: (_ for _ in ()).throw(RuntimeError("query failed")))
-    with pytest.raises(RuntimeError):
-        ns["indicators"](RSI(5))
-    assert app["indicators"].columns() == ["EMA_9"]
-
-
-def test_indicators_need_candles_and_say_which_function_to_call(monkeypatch):
-    monkeypatch.setattr(app_module, "_APP", None)
-    ns = {}
-    algo.install(ns, "NSE")
-    with pytest.raises(RuntimeError, match=r"candles_start\(\)"):
-        ns["indicators"](EMA(9))
-
-
-def test_indicator_bar_size_must_be_a_multiple_of_the_candle_size():
-    assert resolve_timeframe(None, 30, 30) == 30
-    assert resolve_timeframe("5min", 30, 30) == 300 and resolve_timeframe("1min", 60, 60) == 60
-    assert resolve_timeframe(None, 300, 60) == 300                      # falls back to the set default
-    with pytest.raises(ValueError, match="whole multiple"):
-        resolve_timeframe("30s", 60, 60)
-    with pytest.raises(ValueError):
-        resolve_timeframe("90s", 30, 30)
-    with pytest.raises(ValueError, match="whole multiple"):
-        resolve_timeframe("2min", 300, 300)
-
-
-def test_each_indicator_can_have_its_own_bar_size(session, no_build):
-    ns, app = session
-    ns["indicators"](ns["EMA"](9), ns["EMA"](9, "5min"), ns["RSI"](5, "15 MIN"))
-    assert app["indicators"].columns() == ["EMA_9", "EMA_9_5min", "RSI_5_15min"]
-    with pytest.raises(ValueError):
-        ns["EMA"](9, "7x")
-    with pytest.raises(ValueError):
-        ns["EMA"](9, 5)
-
-
-def test_grouping_by_bar_size_puts_the_finest_first():
-    e1, e5, r5, r15 = EMA(9), EMA(9, "5min"), RSI(5, "5min"), RSI(5, "15min")
-    g = group_by_bar([r15, e5, e1, r5], default_seconds=60, candle_seconds=60)
-    assert list(g) == [60, 300, 900] and g[300] == [e5, r5] and g[60] == [e1]
-    assert group_by_bar([e1], 300, 60) == {300: [e1]}                   # the set default applies to EMA(9)
-    assert group_by_bar([], 60, 60) == {60: []}                         # Pct only
-    with pytest.raises(ValueError):
-        group_by_bar([EMA(9, "30s")], 60, 60)                           # finer than the candles
-
-
-def test_helper_columns_do_not_clash_between_bar_sizes():
-    a, b = EMA(9), EMA(9, "5min")
-    assert a.final().split("=")[0].strip() == "EMA_9" and b.final().split("=")[0].strip() == "EMA_9_5min"
-    assert "EMA_9_5min_raw" in b.final() and "EMA_9_5min_raw" not in a.final()
-    r, q = RSI(5), RSI(5, "5min")
-    assert "AvgG_RSI_5_5min" in q.final() and "AvgG_RSI_5_5min" not in r.final()
-    assert "NULL_DOUBLE" in r.final() and "Math.round" not in r.final()
+    for gone in ("indicators", "indicators_remove", "EMA", "RSI", "last_indicators"):
+        assert gone not in ns                                                   # indicators are not a service any more
 
 
 # ---- the other starters -----------------------------------------------------------------------------
@@ -181,10 +77,15 @@ def test_master_build_takes_the_exchange(session, started):
     assert app_module.current() is app                      # same exchange: nothing is stopped
 
 
-def test_switching_exchange_stops_what_was_running_for_the_other_one(session, no_build, monkeypatch):
+def test_switching_exchange_stops_what_was_running_for_the_other_one(session, monkeypatch):
+    class Running(Plugin):
+        name = "running"
+
+        def start(self):
+            pass
     ns, app = session
-    ns["indicators"](EMA(9))
-    assert "indicators" in app.plugins
+    app.run(Running())
+    assert "running" in app.plugins
     monkeypatch.setattr(api, "_run", lambda plugin: None)         # do not build a real master
     ns["master_build"]("US")
     now = app_module.current()
@@ -228,18 +129,6 @@ def test_a_plugin_stops_following_when_it_stops():
     assert seen == [2]
 
 
-def test_indicators_follow_a_restarted_candles_table(monkeypatch):
-    monkeypatch.setattr(app_module, "_APP", None)
-    a = App({}, NSE, Paths())
-    a.shared["candle_seconds"] = 60
-    a.publish("candles", "old")
-    builds = []
-    monkeypatch.setattr(Indicators, "_build", lambda self: builds.append(self.app.table("candles")))
-    a.run(Indicators([EMA(9)]))
-    a.publish("candles", "new")
-    assert builds == ["old", "new"]
-
-
 # ---- instrument scope ---------------------------------------------------------------------------------
 def test_candles_start_passes_the_instrument_scope(session, started):
     ns, _ = session
@@ -247,28 +136,6 @@ def test_candles_start_passes_the_instrument_scope(session, started):
     assert started[-1].symbols == ["NIFTY"] and started[-1].kind == "FUT" and started[-1].bucket == 300
     ns["candles_start"]()
     assert started[-1].symbols is None and started[-1].kind is None
-
-
-def test_indicators_scope_is_set_once_and_changed_with_a_rebuild(session, no_build):
-    ns, app = session
-    ns["indicators"](EMA(9), kind="FUT")
-    assert (app["indicators"].symbols, app["indicators"].kind) == (None, "FUT")
-    ns["indicators"](RSI(5))                                           # no scope named: unchanged, one rebuild for the new column
-    assert app["indicators"].kind == "FUT" and len(no_build) == 2
-    ns["indicators"](symbols=["NIFTY"])                                # new scope alone: rebuild with the same columns
-    assert (app["indicators"].symbols, app["indicators"].kind) == (["NIFTY"], None) and len(no_build) == 3
-    ns["indicators"](symbols=["NIFTY"])                                # same scope again: nothing to do
-    assert len(no_build) == 3
-
-
-def test_a_failed_scope_change_rolls_back(session, monkeypatch):
-    ns, app = session
-    monkeypatch.setattr(Indicators, "_build", lambda self: None)
-    ns["indicators"](EMA(9), kind="FUT")
-    monkeypatch.setattr(Indicators, "_build", lambda self: (_ for _ in ()).throw(ValueError("no instruments")))
-    with pytest.raises(ValueError):
-        ns["indicators"](symbols=["NOPE"])
-    assert (app["indicators"].symbols, app["indicators"].kind) == (None, "FUT")
 
 
 # ---- NATS: one service, the six per-portfolio commands as plain functions -----------------------------
@@ -292,7 +159,7 @@ def test_pf_functions_say_the_service_is_down_instead_of_raising(session, capsys
     ns["pf_apply"](1913, ival=1)
     ns["nats_send"](True)
     out = capsys.readouterr().out
-    assert out.count("NATS service is not running") == 7 and "nats_start()" in out
+    assert out.count("NATS service is not running") == 7 and "nats_start(" in out
     assert "nats_start" in ns and "pf_apply" in ns
 
 
@@ -332,16 +199,24 @@ def test_pf_functions_explain_when_sending_is_off(session, capsys):
     svc.on_stop()
 
 
-def test_nats_start_takes_ip_and_port_and_remembers_them_until_stopped(session, monkeypatch, capsys):
+def test_nats_start_takes_ip_and_port_and_starting_again_does_not_restart_it(session, monkeypatch, capsys):
     ns, app = session
     monkeypatch.setattr(api, "_run", lambda plugin: app.plugins.__setitem__(plugin.name, plugin))
     ns["nats_start"]("10.0.0.5", 4333, users=[3, 4])
-    cfg = app["nats"].cfg
+    first = app["nats"]
+    cfg = first.cfg
     assert (cfg.ip, cfg.port, cfg.users, cfg.url) == ("10.0.0.5", 4333, (3, 4), "nats://10.0.0.5:4333")
-    ns["nats_start"]()                                             # nothing given: the same connection settings
-    assert (app["nats"].cfg.url, app["nats"].cfg.users) == ("nats://10.0.0.5:4333", (3, 4))
-    assert "same as the running connection" in capsys.readouterr().out
-    ns["nats_start"](port=4223, timeout_s=2)                       # changes only what is named
+    ns["nats_start"]()                                             # every algo script may call it: nothing happens
+    ns["nats_start"]("10.0.0.5", 4333, users=[3, 4])               # the same settings: nothing happens
+    ns["nats_start"](users=[3])                                    # a user the service already has: nothing happens
+    assert app["nats"] is first and "already running" in capsys.readouterr().out
+    with pytest.raises(RuntimeError, match="nats_restart"):         # different settings must be asked for on purpose
+        ns["nats_start"](port=4223)
+    with pytest.raises(RuntimeError, match="nats_add_user"):        # a new user is added without a restart
+        ns["nats_start"](users=[3, 4, 9])
+    assert app["nats"] is first and first.cfg.port == 4333
+    ns["nats_restart"](port=4223, timeout_s=2)                     # the restart: only what is named changes
+    assert app["nats"] is not first
     assert (app["nats"].cfg.url, app["nats"].cfg.users, app["nats"].cfg.timeout_s) == ("nats://10.0.0.5:4223", (3, 4), 2)
     ns["nats_stop"]()
     assert app.get("nats") is None
@@ -349,13 +224,13 @@ def test_nats_start_takes_ip_and_port_and_remembers_them_until_stopped(session, 
     assert app["nats"].cfg.url == "nats://192.168.1.130:4222" and app["nats"].cfg.users == (3,)
 
 
-def test_nats_start_sending_always_starts_off_and_rejects_a_bad_ip_or_port(session, monkeypatch):
+def test_nats_start_master_switch_is_on_by_default_and_a_bad_ip_or_port_is_rejected(session, monkeypatch):
     ns, app = session
     monkeypatch.setattr(api, "_run", lambda plugin: app.plugins.__setitem__(plugin.name, plugin))
-    ns["nats_start"]("10.0.0.5", 4222, send=True)
-    assert app["nats"].sending is True
-    ns["nats_start"]()
-    assert app["nats"].sending is False
+    ns["nats_start"]("10.0.0.5", 4222)
+    assert app["nats"].cfg.send_on is True                         # on for everyone; each algo still starts OFF
+    ns["nats_restart"](send=False)
+    assert app["nats"].cfg.send_on is False
     for bad in (dict(ip="nats://10.0.0.5:4222"), dict(ip="10.0.0.5:4222"), dict(ip=""), dict(port="abc"), dict(port=0),
                 dict(port=70000)):
         with pytest.raises(ValueError):
@@ -368,10 +243,10 @@ def test_nats_start_takes_one_user_or_several_and_rejects_nonsense(session, monk
     monkeypatch.setattr(api, "_run", lambda plugin: app.plugins.__setitem__(plugin.name, plugin))
     ns["nats_start"](users=4)
     assert app["nats"].cfg.users == (4,)
-    ns["nats_start"](users=[3, 4, 3])                               # duplicates are dropped, the order is kept
+    ns["nats_restart"](users=[3, 4, 3])                             # duplicates are dropped, the order is kept
     assert app["nats"].cfg.users == (3, 4)
     assert app["nats"].lift_blocks == (3, 4)                        # naming users lifts their blocks
-    ns["nats_start"]()                                              # remembered
+    ns["nats_restart"]()                                            # remembered
     assert app["nats"].cfg.users == (3, 4) and app["nats"].lift_blocks == ()     # a bare restart lifts nothing
     for bad in (0, -1, [], "abc", [3, "x"], True, [1.5]):
         with pytest.raises(ValueError):
@@ -441,3 +316,80 @@ def test_candles_start_passes_expiries_on_and_straddle_warns_when_candles_have_t
     ns["candles_start"]("1min", expiries=2)
     ns["straddle_start"](1)
     assert "warning" not in capsys.readouterr().out
+
+
+# ---- started once, then connected to --------------------------------------------------------------------------------------
+def test_nats_connect_only_checks_and_changes_nothing(session, capsys):
+    ns, app = session
+    assert ns["nats_connect"]() is False and "Start it once" in capsys.readouterr().out         # the service is not running
+    svc, wire = _with_nats(app, send_on=True, users=(3, 4))
+    app.plugins["nats"] = svc
+    before = (svc.cfg.users, svc.sending, set(svc._enabled))
+    assert ns["nats_connect"](user=4, client="bridge_nifty") is True
+    out = capsys.readouterr().out
+    assert "connected to the NATS service" in out and "bridge_nifty sending OFF" in out
+    assert ns["nats_connect"](user=9) is False and "nats_add_user(9)" in capsys.readouterr().out
+    assert (svc.cfg.users, svc.sending, set(svc._enabled)) == before and app["nats"] is svc    # nothing was started or changed
+    for bad in (0, "x", True):
+        with pytest.raises(ValueError):
+            ns["nats_connect"](user=bad)
+    svc.on_stop()
+
+
+def test_nats_add_user_adds_without_a_restart(session, capsys):
+    ns, app = session
+    ns["nats_add_user"](4)
+    assert "NOT sent" in capsys.readouterr().out                                                # not running: said, not raised
+    svc, wire = _with_nats(app, send_on=True, users=(3,))
+    app.plugins["nats"] = svc
+    ns["nats_add_user"]([4, 5])
+    assert svc.cfg.users == (3, 4, 5) and app["nats"] is svc
+    ns["pf_pause"](1, user=5)
+    assert wire.sent and wire.sent[0][2]["USERIDENTIFIER"] == 5
+    svc.on_stop()
+
+
+def test_nats_send_has_a_master_switch_and_one_for_each_algo(session, tmp_path):
+    ns, app = session
+    svc, wire = _with_nats(app, send_on=True)
+    app.plugins["nats"] = svc
+    from algo.strategy.book import Portfolios
+    from algo.strategy.bridge import Bridge
+    from algo.strategy.config import BridgeConfig
+    book = Portfolios(str(tmp_path / "m.json"), str(tmp_path / "s.json"), 1000)
+    bridge = Bridge(BridgeConfig(), name="bridge_nifty")
+    bridge.bind(svc, book)
+    bridge._bind(app)
+    app.plugins["bridge_nifty"] = bridge
+    seen = []
+    bridge.on_enable(lambda: seen.append("recheck"))
+    ns["nats_send"](True, client="bridge_nifty")                       # goes through the bridge, so the algo re-checks its zones
+    assert bridge.sending and seen == ["recheck"]
+    ns["nats_send"](True, client="console_panel")                      # a name with no bridge behind it: the service's own list
+    assert svc.is_enabled("console_panel")
+    ns["nats_send"](False, client="bridge_nifty")
+    assert not bridge.sending and svc.is_enabled("console_panel")      # only that one stopped
+    ns["nats_send"](False)                                             # the master switch
+    assert svc.sending is False and svc.pause(1, client="console_panel").result(5).status == "off"
+    ns["nats_send"](True)
+    assert svc.sending is True and svc.pause(1, client="console_panel").result(5).ok
+    svc.on_stop()
+
+
+def test_registry_start_twice_is_safe_and_registry_connect_only_checks(session, tmp_path, capsys, monkeypatch):
+    ns, app = session
+    assert ns["registry_connect"]() is False and "Start it once" in capsys.readouterr().out
+    from algo.strategy.registry import Registry
+    started = []
+    monkeypatch.setattr(api, "_run", lambda plugin: (started.append(plugin), app.plugins.__setitem__(plugin.name, plugin)))
+    ns["registry_start"]()
+    assert len(started) == 1
+    plugin = app["registry"]
+    plugin.state = Registry(str(tmp_path / "reg.json"))               # as start() would have made it
+    ns["registry_start"]()
+    ns["registry_start"]()
+    assert len(started) == 1 and app["registry"] is plugin             # every algo script may call it: nothing is restarted
+    assert "already running" in capsys.readouterr().out
+    with pytest.raises(RuntimeError, match="another file"):
+        ns["registry_start"](file=str(tmp_path / "other.json"))
+    assert ns["registry_connect"]() is True and "connected to the portfolio registry" in capsys.readouterr().out

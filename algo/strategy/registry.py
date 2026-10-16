@@ -13,7 +13,7 @@ What is remembered for each portfolio:
     owner     the book that numbers it, "book_stocks"             (the number belongs to this book; others are refused)
     created   when it was first registered, and a free `note`
 
-    registry.allocate(3, "book_stocks", start=1111, algo="rsi_stocks", name="RELIANCE")     -> 1111, reserved at once
+    registry.allocate(3, "book_stocks", start=1001, algo="rsi_stocks", name="RELIANCE")     -> 1001, reserved at once
     registry.register(3, 1001, "console")               -> Claim(ok=True, "registered")   or  Claim(ok=False, "taken", held_by="book_stocks")
 
 Numbers are never reused: a portfolio that is retired keeps its number, because it may still hold a position or an order history.
@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
+from algo.core.config import FIRST_PF
 from algo.core.files import replace_with_retry
 from algo.core.plugin import Plugin
 
@@ -203,7 +204,7 @@ class Registry:
         return lambda: self._listeners.remove(fn) if fn in self._listeners else None
 
     # ---- getting numbers ----------------------------------------------------------------------
-    def allocate(self, user: int, owner: str, start: int = 1, note: str = "", algo: str = "", name: str = "") -> int:
+    def allocate(self, user: int, owner: str, start: int = FIRST_PF, note: str = "", algo: str = "", name: str = "") -> int:
         """The next free number for `user`, reserved for `owner` before it is returned.
 
         An owner that has none yet gets `start` (or the first free number above it); an owner that has some gets the number after its
@@ -219,7 +220,7 @@ class Registry:
                              "note": _text(note)})
             return n
 
-    def create(self, user: int, strategy: str, name: str, *, start: int = 1111, note: str = "") -> int:
+    def create(self, user: int, strategy: str, name: str, *, start: int = FIRST_PF, note: str = "") -> int:
         """The whole interface an algo needs: create(user, strategy, name) -> the portfolio number.
 
         The number is the next free one for `user`, reserved before it is returned, so nobody else can be given it. `strategy` is
@@ -311,7 +312,7 @@ class PortfolioRegistry(Plugin):
         if self.rows is not None:
             self.rows.write_row(user, pf, rec["name"], rec["algo"], rec["owner"], rec["created"], rec["note"])
 
-    def create(self, user: int, strategy: str, name: str, *, start: int = 1111, note: str = "") -> int:
+    def create(self, user: int, strategy: str, name: str, *, start: int = FIRST_PF, note: str = "") -> int:
         """`app["registry"].create(user, strategy, name)` -> the portfolio number. See Registry.create."""
         if self.state is None:
             raise RuntimeError("the portfolio registry is not running")

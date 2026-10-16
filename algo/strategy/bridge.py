@@ -2,8 +2,9 @@
 
 `Bridge` holds no connection of its own. It knows the portfolio book and the order of commands for a swap, a retire, an
 exit; the service does the sending, keeps the commands of one portfolio in order and lets different portfolios overlap.
-The service's `send_on` switch decides whether anything leaves the process at all: with it off, signals are still
-computed but no command is sent.
+Each bridge is one named client of the service and has its own sending switch (`send_on()` / `send_off()`, starting OFF), so
+one algo stopping never stops another. A command goes out only while the service's master switch AND this bridge's own switch
+are on; with either off, signals are still computed but no command is sent.
 """
 from __future__ import annotations
 
@@ -30,8 +31,10 @@ async def _step(call: Call, cmd: str, payload: dict | None, what: str) -> Reply:
 class Bridge(Plugin):
     name = "bridge"
 
-    def __init__(self, cfg: BridgeConfig = BridgeConfig(), name: str = "bridge", book: str = "book", nats: str = "nats"):
+    def __init__(self, cfg: BridgeConfig = BridgeConfig(), name: str = "bridge", book: str = "book", nats: str = "nats",
+                 client: str | None = None):
         super().__init__(name)
+        self.client = client or name                      # the name of this sender in the NATS service: its own sending switch
         self.requires = (book,)                           # the NATS service may start later, or be restarted
         self.book_name, self.nats_name = book, nats
         self.cfg = cfg
@@ -43,6 +46,7 @@ class Bridge(Plugin):
     # ---- lifecycle ---------------------------------------------------------------------------
     def start(self) -> None:
         self.bind(None, self.app[self.book_name].state)
+        self.nats.disable(self.client)                    # every start begins OFF, even a re-paste of an algo that was sending
         self.log.info("sending through %s: %s", self.nats_name, self.nats.describe())
         book_user = getattr(self.book, "user", None)
         if self.cfg.user is not None and book_user is not None and self.cfg.user != book_user:
@@ -72,8 +76,9 @@ class Bridge(Plugin):
 
     @property
     def state(self) -> str:
-        """For a UI: service_down, disconnected, dry, off or on."""
-        return self.nats.state
+        """For a UI: service_down, disconnected, dry, off or on (off also when this bridge has not switched sending on)."""
+        base = self.nats.state
+        return "off" if base == "on" and not self.nats.is_enabled(self.client) else base
 
     async def _pause(self, call: Call, pf: int, action: str) -> Reply:
         """Pause or unpause; the book is told only after the bridge has answered ok."""
@@ -95,7 +100,8 @@ class Bridge(Plugin):
 
     @property
     def sending(self) -> bool:
-        return self.nats.sending
+        """May this bridge send right now? The service's master switch and this bridge's own switch are both on."""
+        return self.nats.allowed(self.client)
 
     @property
     def dry_run(self) -> bool:
@@ -113,12 +119,13 @@ class Bridge(Plugin):
         return lambda: self._halt_cbs.remove(callback) if callback in self._halt_cbs else None
 
     def send_off(self) -> None:
-        """Keep computing signals but send nothing. A swap already in flight finishes."""
-        self.nats.send_off()
+        """This algo keeps computing signals but sends nothing; other algos are not affected. A swap in flight finishes."""
+        self.nats.disable(self.client)
         self.book.changed()
 
     def send_on(self) -> bool:
-        if not self.nats.send_on():
+        """This algo may send (it starts OFF). The service's master switch must be on too."""
+        if not self.nats.enable(self.client):
             return False
         self.book.changed()
         for cb in list(self._enable_cbs):
@@ -127,7 +134,7 @@ class Bridge(Plugin):
 
     def submit(self, coro: Awaitable) -> bool:
         """Run a workflow (such as `swap`) without waiting. Returns False (and drops it) while sending is off."""
-        return self.nats.go(coro) is not None
+        return self.nats.go(coro, client=self.client) is not None
 
     # ---- command sequences ---------------------------------------------------------------------
     async def retire(self, old_pf: int) -> None:
@@ -144,7 +151,7 @@ class Bridge(Plugin):
                 if not reply.ok:                           # already paused and squared up: do not block the new PF
                     self.log.warning("unsubscribe of old PF %s not ok (left paused): %s", old_pf, reply.status)
 
-        await self.nats.lane(old_pf, job, user=self.user)
+        await self.nats.lane(old_pf, job, user=self.user, client=self.client)
 
     async def swap(self, pf: int, token: int, option: int, params: dict, prev_leg, prev_option,
                    old_pf: int | None = None) -> None:
@@ -165,7 +172,7 @@ class Bridge(Plugin):
         try:
             if old_pf is not None:
                 await self.retire(old_pf)
-            await self.nats.lane(pf, job, user=self.user)
+            await self.nats.lane(pf, job, user=self.user, client=self.client)
         except Exception as e:
             if old_pf is not None and book.subscribed.get(pf) is None:   # the new PF never reached the bridge
                 book.revert(token, old_pf, pf)
@@ -200,8 +207,10 @@ class Bridge(Plugin):
         if not self.sending:
             if self.nats is NO_SERVICE:
                 self.log.warning("%s NOT sent: the NATS service is not running (nats_start())", what)
+            elif not self.nats.sending:
+                self.log.info("[OFF] %s NOT sent: sending is off for everyone (nats_send(True))", what)
             else:
-                self.log.info("[OFF] %s NOT sent", what)
+                self.log.info("[OFF] %s NOT sent: %s has not switched sending on (send_on())", what, self.client)
             return False
         return True
 
@@ -218,7 +227,7 @@ class Bridge(Plugin):
         if self._dry(f"pause {pf}"):
             self.book.set_paused(pf, True)
         else:
-            return self._after_pause(self.nats.pause(pf, user=self.user), pf, True)
+            return self._after_pause(self.nats.pause(pf, user=self.user, client=self.client), pf, True)
 
     def unpause_pf(self, pf: int) -> "Future | None":
         if not self._guard(f"unpause PF {pf}"):
@@ -226,13 +235,13 @@ class Bridge(Plugin):
         if self._dry(f"unpause {pf}"):
             self.book.set_paused(pf, False)
         else:
-            return self._after_pause(self.nats.unpause(pf, user=self.user), pf, False)
+            return self._after_pause(self.nats.unpause(pf, user=self.user, client=self.client), pf, False)
 
     def squareup_pf(self, pf: int) -> "Future | None":
         """The console only allows this while the PF is paused."""
         if not self._guard(f"squareup PF {pf}"):
             return None
-        fut = None if self._dry(f"squareup {pf}") else self.nats.squareup(pf, user=self.user)
+        fut = None if self._dry(f"squareup {pf}") else self.nats.squareup(pf, user=self.user, client=self.client)
         t = self.book.token_of_pf(pf)
         if t is not None:
             self.book.set_live(t, None)                    # a later signal may start this portfolio again
@@ -243,7 +252,7 @@ class Bridge(Plugin):
             return
         for pf in self.book.all_pfs():
             if not self._dry(f"pause {pf}"):
-                self._after_pause(self.nats.pause(pf, user=self.user), pf, True)
+                self._after_pause(self.nats.pause(pf, user=self.user, client=self.client), pf, True)
 
     def unpause_all(self) -> None:
         """Current portfolios only: a retired one stays paused."""
@@ -251,7 +260,7 @@ class Bridge(Plugin):
             return
         for pf in self.book.current_pfs():
             if not self._dry(f"unpause {pf}"):
-                self._after_pause(self.nats.unpause(pf, user=self.user), pf, False)
+                self._after_pause(self.nats.unpause(pf, user=self.user, client=self.client), pf, False)
 
     def exit_all(self) -> None:
         """Pause + square up every portfolio."""
@@ -259,7 +268,7 @@ class Bridge(Plugin):
             return
         for pf in self.book.all_pfs():
             if not self._dry(f"pause + squareup {pf}"):
-                self.nats.submit(pf, self._exit_job(pf), user=self.user, label="exit")
+                self.nats.submit(pf, self._exit_job(pf), user=self.user, client=self.client, label="exit")
         for t in list(self.book.tracked):
             self.book.set_live(t, None)
 
@@ -273,7 +282,7 @@ class Bridge(Plugin):
             cb()
         pfs = self.book.current_pfs()
         for pf in pfs:
-            self.nats.submit(pf, self._unsubscribe_job(pf), user=self.user, label="unsubscribe")
+            self.nats.submit(pf, self._unsubscribe_job(pf), user=self.user, client=self.client, label="unsubscribe")
         for t in list(self.book.tracked):
             self.book.set_live(t, None)
         self.log.info("unsubscribing %d portfolio(s), watch the log", len(pfs))

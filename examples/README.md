@@ -1,0 +1,88 @@
+# The examples
+
+Written for: you, using the services from the Deephaven terminal. Plain function calls and plain scripts: **no example asks you to define a class.**
+Each file is meant to be pasted (or run) in the terminal after `import algo; algo.install(globals(), "NSE")`. `algo_help()` lists every function.
+
+| file | what it is |
+|---|---|
+| `00_services.py` | starts the shared services **once** for everyone: master, candles, registry, NATS (users 3 and 4) |
+| `01_lookups.py` | look up any contract, and read the latest price and candles |
+| `02_manual_trade.py` | a trade by hand: find the option, take a portfolio number, send subscribe / pause / apply / unpause |
+| `03_algo_template.py` | **an automation as a plain script**: your settings, a few functions, two listeners. Copy it for a new one |
+| `04_nifty_multistrike.py` | your NIFTY automation with `N_STRIKES` strikes, as a plain script (functions and listeners, like your old one) |
+
+An automation script uses only the five services, through functions: `contract` / `strikes` / `nearest_strikes` (master), `last_price` and the
+table `candles` (candles), `algo_start` / `pf_assign` / `pf_activate` (the book and NATS) and `nats_send`.
+
+Every file is tested: `tests/test_examples.py` runs all five for real in an installed console against the master, candles, registry and NATS
+service (fake data and a fake connection). None of this has run on a live Deephaven yet.
+
+## 0. The order: start once, then every script connects
+
+```
+00_services.py      once a day, by one person or at the end of init.py:  master, candles, registry_start(), nats_start(users=[3, 4])
+01, 02              plain calls, any time
+03, 04              nats_connect(user=..) registry_connect() algo_start(..) ... listeners ... nats_send(True, client="<its name>")
+```
+- **A script never starts a shared service.** `nats_connect` and `registry_connect` only check that they are up (and that the user may send);
+  they start and change nothing. Any number of scripts can start, stop and be re-pasted without disturbing each other.
+- **`nats_start` and `registry_start` are safe to call twice** (they do nothing the second time) and refuse to change a running service with other
+  settings; that is `nats_restart`, on purpose. A new user is added with `nats_add_user(5)`, no restart.
+- **Every automation starts OFF and switches itself on:** `nats_send(True, client="nifty_multi")`; `nats_send(False, client=...)` stops only that one,
+  `nats_send(False)` is the master switch for everyone. A command goes out only when both are on. A typed command (example 02) needs only the master switch.
+- **Data is started once too:** `candles_start` restarts the candle table every time it is called, so it is in `00_services.py`, not in a script.
+  (`candles_start` and `master_build` are not yet "start-once" like NATS and the registry.)
+- **Reading is cheap, but not free.** `last_price` and the others make a short-lived filtered table; do not call them on every update. Inside a
+  listener use the update's own data (`update.added(...)`), as 03 and 04 do, and `show=False` on the lookups.
+
+## 1. What the services do that your old scripts did themselves
+
+| the old script did this itself | now done by |
+|---|---|
+| connect to NATS, one asyncio loop, per-PF locks, `MAX_PARALLEL`, `SEND_ON`, reply handling | the **NATS service** (started once; `nats_connect`, `nats_send(client=...)`); errors come back as a status, nothing raises |
+| `last_pf()`, `new_pf()`, `PF_MAP_FILE`, `PF_SUB_FILE`, `PF_START`, never reuse a number | the **registry** (numbers, unique per user) and the **book** (stock -> portfolio, caps, paused, live): `pf_assign` |
+| the order of commands: retire old, subscribe, pause, apply, unpause, roll back on failure | the **bridge**: `pf_activate` |
+| `PRICE_DIV = 100`, RSI as int x100, Pct as int x100 | candles are already in rupees (doubles); the script computes its own RSI (0 to 100) |
+| option sizing (`floor_tick`, `ceil_tick`, `_on_tick`, ival/jval/sval/trp/ranges) | `order_params(...)`, a plain function inside the script (sizing is strategy logic, not infra) |
+| the master lookups (`OPT_IDX`, `EXPIRIES`, `FUT_INFO`, `TICK_OF`) | `contract`, `expiries`, `strikes`, `nearest_strikes` |
+
+What stays in your script is the part that is yours: the settings, which option, how much, when.
+
+## 2. Where each old constant goes
+
+| old constant | now |
+|---|---|
+| `USER_ID` | `USER = 4` in the script, `algo_start(USER, ...)`, and the user in `nats_start(users=[3, 4])` |
+| `NATS_URL` | `nats_start("192.168.1.130", 4222, ...)` in `00_services.py` (see gap 2) |
+| `SENDER`, `TIMEOUT_S`, `MAX_PARALLEL` | `nats_start(sender=, timeout_s=, max_in_flight=)`; the defaults are AUTOMATION, 5 and 64 |
+| `PF_START` | `algo_start(..., pf_start=1001)` |
+| `PF_MAP_FILE`, `PF_SUB_FILE` | `algo_start(..., map_file=, sub_file=)` to keep the portfolios of the stocks script; the numbers are also in the registry |
+| `SUB_PAYLOAD` | `nats_start(sub_payload={...})`: one for the whole service (see gap 1). The stocks one is the default |
+| `APPLY_PARAMS`, `OPT_IVAL_PCT`, `OPT_RANGE_*_PCT`, `TRP_PCT`, `JVAL_FRAC`, `SVAL_MULT` | the `SIZING` dict and `order_params(...)` inside the script |
+| `ADD_QTY`, `UNSUBSCRIBE_ON_RETIRE`, `SQUAREUP_ON_REPOINT` | `algo_start(..., add_qty=, unsubscribe_on_retire=, squareup_on_repoint=)` |
+| `RSI_HIGH`, `RSI_LOW`, `N_STRIKES`, `STRIKE_MODE`, `STRIKE_GAP`, `OPT_EXPIRY_IDX`, `FAIL_COOLDOWN_S` | constants at the top of your script (04 has them all) |
+| `TRADE_START`, `TRADE_END` | a constant in your script (04 has `WINDOW`); the exchange's own window is NSE 9:20 to 15:00 |
+| `SEND_ON` | `nats_send(True, client="<its name>")`, per automation; it starts OFF |
+| `RESET_ON_START`, `ACT_ON_START` | what the script does at the end: 03 and 04 start acting on the next RSI update; `pf_leg` / `pf_mark` reset a leg |
+| the operator functions (`pause_all`, `exit_all`, `unsubscribe_all` ...) | `algo_pause`, `algo_exit`, `algo_unsubscribe`, `algo_portfolios` |
+
+## 3. What is not covered (be aware)
+
+1. **The subscribe payload belongs to the NATS service, not to a script.** Stocks (`maxloss -1000`, `max_unhedge 1`) and NIFTY (`-400`, `3`) need
+   different ones; with both running on one service, one of them subscribes with the wrong payload. It should be a setting of each automation.
+2. **One NATS service means one NATS server.** Your stocks script used `192.168.1.130` and the NIFTY one `192.168.1.104`. If those are two servers,
+   two services are needed (the class supports a name; `nats_start` does not yet). `00_services.py` uses `.130` for both.
+3. **Old files.** The stocks files (`token -> pf`) are read as they are (`algo_start(..., map_file=, sub_file=)`). The NIFTY file has `token:slot`
+   keys: the book refuses it with a clear message and leaves it untouched; use a new file (the registry has the numbers).
+4. **Not in example 04, a few lines each:** the old `blocked` set (a slot you squared up by hand stays off until the RSI leaves its zone),
+   `unsubscribe_pf` for one portfolio (use `pf_unsubscribe` / `pf_squareup`), and re-checking the RSI at the moment the automation is switched on.
+5. **The stocks logic (baskets, the middle-half filter by percent-from-open, `stocks.txt`)** is not provided as a function: write it in the script,
+   as in the old `automation_rsi.py`; `03_algo_template.py` is the shape. There is no packaged strategy any more.
+6. **The console's per-instrument checkbox** keys on the signal future. A slot (`future * 100 + k`) is not a future, so the console will not show
+   the three strikes as separate stocks.
+
+## 4. Still open (decisions for you)
+
+1. Make the **subscribe payload** a setting of each automation (gap 1)?
+2. Are `.130` and `.104` **two NATS servers**? If so, should one session talk to both?
+3. Should the stocks logic (baskets and the mid filter) be a ready function, or stay in your script?

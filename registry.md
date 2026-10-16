@@ -8,7 +8,7 @@ Code: `algo/strategy/registry.py`.
 | field | meaning | example |
 |---|---|---|
 | **user** | the user it belongs to (with the number, the unique id) | 3 |
-| **pf** | the portfolio number | 1111 |
+| **pf** | the portfolio number. Numbering starts at **1001** (`FIRST_PF` in `algo/core/config.py`) for every user unless an algo gives its own `pf_start` | 1001 |
 | **name** | what it trades | `RELIANCE` |
 | **algo** | the strategy or screen that uses it | `rsi_stocks` |
 | **owner** | the book that numbers it; only this book may change the record | `book_stocks` |
@@ -19,7 +19,7 @@ It is kept in a file, so a restart, or a later session, sees all of it. In the s
 - **`portfolio_registry`**: one row per portfolio, always the *current* values (User, PF, Name, Algo, Owner, Created, Note).
 - **`portfolio_registry_log`**: every change as its own row, so you can see an algo taking a portfolio over.
 
-**Name and algo are filled in by the algo itself.** When `RsiOptions` creates a portfolio it records `name` = the stock and `algo` = its own name; every time it
+**Name and algo are filled in by the algo itself.** When a script's `pf_assign` creates a portfolio it records `name` = the stock and `algo` = its own name; every time it
 acts on a portfolio it already has, it records them again (the file is written only if something changed). So if two algos share one book (as the stocks
 and NIFTY scripts do), the `algo` column still says which one is using each portfolio. A portfolio that came from the old files starts with a blank
 name and algo and is filled in the first time an algo acts on it. Another algo taking a portfolio over shows up as a change of `algo`.
@@ -56,24 +56,25 @@ pf_list(3)                               # who holds what for user 3;  pf_list()
 
 Bad input (a user or number that is not a whole number above 0, an empty owner) is an error and registers nothing.
 
-## Books and algos
+## Books and automations
 
-**The book assigns; the algo never picks a number.** An algo tells its book what it needs, `book.assign(token, option, name, algo)`, and the book answers
-`(pf, old_pf, created)`: it keeps the stock's portfolio while the option is the same, makes a new one (numbered by the registry, as the book's user) when the
-stock has none or moves to another option, and says which portfolio retires. `book.plan(token, option)` shows what `assign` would do without
-doing it (used by the dry run). The algo has no number to pass and no create call; a test checks that `rsi_options.py` never calls `book.create`.
-One book belongs to one user, so an algo that trades for several users has one book per user.
+**The book assigns; your script never picks a number.** `pf_assign("stocks", token, option, name="RELIANCE")` asks the automation's book what it needs
+and answers with the portfolio: it keeps the stock's portfolio while the option is the same, makes a new one (numbered by the registry, as the
+automation's user) when the stock has none or moves to another option, and says which portfolio retires (`old_pf`). There is no number to pass and no
+create call; a test checks that the example scripts never number a portfolio themselves. One automation belongs to one user, so a script that
+trades for several users registers one automation per user.
 
 ```python
-registry_start()
-app.run(algo.Book(user=3, name="book_stocks", pf_start=1111))     # numbers come from the registry, as user 3
-app.run(algo.Book(user=3, name="book_nifty",  pf_start=1555))     # a second strategy for the same user: no overlap possible
-app.run(algo.Book(user=4, name="book_u4",     pf_start=1111))     # another user may use the same numbers
+registry_start()                                          # once, for everyone
+algo_start(3, "stocks", pf_start=1001)                    # an automation: its user, its name, where its numbers begin
+algo_start(3, "nifty",  pf_start=1555)                    # a second one for the same user: the two can never be given the same number
+algo_start(4, "other",  pf_start=1001)                    # another user may use the same numbers
+algo_start(3, "stocks", map_file="/data/stocks_pf.json", sub_file="/data/stocks_pf_sub.json")   # keep an older script's portfolios
 ```
-- A `Book` with a `user` needs the registry running. A `Book` without a `user` numbers itself the old way (no check).
-- When such a book starts it **registers the numbers already in its files**. If one of them is held by somebody else for that user it logs
-  `CLASH: ...` for each: that is a real duplicate, and a person has to decide which side changes.
-- A `Bridge` sends as the user of its book unless `BridgeConfig(user=...)` says otherwise (it warns if the two differ).
+- `algo_start` needs the registry running (it says so if not).
+- With `map_file` / `sub_file` it **registers the numbers already in those files**. If one of them is held by somebody else for that user it logs
+  `CLASH: ...` for each: that is a real duplicate, and a person has to decide which side changes. A file in another format is refused and not touched.
+- The bridge sends as the automation's user.
 
 ## What is kept
 

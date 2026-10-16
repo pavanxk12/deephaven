@@ -9,7 +9,7 @@ Code: `algo/comms/nats_service.py` (the service) and `algo/strategy/bridge.py` (
 ## 1. The picture
 
 ```
- algo (RsiOptions)    console buttons    you (pf_pause(...))    any other plugin
+ your script          console buttons    you (pf_pause(...))    any other plugin
         │                    │                    │                     │
         └──── Bridge ────────┘                     │                     │
               swap / retire / exit                 │                     │
@@ -65,7 +65,7 @@ All three use the same calls. They only differ in how they look at the answer.
 
 | caller | how | how it learns the outcome |
 |---|---|---|
-| **an algo** (`RsiOptions`) | `bridge.submit(bridge.swap(...))` → runs *retire old PF → subscribe → pause → apply → unpause* | each step is checked; the first that is not `ok` stops the sequence, leaves the portfolio paused, rolls the book back, waits `fail_cooldown_s` before retrying that stock, and writes a `swap failed` row to `nats_events` |
+| **a script of yours** (`pf_activate`) | `bridge.submit(bridge.swap(...))` → runs *retire old PF → subscribe → pause → apply → unpause* | each step is checked; the first that is not `ok` stops the sequence, leaves the portfolio paused, rolls the book back, waits `fail_cooldown_s` before retrying that stock, and writes a `swap failed` row to `nats_events` |
 | **the console buttons** | `bridge.pause_pf(pf)`, `unpause_pf`, `squareup_pf`, `pause_all`, `exit_all`, ... | the call returns a `Future`; failures appear in `nats_events` and the log |
 | **you in the console** | `pf_pause(1913)`, `pf_apply(1913, ival=1.1, ...)` ... | prints `PF 1913 pause: ok - ok` or `NOT ok - timeout` |
 | **other code** | `svc = app["nats"]`, `svc.pause(pf)` | `.result(5)` gives a `Reply` |
@@ -79,11 +79,33 @@ lane and returns a `Future`.
 To run several commands back to back on one portfolio with nothing from that portfolio in between, use
 `svc.submit(pf, job)`. `Bridge.swap` is built this way.
 
-### The send switch
+### Started once, connected to by everyone
 
-`nats_send(False)` (or `bridge.send_off()`): strategies keep computing signals, but **nothing new is accepted**; every call is answered
-`off` at once. A sequence that has already started finishes. `nats_send(True)` turns it on. It starts OFF every time.
-`nats_start(dry_run=True)` opens no connection and only logs `[DRY] ...`, answering `dry`.
+There is ONE service for all the algos and the UI. It is started once (`examples/00_services.py`), and an algo or the UI never starts it:
+
+| who | calls | what it does |
+|---|---|---|
+| whoever runs the services, once | `nats_start("192.168.1.130", 4222, users=[3, 4])` | starts the service for **all** the users |
+| every algo script | `nats_connect(user=4, client="bridge_nifty")` | only **checks** that the service is up and that user 4 may send; starts and changes nothing |
+| you, on purpose | `nats_restart(port=4223)` | stops and starts it again; this cuts every algo off for a moment |
+| you, on purpose | `nats_add_user(5)` | lets one more user send, **without** a restart |
+
+`nats_start` is safe to call again: with the same settings (or none) it prints `already running; nothing changed` and does nothing, so every
+script may call it. With different settings it **raises an error** pointing to `nats_restart`, because an algo script must never restart the
+service the others are using. The same goes for `registry_start` / `registry_connect`.
+
+### The send switches: one master, one for each algo and the UI
+
+| switch | where | default | effect |
+|---|---|---|---|
+| **master** | `nats_send(False)` / `nats_send(True)` | ON once started | OFF stops sending for **everyone** |
+| **each algo / the UI** | `nats_send(True, client="bridge_nifty")` (or `bridge.send_on()`) | **OFF**, until it says so | stops or starts only that algo |
+
+A command goes out only when the master switch AND its own algo's switch are both on, so one algo stopping never stops another. A typed
+command (`pf_pause(...)`) has no algo behind it and only needs the master switch. A bridge's name is its client name (`bridge`, `bridge_nifty`).
+When the service is restarted every algo is OFF again and has to say `send` again. A refused command is answered `off` with the reason in
+`reply.data["detail"]` (`sending is off for everyone`, or `<name> has not switched sending on`). `nats_start(dry_run=True)` opens no connection and
+only logs `[DRY] ...`, answering `dry`.
 
 ---
 
@@ -122,9 +144,9 @@ blocked, unblocking one of their portfolios does not help: unblock the user.
 A blocked command is answered **`blocked`** at once and a row is written to `nats_events`. A block also stops the *rest of a sequence that is already
 under way* (a swap stops at its next step and rolls back), and it stops **squareup too**: blocking really means nothing goes out for that
 user or portfolio, so if you block one that holds a position, you have to square it up some other way or unblock first.
-Blocks stay through `nats_stop()` and `nats_start()`, and through a NATS outage, but are lost if Deephaven itself restarts (they are not saved to a file).
-**Naming a blocked user in `nats_start(users=[...])` unblocks that user and every portfolio under them** (you are allowing them again), and the log
-says so. A bare `nats_start()` (a plain reconnect) keeps every block.
+Blocks stay through `nats_stop()`, `nats_start()` and `nats_restart()`, and through a NATS outage, but are lost if Deephaven itself restarts (they are not saved to a file).
+**Naming a blocked user in the first `nats_start(users=[...])` or in `nats_restart(users=[...])` unblocks that user and every portfolio under them**
+(you are allowing them again), and the log says so. A repeated `nats_start()` or a bare `nats_restart()` keeps every block.
 
 ---
 
@@ -137,7 +159,7 @@ says so. A bare `nats_start()` (a plain reconnect) keeps every block.
 
 The bridge looks the service up **every time** it needs it. So `nats_stop()` followed by `nats_start()` (new ip or port, say) is picked up at
 once by every algo and the console, with no restart. An algo can even be started before `nats_start()`; it computes, sends nothing, and
-starts sending when you `nats_start()` and `nats_send(True)`.
+starts sending when the service is started and the algo says `nats_send(True, client=...)`.
 
 `bridge.state` (and `svc.state`) is one word a UI can show: `service_down`, `disconnected`, `dry`, `off` or `on`.
 
@@ -218,15 +240,18 @@ Every command the bridge **accepted** is also a row in `cmd_queue_automated` (th
 | `max_in_flight` | 64 | requests on the wire at once, all portfolios together (0 = no cap) |
 | `lane_depth` | 256 | jobs waiting per portfolio |
 | `subject` | `cmd.hft.{pf}` | where each portfolio's commands go |
-| `send_on` | `False` | start with sending ON |
+| `send_on` | `False` | the master switch at start (`nats_start` sets it ON; each algo is still OFF) |
 | `dry_run` | `False` | no connection, log only |
 | `sub_payload` | the default subscribe fields | sent on `subscribe` / `unsubscribe`; only `T1` changes |
 
 ```python
-nats_start("192.168.1.130", 4222, users=[3, 4])          # connect, sending OFF, for users 3 and 4
-nats_start()                                             # again: the same ip, port and settings are remembered
-nats_start(port=4223)                                    # again, changing only the port
-nats_send(True)
+nats_start("192.168.1.130", 4222, users=[3, 4])          # ONCE: start the shared service for users 3 and 4 (master switch ON)
+nats_start()                                             # again: nothing happens ("already running"), so any script may call it
+nats_connect(user=4, client="bridge_nifty")              # what an algo calls: only checks that the service is up and user 4 may send
+nats_send(True, client="bridge_nifty")                   # this algo may send (it starts OFF);  nats_send(False, client=...) stops only it
+nats_add_user(5)                                         # one more user, no restart
+nats_restart(port=4223)                                  # on purpose: stop and start again (every algo goes back to OFF)
+nats_send(False)                                         # the master switch: nothing is sent for anyone
 nats_stop()                                              # stops it and forgets the ip and port
 ```
 
