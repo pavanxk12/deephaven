@@ -8,8 +8,8 @@ from algo.core.nulls import NULL_DOUBLE, NULL_LONG, as_float, good_price, good_v
 from algo.data.candles import CandleAggregator, Candles, LttParser
 from algo.series.straddle import StraddleConfig, StraddleEngine
 from algo.strategy.book import Portfolios
-from algo.strategy.bridge import Bridge
-from algo.strategy.config import BridgeConfig, RsiOptionsConfig
+from algo.comms.nats_service import NatsConfig, NatsService
+from algo.strategy.config import RsiOptionsConfig
 from algo.strategy.picker import OptionPicker
 from algo.strategy.sizing import on_tick, option_params
 from tests.test_bridge import make
@@ -190,25 +190,26 @@ def test_submit_on_a_closed_loop_returns_false_instead_of_raising(tmp_path):
     b, book, fake = make(tmp_path)
     dead = asyncio.new_event_loop()
     dead.close()
-    real, b.loop = b.loop, dead
+    real, b.nats.loop = b.nats.loop, dead
 
     async def noop():
         return 1
     assert b.submit(noop()) is False
-    b.loop = real
-    b.on_stop()
+    b.nats.loop = real
+    b.nats.on_stop()
 
 
 def test_bridge_stop_twice_is_harmless(tmp_path):
     b, _, _ = make(tmp_path)
-    b.on_stop()
-    b.on_stop()
-    assert b.loop is None and b.submit(asyncio.sleep(0)) is False
+    b.nats.on_stop()
+    b.nats.on_stop()
+    assert b.nats.loop is None and b.submit(asyncio.sleep(0)) is False
 
 
 def test_dry_run_bridge_has_no_loop_and_never_sends():
-    b = Bridge(BridgeConfig(dry_run=True))
-    assert b.loop is None and b.transport is None
+    svc = NatsService(NatsConfig(dry_run=True))
+    svc.connect()
+    assert svc.loop is None and svc.transport is None and svc.send_on() is False
 
 
 def test_a_briefly_locked_state_file_is_retried(tmp_path, monkeypatch):

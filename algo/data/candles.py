@@ -123,15 +123,18 @@ class Candles(Plugin):
     COLS = ["token", "ltp", "vol", "ltt"]
     GRACE_S = 10          # a minute is closed this many seconds after its end
     SLOW_BATCH_MS = 250   # a feed batch that takes longer than this holds up every table in the update cycle: say so
+    ROW_BYTES = 56        # one candle row: Minute, token, Open, High, Low, Close, Volume (8 bytes each)
+    WARN_MB = 500         # say so loudly when a full session of candles is likely to take more than this
 
     def __init__(self, timeframe: str = "1min", multiplier: float | None = None, *, symbols=None, kind: str | None = None,
-                 build_from: int | None = None, decimals: int = 6):
+                 expiries: int | None = None, build_from: int | None = None, decimals: int = 6):
         """timeframe: "30s", "1min", "5min", "15min". multiplier: applied to every feed price to get proper rates
         (feed in paise -> 0.01); None = each contract's own Divisor from the contract file. symbols / kind: build only
-        these underlyings (["NIFTY"]) and kinds ("FUT", "OPT", "EQ"); None = everything in the feed. build_from: epoch
-        second of the first bar to build; None = the next full bar."""
+        these underlyings (["NIFTY"]) and kinds ("FUT", "OPT", "EQ"); None = everything in the feed. expiries: keep only
+        each underlying's n nearest option expiries (1 = the nearest). build_from: epoch second of the first bar to build;
+        None = the next full bar."""
         super().__init__()
-        self.symbols, self.kind = symbols, kind
+        self.symbols, self.kind, self.expiries = symbols, kind, expiries
         if multiplier is not None and (isinstance(multiplier, (bool, str)) or not good_price(multiplier)):
             raise ValueError(f"multiplier must be a number above zero (e.g. 0.01 for a feed in paise), got {multiplier!r}")
         if not isinstance(decimals, int) or isinstance(decimals, bool) or not 0 <= decimals <= 12:
@@ -159,7 +162,7 @@ class Candles(Plugin):
         self.scale = self.multiplier if self.multiplier is not None else 1.0 / mk.price_div
         if self.multiplier is None:                         # no multiplier given: each contract's own Divisor from the file
             self.scale_of = {t: 1.0 / d for t, d in master.divisor_of.items()}
-        self.tokens = master.tokens_for(self.symbols, self.kind)
+        self.tokens = master.tokens_for(self.symbols, self.kind, self.expiries)
         self._build_lookups(max(symbol_of, default=0))
 
         # numbers only: a text per row would cost a Java String per candle, the Symbol is joined from a static table
@@ -182,6 +185,11 @@ class Candles(Plugin):
         self.agg = CandleAggregator(emit, start, b)
         self._parse = LttParser(mk.ltt_fmt, mk.ltt_zone)
         self.listen(feed, self._on_update, replay=True)
+        n = len(symbol_of) if self.tokens is None else len(self.tokens)
+        mb = n * (6.5 * 3600 // self.bucket) * self.ROW_BYTES / 1e6       # if every instrument ticks all session
+        (self.log.warning if mb > self.WARN_MB else self.log.info)(
+            "%d instruments: up to about %.0f MB of candles over a full session (%d bytes a row)%s", n, mb, self.ROW_BYTES,
+            "; candles_start(kind='FUT'), symbols=[...] or expiries=1 cut this a lot" if self.tokens is None else "")
         scales = sorted({round(v, 12) for v in self.scale_of.values()}) or [self.scale]
         self.log.info("%s candles, feed price x %s%s, market=%s ltt_tz=%s fmt=%s feed=%s, %s",
                       self.timeframe, " / ".join(f"{v:g}" for v in scales),
@@ -191,6 +199,7 @@ class Candles(Plugin):
 
     def describe(self) -> str:
         scope = "all instruments" if self.tokens is None else f"{len(self.tokens)} instruments"
+        scope += f" (nearest {self.expiries} option expiries per underlying)" if self.expiries is not None else ""
         return (f"{self.timeframe}, {scope}, {self.rows} candles, {self.skipped} bad ticks skipped, "
                 f"feed batch {self.last_ms:.1f} ms (max {self.max_ms:.1f}, {self.batches} batches)")
 

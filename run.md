@@ -159,6 +159,64 @@ eod_load()                               # every saved day merged -> candles_his
 
 ---
 
+## 6. NATS: the one connection for commands (optional)
+
+Strategies, the console and you all send portfolio commands through one service, so there is one connection and one set of rules.
+
+```python
+nats_start()                                   # connect (sending starts OFF)
+nats_start("192.168.1.130", 4222, users=[3, 4])   # ip, port, the users that may send; remembered until nats_stop()
+nats_start()                                   # again: same ip, port and settings as before
+nats_start(dry_run=True)                       # no connection, commands are only logged
+nats_send(True)                                # sending ON for everyone;  nats_send(False) = OFF
+nats_stop()
+
+pf_subscribe(1913, 47162, user=4)              # portfolio 1913 -> option token 47162, sent as user 4
+pf_pause(1913, user=4)                         # user= may be left out when the service has a single user
+pf_apply(1913, user=4, ival=1.1, jval=0.8, sval=3.3, maxqty=3, side="BUY")
+pf_unpause(1913, user=4)
+pf_squareup(1913, user=4)
+pf_unsubscribe(1913, 47162, user=4)
+
+nats_block(user=4)                             # nothing is sent for user 4 or ANY portfolio under user 4
+nats_block(user=4, pf=1913)                    # only portfolio 1913 of user 4 (a portfolio is always named with its user)
+nats_block()                                   # list what is blocked
+nats_unblock(user=4)                           # lifts user 4 and every portfolio blocked under user 4
+nats_unblock(user=4, pf=1913)                  # lifts only that portfolio
+```
+Each `pf_...` prints the outcome (`PF 1913 apply: ok - ok`). Statuses: `ok`, the bridge's own refusal, `timeout` (not known whether the
+bridge acted: it is never re-sent by itself), `no_responders` (nothing listens on `cmd.hft.<pf>`), `disconnected`, `off` (sending is off),
+`full` (too many waiting for that portfolio), `dry`.
+Every command the bridge accepted is also a row in the table `cmd_queue_automated`.
+
+From code (a strategy, a UI callback): `svc = app["nats"]`, then `svc.pause(pf)` etc. Each returns a `Future` at once and never blocks;
+`.result(5)` gives the `Reply` (`.ok`, `.status`). `svc.submit(pf, job)` runs several commands back to back on one portfolio.
+`svc.stats()` and `algo_status()` show connected, sent, ok, failed, timeouts, waiting and the last round trip.
+
+**How the load is shared:** one connection and one event loop (NATS requests are waiting on the network, not computing, so extra threads
+would only add contention). Each portfolio has its own queue, so its commands always run in the order given, while different portfolios run at
+the same time. `max_in_flight` (default 64) caps requests on the wire across all portfolios, first come first served. Every command is sent, in
+order; none is replaced or dropped. Each portfolio queue holds at most `lane_depth` (256) jobs and refuses the rest with `full`.
+
+---
+
+## 7. Portfolio numbers: one registry (optional)
+
+A user never has two portfolios with the same number, whichever strategy or screen creates them. Details in `registry.md`.
+
+```python
+registry_start()                               # once; remembers its numbers in a file
+pf_create(3, "rsi_stocks", "RELIANCE")         # create(user, strategy, name) -> the portfolio number (the next free one for user 3)
+pf_create(3, "rsi_nifty", "NIFTY", start=1555) # this strategy's numbers begin at 1555
+pf_register(3, 1001)                           # claim a number you already use (refused, with who holds it, if it is taken)
+pf_register(3, 1001, algo="rsi_stocks", name="TCS")      # yours already: records the algo and what it trades
+pf_list(3)                                     # user, number, name, algo and book for user 3;  pf_list() for everyone
+```
+Books take their numbers from it: `algo.Book(user=3, name="book_stocks", pf_start=1111)`, and the algo records its own name and the stock for each
+portfolio it uses. The same number under two different users is fine. The tables are `portfolio_registry` (current) and `portfolio_registry_log` (every change).
+
+---
+
 ## A normal morning
 
 **India**
@@ -206,6 +264,15 @@ and run the steps again.
 | `no .db3 for <day> in /data/fo_market_data` | today's contract file is not there yet |
 | `... lists exchange [...], which is not NSE` (or US) | the file is the other market's; pass `file=` with the right name |
 | `bar size ... must be a whole multiple of the candle size` | an indicator's size such as `"30s"` on 1-minute candles |
+| `... NOT sent - the NATS service is not running. Call nats_start() first.` | a `pf_...` or `nats_send` call before `nats_start()` (nothing raises) |
+| `... (NATS is down; it reconnects by itself, send again when it is back)` | the NATS server cannot be reached right now |
+| `... (several users are allowed: add user=...)` | `pf_...` without `user=` while `nats_start` was given several users |
+| `... (that user was not given to nats_start)` | `user=` names a user that is not one of the service's users |
+| `... (blocked: nats_unblock(...) lifts it)` | that user or portfolio is blocked |
+| `The portfolio registry is not running. Call registry_start() first.` | `pf_create`, `pf_register` or `pf_list` before `registry_start()` (nothing raises) |
+| `... TAKEN by <name>, not available to <you>` | that user already has a portfolio with that number |
+| `CLASH: ...` (in the log, when a book starts) | a number in the book's files is held by somebody else for that user |
+| `cannot connect to nats://...` | no NATS server answered within a few seconds; check the url |
 | `... is not writable (a read-only mount?)` | `eod_save`: use `folder=` or mount a writable folder (section 0) |
 | `no instruments in master for symbols [...]` | a name in `symbols=` is not in the contract file |
 

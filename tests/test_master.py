@@ -126,3 +126,22 @@ def test_tokens_for_narrows_to_the_wanted_instruments(master):
         master.tokens_for(["NOPE"])
     with pytest.raises(ValueError, match="kind must be"):
         master.tokens_for(kind="BOND")
+
+
+# ---- lean: options limited to the nearest expiries --------------------------------------------------------------------------
+def test_expiries_keeps_only_each_underlyings_nearest_option_expiries(master_weekly):
+    m = master_weekly                                                        # NIFTY: weeklies Jan 9, 16, 23, then Jan 30 and Feb 27
+    nifty = lambda n: set(m.tokens_for(["NIFTY"], "OPT", n))                 # noqa: E731
+    assert len(nifty(1)) == 6 and len(nifty(2)) == 12 and nifty(1) < nifty(2) < set(m.tokens_for(["NIFTY"], "OPT"))
+    assert set(m.tokens_for(["RELIANCE"], "OPT", 1)) == set(m.tokens_for(["RELIANCE"], "OPT"))     # it has one expiry only
+    everything, near = set(m.tokens_for(kind=None, symbols=None, expiries=99)), set(m.tokens_for(expiries=1))
+    assert near < everything
+    assert {1, 2, 3} <= near and 900 in near                                  # futures and equities are never thinned
+    assert list(m.tokens_for(kind="FUT", expiries=1)) == [1, 2, 3]            # nothing to thin among futures
+    assert m.tokens_for() is None and m.tokens_for(expiries=None) is None
+
+
+def test_expiries_must_be_a_whole_number_of_one_or_more(master_weekly):
+    for bad in (0, -1, True, "1", 1.5):
+        with pytest.raises(ValueError, match="expiries"):
+            master_weekly.tokens_for(expiries=bad)

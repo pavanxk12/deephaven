@@ -50,7 +50,7 @@ class RsiOptions(Plugin):
         self.follow("indicators", self._reattach_sig)
 
         self.log.info("armed (%s, sending %s), %d instruments, RSI >%s buy PUT / <%s buy CALL, mid-quartile filter %s",
-                      "DRY RUN" if self.bridge.cfg.dry_run else "LIVE", "ON" if self.bridge.sending else "OFF",
+                      "DRY RUN" if self.bridge.dry_run else "LIVE", "ON" if self.bridge.sending else "OFF",
                       len(self.tokens), cfg.rsi_high, cfg.rsi_low, "ON" if cfg.mid_filter else "OFF")
         if cfg.reset_on_start:
             self._reset_tokens(self.tokens)
@@ -240,20 +240,16 @@ class RsiOptions(Plugin):
         prev_leg, prev_opt = book.live.get(token), book.opt_of.get(token)
         book.set_live(token, leg, opt)                          # mark now so an in-flight swap is not queued twice
         nm = self.master.symbol_of.get(opt, opt)
-        cur_pf = book.pf_of(token)
-        old_pf = cur_pf if cur_pf is not None and book.subscribed.get(cur_pf) not in (None, opt) else None   # moves to another option
-        if bridge.cfg.dry_run:                                  # a dry run never creates a portfolio or writes the PF file
+        if bridge.dry_run:                                  # a dry run never creates a portfolio or writes the PF file
+            cur_pf, old_pf = book.plan(token, opt)
             self.log.info("[DRY] %s PF %s -> BUY %s: subscribe if needed, pause, apply %s, unpause", inst.name,
                           f"NEW (old {old_pf} retired)" if old_pf else cur_pf or "NEW", nm, params)
             return
+        pf, old_pf, created = book.assign(token, opt, name=inst.underlying, algo=self.cfg.name)   # the BOOK picks the portfolio
         if old_pf is not None:
-            pf = book.create(token)
             self.log.info("%s moves to %s, PF %s retired: created PF %s", inst.name, nm, old_pf, pf)
-        elif cur_pf is None:
-            pf = book.create(token)
+        elif created:
             self.log.info("%s qualified and has no portfolio: created PF %s", inst.name, pf)
-        else:
-            pf = cur_pf
         self.log.info("%s PF %s -> BUY %s maxqty %s ival %s jval %s sval %s range %s-%s", inst.name, pf, nm,
                       book.caps.get(pf, 0) + bridge.cfg.add_qty, params["ival"], params["jval"], params["sval"],
                       params["lowerrange"], params["upperrange"])

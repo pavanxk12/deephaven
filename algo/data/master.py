@@ -70,10 +70,14 @@ class MasterData:
             out.update(_positive_pairs(frame, col, "divisor"))
         return out
 
-    def tokens_for(self, symbols=None, kind: str | None = None) -> np.ndarray | None:
+    def tokens_for(self, symbols=None, kind: str | None = None, expiries: int | None = None) -> np.ndarray | None:
         """Sorted token array of the chosen underlyings and kind ("FUT", "OPT", "EQ"); None = no restriction.
+        `expiries=n` keeps, for every underlying, only the options of its n nearest expiries (futures and equities are not
+        affected); options are about 99% of the instruments, so this is the biggest single saving.
         Used to keep candles and indicators to the instruments that are actually needed."""
-        if symbols is None and kind is None:
+        if expiries is not None and (isinstance(expiries, bool) or not isinstance(expiries, int) or expiries < 1):
+            raise ValueError("expiries must be a whole number, 1 or more (1 = only each underlying's nearest expiry)")
+        if symbols is None and kind is None and expiries is None:
             return None
         if kind is not None and kind.upper() not in ("FUT", "OPT", "EQ"):
             raise ValueError("kind must be FUT, OPT or EQ")
@@ -83,6 +87,8 @@ class MasterData:
             if kind is not None and kind.upper() != k:
                 continue
             f = frame if want is None else frame[frame["TckrSymb"].isin(want)]
+            if k == "OPT" and expiries is not None and len(f):
+                f = f[f.groupby("TckrSymb")["expiry"].rank(method="dense") <= expiries]
             parts.append(f[col].to_numpy(dtype=np.int64))
         out = np.unique(np.concatenate(parts)) if parts else np.empty(0, dtype=np.int64)
         if want is not None and not len(out):

@@ -8,14 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 
-def _sub_payload() -> dict:
-    """Sent on `subscribe` / `unsubscribe`; only T1 (the option token) is replaced per portfolio."""
-    return {"T1": 0, "gtw": 32395, "PRNT": 1, "code": "", "ival": 1, "jval": 0.75, "side": "BUY", "sval": 3, "trp": 0,
-            "jqty1": 1, "jqty2": 1, "openq": 0, "maxqty": 0, "target": 1000, "maxloss": -1000, "stoploss": -1000,
-            "lowerrange": 0, "upperrange": 10000, "max_unhedge": 1, "strategyname": "Churning",
-            "USERIDENTIFIER": 3, "user_id": 3}
-
-
 def _apply_params() -> dict:
     """Fixed fields of every `apply`; maxqty, ranges, ival / jval / sval / trp and side are added per signal."""
     return {"jqty1": 1, "jqty2": 1, "target": 5000, "stoploss": -5000, "maxloss": -5000, "max_unhedge": 1, "PRNT": 1}
@@ -23,17 +15,11 @@ def _apply_params() -> dict:
 
 @dataclass
 class BridgeConfig:
-    nats_url: str = "nats://192.168.1.130:4222"
-    user_id: int = 3
-    sender: str = "AUTOMATION"
-    timeout_s: float = 5
-    max_parallel: int = 0                  # 0 = unlimited simultaneous requests
-    dry_run: bool = False                  # True: no NATS connection, commands are only printed
-    send_on: bool = False                  # False: compute signals but send nothing (switch live with send_on())
-    sub_payload: dict = field(default_factory=_sub_payload)
+    """How the strategy sequences its commands. The connection itself (url, user, timeout, the send switch) is `NatsConfig`."""
     unsubscribe_on_retire: bool = True     # after the squareup, unsubscribe the old portfolio from its option
     squareup_on_repoint: bool = True       # square up the old portfolio when a stock moves to another option
     add_qty: int = 5                       # added to the cumulative maxqty on every activation / flip
+    user: int | None = None                # the user this strategy sends as; needed when the NATS service has several users
 
 
 @dataclass

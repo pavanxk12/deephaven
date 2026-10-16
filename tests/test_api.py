@@ -269,3 +269,175 @@ def test_a_failed_scope_change_rolls_back(session, monkeypatch):
     with pytest.raises(ValueError):
         ns["indicators"](symbols=["NOPE"])
     assert (app["indicators"].symbols, app["indicators"].kind) == (None, "FUT")
+
+
+# ---- NATS: one service, the six per-portfolio commands as plain functions -----------------------------
+def _with_nats(app, **cfg):
+    from algo.comms.nats_service import NatsConfig, NatsService
+    from tests.test_nats_service import Wire
+    wire = Wire()
+    svc = NatsService(NatsConfig(**cfg), transport_factory=lambda: wire)
+    svc.connect()
+    app.plugins["nats"] = svc
+    return svc, wire
+
+
+def test_pf_functions_say_the_service_is_down_instead_of_raising(session, capsys):
+    ns, _ = session
+    ns["pf_subscribe"](1913, 47162)
+    ns["pf_pause"](1913)
+    ns["pf_unpause"](1913)
+    ns["pf_squareup"](1913)
+    ns["pf_unsubscribe"](1913, 47162)
+    ns["pf_apply"](1913, ival=1)
+    ns["nats_send"](True)
+    out = capsys.readouterr().out
+    assert out.count("NATS service is not running") == 7 and "nats_start()" in out
+    assert "nats_start" in ns and "pf_apply" in ns
+
+
+def test_a_dropped_nats_connection_is_said_in_words(session, capsys):
+    ns, app = session
+    svc, wire = _with_nats(app, send_on=True)
+    wire.is_connected = False
+    ns["pf_pause"](1913)
+    assert "disconnected" in capsys.readouterr().out
+    svc.on_stop()
+
+
+def test_pf_functions_send_the_six_commands_and_report(session, capsys):
+    ns, app = session
+    svc, wire = _with_nats(app, send_on=True)
+    ns["pf_subscribe"](1913, 47162)
+    ns["pf_pause"](1913)
+    ns["pf_apply"](1913, ival=1.1, maxqty=3, side="BUY")
+    ns["pf_unpause"](1913)
+    ns["pf_squareup"](1913)
+    ns["pf_unsubscribe"](1913, 47162)
+    assert [lab for _, lab, _ in wire.sent] == ["subscribe", "pause_unpause:Pause", "apply", "pause_unpause:UnPause",
+                                                 "squareup", "unsubscribe"]
+    assert wire.sent[2][2]["maxqty"] == 3 and wire.sent[0][2]["T1"] == 47162
+    assert "PF 1913 apply: ok" in capsys.readouterr().out
+    svc.on_stop()
+
+
+def test_pf_functions_explain_when_sending_is_off(session, capsys):
+    ns, app = session
+    svc, wire = _with_nats(app)
+    ns["pf_pause"](5)
+    assert wire.sent == [] and "nats_send(True)" in capsys.readouterr().out
+    ns["nats_send"](True)
+    ns["pf_pause"](5)
+    assert [lab for _, lab, _ in wire.sent] == ["pause_unpause:Pause"]
+    svc.on_stop()
+
+
+def test_nats_start_takes_ip_and_port_and_remembers_them_until_stopped(session, monkeypatch, capsys):
+    ns, app = session
+    monkeypatch.setattr(api, "_run", lambda plugin: app.plugins.__setitem__(plugin.name, plugin))
+    ns["nats_start"]("10.0.0.5", 4333, users=[3, 4])
+    cfg = app["nats"].cfg
+    assert (cfg.ip, cfg.port, cfg.users, cfg.url) == ("10.0.0.5", 4333, (3, 4), "nats://10.0.0.5:4333")
+    ns["nats_start"]()                                             # nothing given: the same connection settings
+    assert (app["nats"].cfg.url, app["nats"].cfg.users) == ("nats://10.0.0.5:4333", (3, 4))
+    assert "same as the running connection" in capsys.readouterr().out
+    ns["nats_start"](port=4223, timeout_s=2)                       # changes only what is named
+    assert (app["nats"].cfg.url, app["nats"].cfg.users, app["nats"].cfg.timeout_s) == ("nats://10.0.0.5:4223", (3, 4), 2)
+    ns["nats_stop"]()
+    assert app.get("nats") is None
+    ns["nats_start"]()                                             # stopped: forgotten, back to the defaults
+    assert app["nats"].cfg.url == "nats://192.168.1.130:4222" and app["nats"].cfg.users == (3,)
+
+
+def test_nats_start_sending_always_starts_off_and_rejects_a_bad_ip_or_port(session, monkeypatch):
+    ns, app = session
+    monkeypatch.setattr(api, "_run", lambda plugin: app.plugins.__setitem__(plugin.name, plugin))
+    ns["nats_start"]("10.0.0.5", 4222, send=True)
+    assert app["nats"].sending is True
+    ns["nats_start"]()
+    assert app["nats"].sending is False
+    for bad in (dict(ip="nats://10.0.0.5:4222"), dict(ip="10.0.0.5:4222"), dict(ip=""), dict(port="abc"), dict(port=0),
+                dict(port=70000)):
+        with pytest.raises(ValueError):
+            ns["nats_start"](**bad)
+
+
+# ---- several users from the console --------------------------------------------------------------------------------
+def test_nats_start_takes_one_user_or_several_and_rejects_nonsense(session, monkeypatch):
+    ns, app = session
+    monkeypatch.setattr(api, "_run", lambda plugin: app.plugins.__setitem__(plugin.name, plugin))
+    ns["nats_start"](users=4)
+    assert app["nats"].cfg.users == (4,)
+    ns["nats_start"](users=[3, 4, 3])                               # duplicates are dropped, the order is kept
+    assert app["nats"].cfg.users == (3, 4)
+    assert app["nats"].lift_blocks == (3, 4)                        # naming users lifts their blocks
+    ns["nats_start"]()                                              # remembered
+    assert app["nats"].cfg.users == (3, 4) and app["nats"].lift_blocks == ()     # a bare restart lifts nothing
+    for bad in (0, -1, [], "abc", [3, "x"], True, [1.5]):
+        with pytest.raises(ValueError):
+            ns["nats_start"](users=bad)
+
+
+def test_pf_functions_name_the_user_and_say_when_it_is_missing_or_wrong(session, capsys):
+    ns, app = session
+    svc, wire = _with_nats(app, send_on=True, users=(3, 4))
+    ns["pf_pause"](1913, user=4)
+    ns["pf_pause"](1913)
+    ns["pf_pause"](1913, user=9)
+    out = capsys.readouterr().out
+    assert "PF 1913 pause: ok" in out and "several users are allowed" in out and "was not given to nats_start" in out
+    assert [p["USERIDENTIFIER"] for _, _, p in wire.sent] == [4]
+    svc.on_stop()
+
+
+def test_nats_block_and_unblock_from_the_console(session, capsys):
+    ns, app = session
+    svc, wire = _with_nats(app, send_on=True, users=(3, 4))
+    ns["nats_block"](user=4)
+    ns["pf_pause"](1, user=4)
+    ns["pf_pause"](2, user=3)
+    out = capsys.readouterr().out
+    assert "blocked: {'users': [4], 'portfolios': {}}" in out and "nats_unblock" in out and "PF 2 pause: ok" in out
+    assert len(wire.sent) == 1
+    ns["nats_block"]()                                              # nothing named: just lists
+    assert "'users': [4]" in capsys.readouterr().out
+    ns["nats_unblock"](user=4)
+    ns["pf_pause"](1, user=4)
+    assert "PF 1 pause: ok" in capsys.readouterr().out
+    svc.on_stop()
+
+
+def test_block_commands_without_the_service_say_so_instead_of_raising(session, capsys):
+    ns, _ = session
+    ns["nats_block"](user=4)
+    ns["nats_unblock"](user=4)
+    assert capsys.readouterr().out.count("NATS service is not running") == 2
+
+
+def test_a_portfolio_block_from_the_console_must_name_its_user(session, capsys):
+    ns, app = session
+    svc, wire = _with_nats(app, send_on=True, users=(3, 4))
+    with pytest.raises(ValueError, match="user"):
+        ns["nats_block"](pf=1913)
+    ns["nats_block"](user=4, pf=1913)
+    ns["pf_pause"](1913, user=4)
+    ns["pf_pause"](1913, user=3)
+    out = capsys.readouterr().out
+    assert "'portfolios': {4: [1913]}" in out and "NOT ok - blocked" in out and "PF 1913 pause: ok" in out
+    assert [p["USERIDENTIFIER"] for _, _, p in wire.sent] == [3]
+    svc.on_stop()
+
+
+def test_candles_start_passes_expiries_on_and_straddle_warns_when_candles_have_too_few(session, monkeypatch, capsys):
+    ns, app = session
+    started = []
+    monkeypatch.setattr(api, "_run", lambda plugin: (started.append(plugin), app.plugins.__setitem__(plugin.name, plugin)))
+    ns["candles_start"]("1min", expiries=1)
+    assert started[0].expiries == 1 and "nearest 1 option expiries" in started[0].describe()
+    ns["straddle_start"](0)
+    assert "warning" not in capsys.readouterr().out                           # one expiry is enough for straddle_start(0)
+    ns["straddle_start"](1)
+    assert "needs the 2 nearest expiries" in capsys.readouterr().out
+    ns["candles_start"]("1min", expiries=2)
+    ns["straddle_start"](1)
+    assert "warning" not in capsys.readouterr().out

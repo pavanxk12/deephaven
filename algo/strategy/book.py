@@ -1,7 +1,8 @@
 """Portfolio bookkeeping shared by every strategy and by the console.
 
 One portfolio (PF) = one option contract for its whole life. A stock's PF is created lazily on its first signal and
-numbered `highest known + 1`; numbers are never reused. The two JSON files hold what must survive a restart:
+numbered `highest known + 1`; numbers are never reused. A book that has a `user` takes its numbers from the portfolio registry
+(algo.strategy.registry), so no two strategies, and no screen, can be given the same number for that user. The two JSON files hold what must survive a restart:
     pf_map  : future token -> PF          pf_sub : PF -> option token it is subscribed to
 Everything else (caps, paused, live legs, allow switches) lives in memory and survives a plugin restart via `app.shared`.
 """
@@ -34,8 +35,10 @@ def _write_json(path: str, obj: dict) -> None:
 
 
 class Portfolios:
-    def __init__(self, map_file: str, sub_file: str, pf_start: int = 1111):
+    def __init__(self, map_file: str, sub_file: str, pf_start: int = 1111, registry=None, user: int | None = None,
+                 owner: str = ""):
         self.map_file, self.sub_file, self.pf_start = map_file, sub_file, pf_start
+        self.registry, self.user, self.owner = registry, user, owner      # set: numbers come from the registry, as `user`
         self.pf_map: dict[int, int] = _read_ints(map_file)        # future token -> PF   (persisted)
         self.subscribed: dict[int, int] = _read_ints(sub_file)    # PF -> option token   (persisted)
         self.caps: dict[int, int] = {}                            # PF -> cumulative maxqty
@@ -139,8 +142,52 @@ class Portfolios:
         found += list(_read_ints(self.map_file).values()) + list(_read_ints(self.sub_file))
         return max(found) if found else None
 
-    def create(self, token: int) -> int:
+    def claim_existing(self) -> list:
+        """Register the numbers this book already holds (from its files) with the registry. Returns the claims that were
+        refused: those numbers are held by somebody else for this user, which is a real clash that needs a person."""
+        if self.registry is None or self.user is None:
+            return []
+        with self._lock:
+            mine = sorted(set(self.pf_map.values()) | set(self.subscribed))
+        claims = [self.registry.register(self.user, pf, self.owner) for pf in mine]
+        return [c for c in claims if not c.ok]
+
+    def plan(self, token: int, option: int) -> tuple[int | None, int | None]:
+        """What `assign` would do, changing nothing: (the stock's current portfolio or None, the portfolio that would be retired
+        or None). A stock that trades another option than the one its portfolio is subscribed to moves to a NEW portfolio and
+        the old one retires; a stock with none gets its first; otherwise the portfolio it has is kept."""
+        with self._lock:
+            cur = self.pf_of(token)
+            moves = cur is not None and self.subscribed.get(cur) not in (None, option)
+            return cur, (cur if moves else None)
+
+    def assign(self, token: int, option: int, name: str = "", algo: str = "") -> tuple[int, int | None, bool]:
+        """The portfolio an algo must use for this stock and option: (pf, old_pf, created).
+        The algo never picks a number. The book keeps the stock's portfolio, makes a new one (numbered by the registry, as this
+        book's user) when the stock has none or moves to another option, and says which one retires (`old_pf`)."""
+        with self._lock:
+            cur, old_pf = self.plan(token, option)
+            if cur is None or old_pf is not None:
+                return self.create(token, name=name, algo=algo), old_pf, True
+            self.label(cur, algo=algo, name=name)              # the registry always knows who uses it and what it trades
+            return cur, None, False
+
+    def label(self, pf: int, algo: str = "", name: str = "") -> None:
+        """Tell the registry what portfolio `pf` is for: the algo using it and the instrument it trades (a blank keeps what is
+        stored). Called every time an algo acts on it; the file is written only when something changed."""
+        if self.registry is not None and self.user is not None:
+            self.registry.register(self.user, pf, self.owner, algo=algo, name=name)
+
+    def create(self, token: int, name: str = "", algo: str = "") -> int:
         with self._lock:                                  # two signals must never get the same number
+            if self.registry is not None and self.user is not None:
+                pf = self.registry.allocate(self.user, self.owner, start=self.pf_start, algo=algo, name=name)
+                self.pf_map[token] = pf
+                self.save_map()
+                self.session_pfs.add(pf)
+                self.caps.setdefault(pf, 0)
+                self.changed()
+                return pf
             last = self.last_pf()
             pf = self.pf_start if last is None else last + 1
             self.pf_map[token] = pf
@@ -191,9 +238,11 @@ class Book(Plugin):
     name = "book"
 
     def __init__(self, map_file: str | None = None, sub_file: str | None = None, pf_start: int = 1111,
-                 name: str = "book"):
+                 name: str = "book", user: int | None = None, registry: str = "registry"):
         super().__init__(name)
         self.map_file, self.sub_file, self.pf_start = map_file, sub_file, pf_start
+        self.user, self.registry_name = user, registry
+        self.requires = (registry,) if user is not None else ()     # a book with a user needs the portfolio registry running
         self.state: Portfolios | None = None
 
     def start(self) -> None:
@@ -205,6 +254,15 @@ class Book(Plugin):
         self.state = self.app.shared.get(key)
         if self.state is None:
             self.state = self.app.shared[key] = Portfolios(map_file, sub_file, self.pf_start)
+        if self.user is not None:
+            self.state.registry, self.state.user, self.state.owner = self.app[self.registry_name].state, self.user, self.name
+            clashes = self.state.claim_existing()
+            for c in clashes:
+                self.log.error("CLASH: %s. This book still uses it; one of the two must change", c)
+            self.log.info("files %s, %s; user %s; new portfolios come from the registry starting at %s%s", map_file, sub_file,
+                          self.user, self.pf_start, f"; {len(clashes)} CLASHES" if clashes else "")
+            return
+        self.state.registry = self.state.user = None
         last = self.state.last_pf()
         self.log.info("files %s, %s; next new portfolio gets %s", map_file, sub_file,
                       last + 1 if last is not None else f"{self.pf_start} (pf_start)")

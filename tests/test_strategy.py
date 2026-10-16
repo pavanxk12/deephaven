@@ -16,7 +16,7 @@ class FakeBridge:
     """Records swaps the way Bridge would execute them, including the subscribe bookkeeping."""
 
     def __init__(self, book, sending=True, dry=False):
-        self.book, self.sending, self.cfg = book, sending, BridgeConfig(dry_run=dry)
+        self.book, self.sending, self.dry_run, self.cfg = book, sending, dry, BridgeConfig()
         self.swaps = []
         self.fail_next = False
 

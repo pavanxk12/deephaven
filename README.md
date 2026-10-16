@@ -195,7 +195,7 @@ read-only mount:
 | niftyrsi.py | the same with `RsiOptionsConfig.nifty()` |
 | dashboard_blackbox.py | `algo.Console` |
 
-All the numbers that sat in the USER INPUT blocks are fields of `RsiOptionsConfig`, `BridgeConfig`,
+All the numbers that sat in the USER INPUT blocks are fields of `RsiOptionsConfig`, `BridgeConfig`, `NatsConfig` (the connection),
 `StraddleConfig`, `Market` and `Paths`.
 
 ## Behaviour to know about
