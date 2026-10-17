@@ -119,9 +119,16 @@ Per (symbol, day) the service keeps a `Day`: `close` (carried over minutes, floa
 
 ---
 
+## 5b. A reference on a future stays on one contract
+
+A rolling future changes contract at each expiry, and two contracts trade a few points apart (the calendar spread). So the **earlier days a reference needs** are read for the contract that is
+the nearest on the day being measured, not for whatever was the nearest on those earlier days (`_pin`): the previous close, and a week's or month's open and VWAP, all come from that one contract
+(the contract of today comes from the master, the contract of a past day from its file). Without this, on the first day after an expiry `ref="prev_close"` would measure the new contract against
+the old one's close: on 2026-01-28 that was +0.97% for NIFTY, against -0.03% on the same contract. A contract named by its month or full name is already one contract and needs no pin.
+
 ## 6. `absolute(series, level, symbol, n)`
 
-1. Validate `series`, `level`, `n` (1 to 400) and parse the symbol: `"RELIANCE"` = cash, `"NIFTY FUT"` = the nearest unexpired future **of each day** (the history rolls: on 2026-01-28 the 27 Jan contract is gone and the Feb one is used), `"NIFTY 27OCT26 FUT"` = that contract, never rolling.
+1. Validate `series`, `level`, `n` (1 to 400) and parse the symbol. The instrument is exactly what is written, never another: `"RELIANCE"` = the cash stock; `"NIFTY FUT"` = the nearest unexpired future **of each day** (the history rolls: on 2026-01-28 the 27 Jan contract is gone and the Feb one is used); `"NIFTY JUN FUT"` / `"NIFTY JUN26 FUT"` = the contract expiring in that month (without a year, the next such month on or after the day), its own days only; `"NIFTY 27OCT26 FUT"` = that contract. A day on which the instrument has no file or no rows is NaN (a future never falls back to the equity, nor the equity to a future).
 2. Work out the date and slot from `at` (or the clock), list the saved days (the folder is listed at most once a minute), pick the n comparison dates (section 3.1).
 3. For each comparison date, `_value_at`: get that day's `Day` / `IvDay` from the cache (reading the file once if absent), and for a week or month also the earlier days of that period; compute the value at the slot, NaN if absent.
 4. **Now:** today's rows for this one symbol are read from the live `candles` / `straddle_series` table (a filtered snapshot, section 8) and turned into a `Day` the same way; if the live table has nothing, today's saved file is used (after the close).

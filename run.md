@@ -167,7 +167,10 @@ absolute_settings(memory_mb=300)                              # the cache limit 
   `pct_open` and `pct_vwap` still work as shorthands for `pct` with `ref="open"` / `"vwap"`. With `level="intraweek"` and `ref="10min"` the comparison points are the same weekday and minute
   of the previous weeks, each measured from 10 minutes before itself. **level:** `intraday` (previous n trading days; open and VWAP restart each day), `intraweek` (same weekday and minute of the previous n weeks;
   weekly open and VWAP), `intramonth` (same trading-day-of-the-month and minute of the previous n months; monthly open and VWAP).
-  **symbol:** `"RELIANCE"` (cash), `"NIFTY FUT"` (the nearest unexpired future of each day, so it rolls), `"NIFTY 27OCT26 FUT"` (one contract); for `iv` the underlying.
+  **symbol:** what you write is the instrument, and nothing falls back to another: `"SBIN"` is the cash stock; `"SBIN FUT"` is the nearest unexpired future of each day (it rolls, so earlier days
+  use the contracts that were nearest then); `"SBIN JUN FUT"` (or `"SBIN JUN26 FUT"`) is the contract expiring in June, its own days only, never an earlier contract's; `"SBIN 30JUN26 FUT"` is one
+  contract by its full name; for `iv` the underlying (all four spellings give the same IV). A day with no file or no rows for that instrument is NaN. A future's reference (`open`, `vwap`,
+  `prev_close`) is always taken from the same contract as the day it belongs to, so a roll never adds the calendar spread between two contracts.
 * **Time** is the exchange's own session minute (minutes since the open, from its time zone), not UTC and not a position in an array: a bar missing on one day cannot shift the
   rest, and the US clock change needs no care (09:30 New York is session minute 0 in summer and winter). A price is carried forward at most 5 minutes (an IV 3); beyond that the
   point is NaN and left out. The comparison minute is the latest closed bar; before the open it is the first minute, after the close the last.

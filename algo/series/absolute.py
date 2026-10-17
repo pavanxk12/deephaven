@@ -41,6 +41,8 @@ SERIES = ("pct", "iv", "pct_open", "pct_vwap")             # pct_open / pct_vwap
 LEVELS = ("intraday", "intraweek", "intramonth")
 NAN = float("nan")
 _FUT = re.compile(r"^(?P<und>.+?) (?P<exp>\d{2}[A-Z]{3}\d{2}) FUT$")
+_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+_FUT_MONTH = re.compile(r"^(?P<und>.+?) (?P<mon>" + "|".join(_MONTHS) + r")(?P<yy>\d{2})?$")           # "SBIN JUN" / "SBIN JUN26": a contract named by its month
 
 
 # ---- the result ----------------------------------------------------------------------------------------------------------------
@@ -176,12 +178,17 @@ def build_iv_day(slot: np.ndarray, iv: np.ndarray, slots: int, max_age: int) -> 
 
 # ---- symbol names -----------------------------------------------------------------------------------------------------------------
 def parse_symbol(symbol: str) -> tuple[str, str]:
-    """("cash", "RELIANCE") | ("fut", "NIFTY") for the rolling nearest future | ("exact", "NIFTY 27OCT26 FUT")."""
+    """("cash", "RELIANCE") | ("fut", "NIFTY") for the rolling nearest future | ("exact", "NIFTY 27OCT26 FUT") | ("month", "SBIN JUN") for the contract expiring in that month
+    ("SBIN JUN FUT", or with the year "SBIN JUN26 FUT"; without a year, the next such month on or after the day looked at)."""
     s = " ".join(str(symbol).upper().split())
     if not s:
         raise ValueError("the symbol is empty")
     if s.endswith(" FUT"):
-        return ("exact", s) if _FUT.match(s) else ("fut", s[:-4].strip())
+        if _FUT.match(s):
+            return "exact", s
+        if _FUT_MONTH.match(s[:-4].strip()):
+            return "month", s[:-4].strip()
+        return "fut", s[:-4].strip()
     return "cash", s
 
 
@@ -190,7 +197,49 @@ def underlying_of(spec: tuple[str, str]) -> str:
     if kind == "exact":
         m = _FUT.match(name)
         return m["und"] if m else name
+    if kind == "month":
+        return _FUT_MONTH.match(name)["und"]
     return name
+
+
+def is_future(spec) -> bool:
+    """Any future: the rolling nearest ("NIFTY FUT"), one named by its month ("NIFTY APR FUT") or one contract ("NIFTY 28APR26 FUT")."""
+    return spec[0] in ("fut", "month", "exact")
+
+
+def needs_contract(spec) -> bool:
+    """A future that means a different contract on different days (rolling, or a month): it is resolved to one contract per day before a reference is read."""
+    return spec[0] in ("fut", "month")
+
+
+def label_of(spec) -> str:
+    """The symbol as a person writes it: RELIANCE, NIFTY FUT, SBIN JUN FUT, NIFTY 27OCT26 FUT."""
+    kind, name = spec
+    return name + " FUT" if kind in ("fut", "month") else name
+
+
+def month_contract(spec, names, day: str) -> "str | None":
+    """Of these contract names (`UND 27JUN26 FUT`), the one that a month spec means on `day`: it expires in that month (of that year when one is given) on or after the day;
+    the earliest such. For a rolling "fut" spec: the nearest that has not expired."""
+    kind, name = spec
+    best = None
+    if kind == "month":
+        m = _FUT_MONTH.match(name)
+        und, mon, yy = m["und"], _MONTHS.index(m["mon"]) + 1, m["yy"]
+    else:
+        und, mon, yy = name, None, None
+    for nm in names:
+        mm = _FUT.match(nm)
+        if not mm or mm["und"] != und:
+            continue
+        e = future_expiry(nm)
+        if e is None or e.isoformat() < day:
+            continue
+        if mon is not None and (e.month != mon or (yy is not None and e.year != 2000 + int(yy))):
+            continue
+        if best is None or e < best[0]:
+            best = (e, nm)
+    return best[1] if best else None
 
 
 def future_expiry(name: str) -> "date | None":
@@ -374,7 +423,7 @@ class Baskets:
                     kind, name = parse_symbol(piece)
                 except ValueError:
                     raise ValueError(f"{where} line {n}: {piece!r} is not a symbol") from None
-                text_ = name + " FUT" if kind == "fut" else name
+                text_ = label_of((kind, name))
                 if text_ not in out[current]:
                     out[current].append(text_)
         for name, symbols in out.items():
@@ -463,7 +512,7 @@ class Baskets:
                 raise ValueError("a basket is a list of symbols, like ['TCS', 'INFY']")
             for x in symbols:
                 kind, nm = parse_symbol(x)
-                t = nm + " FUT" if kind == "fut" else nm
+                t = label_of((kind, nm))
                 if t not in clean:
                     clean.append(t)
             if not clean:
@@ -507,11 +556,11 @@ class Baskets:
         gone = set()
         for x in remove or ():
             kind, nm = parse_symbol(x)
-            gone.add(nm + " FUT" if kind == "fut" else nm)
+            gone.add(label_of((kind, nm)))
         keep = [x for x in cur if x not in gone]
         for x in add or ():
             kind, nm = parse_symbol(x)
-            t = nm + " FUT" if kind == "fut" else nm
+            t = label_of((kind, nm))
             if t not in keep:
                 keep.append(t)
         return self._write(name, keep)
@@ -535,13 +584,14 @@ class AbsoluteService:
     when `absolute()` is called (a one-off read of the candles / straddle table for that one symbol). Nothing runs between calls; the only memory kept is the cache."""
 
     def __init__(self, clock: Clock, source, memory_mb: float = 200, max_age: int = 5, iv_max_age: int = 3, min_valid: "int | None" = None,
-                 today_bars=None, today_iv=None, now=None, today_bars_many=None, today_iv_many=None, baskets=None):
+                 today_bars=None, today_iv=None, now=None, today_bars_many=None, today_iv_many=None, baskets=None, contract_of_today=None):
         self.clock, self.source = clock, source
         self.cache = Cache(int(memory_mb * 1e6))
         self.max_age, self.iv_max_age, self.min_valid = int(max_age), int(iv_max_age), min_valid
         self.today_bars, self.today_iv = today_bars, today_iv
         self.baskets = baskets if baskets is not None else Baskets()                          # named lists of symbols for relative() (baskets.txt)
         self.today_bars_many, self.today_iv_many = today_bars_many, today_iv_many           # many symbols in ONE read (used by relative())
+        self.contract_of_today = contract_of_today                                          # ("fut", "NIFTY") -> the contract that is the nearest today, as ("exact", name)
         self._now = now                                             # a function returning epoch seconds (the wall clock)
         self._days_cache: dict[str, tuple[float, list]] = {}
 
@@ -625,6 +675,18 @@ class AbsoluteService:
     def _obj(self, kind: str, spec, d: str, today: str):
         return self._ivday(underlying_of(spec), d, today) if kind == "iv" else self._day(spec, d, today)
 
+    def _pin(self, spec, d: str, today: str):
+        """The symbol to read the EARLIER days of a reference with. A rolling future ("NIFTY FUT") is replaced by the contract that is the nearest on day d, so a week's or month's
+        open or VWAP and the previous close are all taken from that one contract: measured against another contract they would contain the calendar spread."""
+        if not needs_contract(spec):
+            return spec
+        if d == today and self.contract_of_today is not None:
+            got = self.contract_of_today(spec, d)
+        else:
+            find = getattr(self.source, "contract_of", None)
+            got = find(d, spec) if find is not None else None
+        return got or spec
+
     def _ref_days(self, ref, level: str, d: str, days: list[str]) -> list[str]:
         """The other saved days one value at date d needs: the earlier days of its week / month for an open or VWAP, the previous trading day for prev_close."""
         if ref is None:
@@ -650,7 +712,8 @@ class AbsoluteService:
             return v
         what, k = ref
         if what in ("open", "vwap"):
-            prev = [p for p in (self._obj(kind, spec, x, today) for x in self._period_prev(level, d, days)) if p is not None]
+            pin = self._pin(spec, d, today) if kind == "pct" else spec
+            prev = [p for p in (self._obj(kind, pin, x, today) for x in self._period_prev(level, d, days)) if p is not None]
             if what == "open":
                 base = prev[0] if prev else obj
                 anchor = base.first if kind == "iv" else base.open
@@ -664,7 +727,7 @@ class AbsoluteService:
             anchor = float(arr[k]) if k <= m else NAN                # the fixed time has not come yet at this minute
         else:                                                        # prev_close
             before = [x for x in days if x < d]
-            p = self._obj(kind, spec, before[-1], today) if before else None
+            p = self._obj(kind, self._pin(spec, d, today) if kind == "pct" else spec, before[-1], today) if before else None
             anchor = NAN if p is None else p.last
         return (v - anchor) / anchor * 100.0 if anchor == anchor and anchor != 0 else NAN
 
@@ -829,7 +892,7 @@ class AbsoluteService:
         days = self.days("straddle" if kind == "iv" else "candles")
         extra = self._ref_days(rf, level, today, days)               # the earlier days the reference needs, read once for the whole basket
         if extra:
-            self._load_many(kind, everyone, extra)
+            self._load_many(kind, [self._pin(sp, today, today) if kind == "pct" else sp for sp in everyone], extra)
         if kind == "iv":
             ivs = self._today_ivs(list(dict.fromkeys(underlying_of(sp) for sp in everyone)), today)
             value = {sp: self._value_from("iv", rf, level, sp, ivs[underlying_of(sp)], today, slot, days, today) for sp in everyone}
@@ -845,7 +908,7 @@ class AbsoluteService:
             pctile = 100.0 * idx / valid.size
         else:
             idx, pctile = -1, NAN
-        names = [n if k != "fut" else n + " FUT" for k, n in specs]
+        names = [label_of(sp) for sp in specs]
         return Relative(vals, idx, now=cur, n_valid=int(valid.size), pctile=pctile, symbols=names, today=today, series=series, level=level, symbol=symbol, minute=slot,
                         basket=basket_name, ref=ref_label(rf, self.clock))
 
@@ -879,21 +942,26 @@ class ParquetSource:
     def _path(self, kind: str, day: str) -> "str | None":
         return self.store.find(self.PREFIX[kind], day)
 
-    def _futures_of(self, pq, path: str, day: str, underlying: str) -> "str | None":
-        key = (path, underlying)
+    def _futures_of(self, pq, path: str, day: str, spec) -> "str | None":
+        """The contract a rolling future ("fut") or a month ("month") spec means in this day's file (see month_contract), cached per file."""
+        key = (path, spec)
         if key not in self._fut_names:
             names = pq.read_table(path, columns=["Symbol"])["Symbol"].unique().to_pylist()
-            best = None
-            for nm in names:
-                m = _FUT.match(nm)
-                if m and m["und"] == underlying:
-                    e = future_expiry(nm)
-                    if e is not None and e.isoformat() >= day and (best is None or e < best[0]):
-                        best = (e, nm)
-            self._fut_names[key] = best[1] if best else None
+            self._fut_names[key] = month_contract(spec, names, day)
             while len(self._fut_names) > 64:
                 self._fut_names.popitem(last=False)
         return self._fut_names[key]
+
+    def contract_of(self, day: str, spec):
+        """("exact", name) of the contract a rolling future means on that day (the nearest that has not expired), the spec itself for anything else; None if there is none."""
+        if not needs_contract(spec):
+            return spec
+        path = self._path("candles", day)
+        if path is None:
+            return None
+        _, pq = self._pq()
+        name = self._futures_of(pq, path, day, spec)
+        return None if name is None else ("exact", name)
 
     def bars(self, day: str, spec):
         path = self._path("candles", day)
@@ -901,8 +969,8 @@ class ParquetSource:
             return None
         pa, pq = self._pq()
         kind, name = spec
-        if kind == "fut":
-            name = self._futures_of(pq, path, day, name)
+        if kind in ("fut", "month"):
+            name = self._futures_of(pq, path, day, spec)
             if name is None:
                 return None
         t = pq.read_table(path, columns=["Minute", "Open", "High", "Low", "Close", "Volume"], filters=[("Symbol", "=", name)])
@@ -920,8 +988,8 @@ class ParquetSource:
         want: dict = {}                                             # symbol text in the file -> the specs that mean it
         for sp in specs:
             kind, name = sp
-            if kind == "fut":
-                name = self._futures_of(pq, path, day, name)
+            if kind in ("fut", "month"):
+                name = self._futures_of(pq, path, day, sp)
             if name is not None:
                 want.setdefault(name, []).append(sp)
         if not want:
@@ -995,7 +1063,13 @@ def deephaven_readers(app):
         if kind == "exact":
             return m.token_of.get(name)
         import pandas as pd
-        f = m.futs[(m.futs["TckrSymb"] == name) & (m.futs["expiry"] >= pd.Timestamp(day))].sort_values("expiry")
+        und = underlying_of(spec)
+        f = m.futs[(m.futs["TckrSymb"] == und) & (m.futs["expiry"] >= pd.Timestamp(day))].sort_values("expiry")
+        if kind == "month":                                          # the contract expiring in that month (of that year, if one was written)
+            mm = _FUT_MONTH.match(name)
+            f = f[f["expiry"].dt.month == _MONTHS.index(mm["mon"]) + 1]
+            if mm["yy"]:
+                f = f[f["expiry"].dt.year == 2000 + int(mm["yy"])]
         return int(f["fut_token"].iloc[0]) if len(f) else None
 
     def today_bars(spec, day):
@@ -1045,6 +1119,14 @@ def deephaven_readers(app):
                 out[sp] = arrays
         return out
 
+    def contract_of(spec, day):
+        """The contract a rolling future is today, as ("exact", "NIFTY 27OCT26 FUT") (from the master); anything else is itself."""
+        if not needs_contract(spec):
+            return spec
+        t = token_of(spec, day)
+        name = app.master.symbol_of.get(int(t)) if t is not None else None
+        return parse_symbol(name) if name else None
+
     def today_iv_many(unders, day):
         table = app.tables.get("straddle_series")
         names = [u for u in unders if _NAME.match(u)]
@@ -1062,4 +1144,4 @@ def deephaven_readers(app):
             out[str(und)] = (np.array([int(t[0:2]) * 60 + int(t[3:5]) for t in times], dtype=np.int64), g["IV"].to_numpy(dtype=np.float64)[keep])
         return out
 
-    return today_bars, today_iv, today_bars_many, today_iv_many
+    return today_bars, today_iv, today_bars_many, today_iv_many, contract_of

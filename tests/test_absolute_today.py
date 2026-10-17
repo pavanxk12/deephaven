@@ -123,7 +123,7 @@ def test_nothing_is_kept_between_calls_but_the_cache_and_there_is_no_thread_or_l
     s = service(src, now=lambda: epoch(TODAY, 11), today_bars=lambda spec, day: bars_of((0, 100, 100, 100, 100, 5), (10, 101, 101, 101, 101, 5)))
     for _ in range(3):
         s.absolute("pct_open", "intraday", "ABC", 5)
-    assert threading.active_count() == before and set(vars(s)) <= {"clock", "source", "cache", "max_age", "iv_max_age", "min_valid", "today_bars", "today_iv", "_now", "_days_cache", "baskets", "today_bars_many", "today_iv_many"}
+    assert threading.active_count() == before and set(vars(s)) <= {"clock", "source", "cache", "max_age", "iv_max_age", "min_valid", "today_bars", "today_iv", "_now", "_days_cache", "baskets", "today_bars_many", "today_iv_many", "contract_of_today"}
 
 
 # ---- the Deephaven readers (the tables are faked) -----------------------------------------------------------------------------------------------------
@@ -160,7 +160,7 @@ def readers(monkeypatch):
 
 def test_todays_bars_are_read_for_the_one_token_of_the_symbol(readers):
     app, candles, _ = readers
-    today_bars, _, _, _ = deephaven_readers(app)
+    today_bars, _, _, _, _ = deephaven_readers(app)
     ts, o, h, l, c, v = today_bars(("cash", "ABC"), TODAY)
     assert candles.where_expr == "token = 7" and candles.view_cols[0] == "Ts = epochSeconds(Minute)"
     assert c.tolist() == [100.5, 101.5] and v.tolist() == [10.0, 20.0] and ts.dtype == np.int64
@@ -173,7 +173,7 @@ def test_todays_bars_are_read_for_the_one_token_of_the_symbol(readers):
 
 def test_todays_iv_is_the_nearest_expiry_as_minute_of_day_and_value(readers):
     app, _, straddle = readers
-    _, today_iv, _, _ = deephaven_readers(app)
+    _, today_iv, _, _, _ = deephaven_readers(app)
     minute, iv = today_iv("NIFTY", TODAY)
     assert straddle.where_expr == "Symbol = `NIFTY`" and minute.tolist() == [9 * 60 + 25, 9 * 60 + 26] and iv.tolist() == [2.0, 2.5]
     assert today_iv("NIFTY`; drop", TODAY) is None                                                  # only plain names go into a query
@@ -182,7 +182,7 @@ def test_todays_iv_is_the_nearest_expiry_as_minute_of_day_and_value(readers):
 def test_a_missing_table_gives_none_so_the_saved_file_is_used(readers):
     app, _, _ = readers
     app.tables.clear()
-    today_bars, today_iv, _, _ = deephaven_readers(app)
+    today_bars, today_iv, _, _, _ = deephaven_readers(app)
     assert today_bars(("cash", "ABC"), TODAY) is None and today_iv("NIFTY", TODAY) is None
 
 

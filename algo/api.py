@@ -121,7 +121,14 @@ def absolute(series: str, level: str, symbol: str, n: int = 22, ref=None, now: "
         "10min"       10 minutes ago (any number of minutes: "1min" ... "389min")
         "09:30"       a fixed time of the day (exchange time): the value at that minute; NaN before that time has come
     level: "intraday" (same minute, previous n days) | "intraweek" (same weekday and minute, previous n weeks) | "intramonth" (same trading day of the month and minute, previous n months).
-    symbol: "RELIANCE" (cash), "NIFTY FUT" (nearest future, rolling), "NIFTY 27OCT26 FUT"; for "iv" the underlying.
+    symbol (the instrument is exactly what you write; nothing falls back to another):
+        "SBIN"               the cash stock, its own history
+        "SBIN FUT"           the nearest future that has not expired, on each day (it rolls: last month's contract on the days it was the nearest)
+        "SBIN JUN FUT"       the contract expiring in June ("SBIN JUN26 FUT" with the year): only that contract's own days, never an earlier contract's
+        "SBIN 30JUN26 FUT"   one contract by its full name
+        for "iv" the underlying (the straddle is built from the options; all four spellings give the same IV).
+        A day on which the named instrument has no file or no rows is NaN. A reference (open, vwap, prev_close) of a future is always taken from the SAME contract as the
+        day it belongs to, so a roll does not add the calendar spread between two contracts.
     now=: give the current value yourself.  at=: evaluate as of another moment, in exchange time: "HH:MM", "2026-03-20 11:30", a datetime or epoch seconds.
     How it works: history is read from the saved candles_<day> / straddle_<day> files (one symbol and one day at a time, kept in one size-limited cache);
     today so far is read from the candles / straddle_series table for this one symbol at the moment of the call. Time is the exchange's own session minute, so the
@@ -212,12 +219,12 @@ def _absolute():
     svc = app.shared.get("absolute_service")
     if svc is None:
         cfg = app.shared.setdefault("absolute_settings", {"memory_mb": 200, "max_age": 5, "iv_max_age": 3, "min_valid": None, "folder": None, "basket_file": None})
-        today_bars, today_iv, today_bars_many, today_iv_many = deephaven_readers(app)
+        today_bars, today_iv, today_bars_many, today_iv_many, contract_of = deephaven_readers(app)
         places = [cfg["basket_file"]] if cfg.get("basket_file") else [os.path.join(app.paths.market_data, "baskets.txt"), os.path.join(app.paths.state, "baskets.txt")]
         baskets = Baskets(places)
         svc = app.shared["absolute_service"] = AbsoluteService(
             Clock(app.market.zone, app.market.session), ParquetSource(make_store(app, cfg["folder"])), cfg["memory_mb"], cfg["max_age"], cfg["iv_max_age"],
-            cfg["min_valid"], today_bars, today_iv, None, today_bars_many, today_iv_many, baskets)
+            cfg["min_valid"], today_bars, today_iv, None, today_bars_many, today_iv_many, baskets, contract_of)
     return svc
 
 

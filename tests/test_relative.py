@@ -186,7 +186,7 @@ def dh(monkeypatch):
 
 def test_one_read_of_the_table_gives_the_rows_of_all_the_symbols(dh):
     app, candles, straddle = dh
-    _, _, bars_many, iv_many = deephaven_readers(app)
+    _, _, bars_many, iv_many, _ = deephaven_readers(app)
     got = bars_many([("cash", "ABC"), ("cash", "XYZ"), ("fut", "NIFTY"), ("cash", "NOPE")], TODAY)
     assert candles.keys[1] == "token" and candles.keys[0]["token"].tolist() == [7, 8, 11]                  # one filter with every token
     assert set(got) == {("cash", "ABC"), ("cash", "XYZ"), ("fut", "NIFTY")} and got[("cash", "ABC")][4].tolist() == [1.5, 2.5] and got[("cash", "XYZ")][5].tolist() == [3.0]
