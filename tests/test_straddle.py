@@ -188,3 +188,37 @@ def test_the_engine_prices_the_atm_strike_from_the_spot():
     (row,) = e.sample(WHEN, now)
     r = dict(zip(StraddleEngine.COLUMNS, row))
     assert r["Fut"] == 1000.0 and r["ATMStrike"] == 1000.0 and r["V"] == 45.0
+
+
+# ---- IV = V / Synthetic * sqrt(max(dte, 1)) * 100 ------------------------------------------------------------------------------
+def test_iv_is_v_over_synthetic_times_root_of_the_days_left_times_100():
+    import math
+    e = engine()
+    feed(e, 25000.0, {4: (120, 130), 5: (100, 90), 6: (140, 150)})
+    (row,) = e.sample(WHEN, NOW)                                                        # 2030-01-10, expiry 2030-01-30: 20 days
+    r = dict(zip(StraddleEngine.COLUMNS, row))
+    assert StraddleEngine.COLUMNS[-1] == "IV" and len(row) == len(StraddleEngine.COLUMNS)
+    assert r["IV"] == 190.0 / 25010.0 * math.sqrt(20) * 100
+
+
+def test_on_the_expiry_day_the_days_left_count_as_one():
+    from algo.series.straddle import implied_vol
+    assert implied_vol(190.0, 25010.0, 0) == implied_vol(190.0, 25010.0, 1) == 190.0 / 25010.0 * 100
+    assert implied_vol(190.0, 25010.0, 4) == 190.0 / 25010.0 * 2 * 100
+    assert implied_vol(190.0, 25010.0, -3) == 190.0 / 25010.0 * 100                    # never below one day
+
+
+def test_iv_is_nan_when_the_synthetic_price_is_not_positive():
+    from algo.series.straddle import implied_vol
+    assert np.isnan(implied_vol(10.0, 0.0, 5)) and np.isnan(implied_vol(10.0, -5.0, 5)) and np.isnan(implied_vol(10.0, float("nan"), 5))
+
+
+def test_the_days_left_follow_the_sample_day_not_a_fixed_date():
+    e = engine()
+    feed(e, 25000.0, {4: (120, 130), 5: (100, 90), 6: (140, 150)})
+    first = dict(zip(StraddleEngine.COLUMNS, e.sample(WHEN, NOW)[0]))["IV"]
+    later = datetime(2030, 1, 29, 10, 0, 0, tzinfo=IST)                                  # one day before the expiry
+    for tok in list(e.px):
+        e.px[tok] = (e.px[tok][0], later.timestamp())
+    last = dict(zip(StraddleEngine.COLUMNS, e.sample(later, later.timestamp())[0]))["IV"]
+    assert last < first and abs(last - 190.0 / 25010.0 * 100) < 1e-9

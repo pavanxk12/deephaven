@@ -33,6 +33,8 @@ How master and candles work inside (workflow, which steps are numpy / DataFrame 
 
 Indicators are not part of the package: a script computes the ones it needs from the candles it reads (`examples/03_algo_template.py` does an RSI).
 
+History and comparisons: how saved days, `absolute()` (now against the same minute of past periods) and `relative()` (now against a basket) work, with the numbers measured: [docs/history_absolute_relative.md](docs/history_absolute_relative.md).
+
 ## A day
 
 Once per session (or the last line of `init.py`): `import algo; algo.install(globals(), "NSE")`. That puts plain
@@ -80,6 +82,7 @@ eod_save(day="2026-10-14", folder="/data/eod")                           # anoth
 eod_auto()                       # saves by itself every day, 5 minutes after the session ends (NSE 15:35, US 16:05)
 eod_auto("15:40")                # or at a time you choose;  eod_auto(stop=True) switches it off
 eod_load("2026-10-15")           # -> tables candles_20261015, straddle_20261015
+eod_load(days=5)                # the last 5 saved days merged -> candles_hist, straddle_hist
 eod_load()                       # every saved day merged -> candles_hist, straddle_hist
 ```
 * **The whole table is written**, every row and column, with an added `Date` column (the tables carry only a time of day).

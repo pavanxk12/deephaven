@@ -46,7 +46,7 @@ class FT:
 @pytest.fixture
 def fake_parquet(monkeypatch):
     mod = types.ModuleType("deephaven.parquet")
-    mod.write = lambda table, path: table.df.to_parquet(path)
+    mod.write = lambda table, path, compression_codec_name=None: table.df.to_parquet(path, compression=(compression_codec_name or "snappy").lower())
     mod.read = lambda path: FT(pd.read_parquet(path))
     dh = types.ModuleType("deephaven")
     dh.parquet = mod
@@ -250,3 +250,69 @@ def test_the_store_survives_an_empty_folder_listing(tmp_path, fake_parquet):
         store.load_all("candles_")
     with pytest.raises(FileNotFoundError):
         store.load_day("candles_", DAY)
+
+
+def test_files_are_written_with_zstd_and_an_older_deephaven_without_the_argument_still_saves(session, fake_parquet):
+    import pyarrow.parquet as pq
+    ns, app, tmp = session
+    ns["eod_save"](day=DAY)
+    assert pq.ParquetFile(tmp / "eod" / f"candles_{DAY}.parquet").metadata.row_group(0).column(0).compression == "ZSTD"
+    fake_parquet.write = lambda table, path: table.df.to_parquet(path)                       # no compression_codec_name argument
+    ns["eod_save"](day="2026-10-16")
+    assert (tmp / "eod" / "candles_2026-10-16.parquet").exists()
+
+
+# ---- the last N days --------------------------------------------------------------------------------------
+def three_days(ns):
+    for d in ("2026-10-13", "2026-10-14", "2026-10-15"):
+        ns["eod_save"](day=d)
+
+
+def test_a_number_of_days_loads_only_the_latest_days_merged_into_the_hist_tables(session, capsys):
+    ns, app, _ = session
+    three_days(ns)
+    ns["eod_load"](days=2)
+    assert set(ns["candles_hist"].df.Date) == {"2026-10-14", "2026-10-15"} and len(ns["candles_hist"].df) == 6 and len(ns["straddle_hist"].df) == 4
+    assert "2 day(s): 2026-10-14 to 2026-10-15" in capsys.readouterr().out
+    ns["eod_load"](1, tables=["candles"])                                                   # a bare number means the same
+    assert set(ns["candles_hist"].df.Date) == {"2026-10-15"}
+    ns["eod_load"](days=10)                                                                  # more than there are: every day there is
+    assert set(ns["candles_hist"].df.Date) == {"2026-10-13", "2026-10-14", "2026-10-15"}
+
+
+def test_the_number_of_days_is_checked(session):
+    ns, _, _ = session
+    three_days(ns)
+    for bad in (0, -1, 2.5, "3", True):
+        with pytest.raises(ValueError, match="whole number"):
+            ns["eod_load"](days=bad)
+    with pytest.raises(ValueError, match="not both"):
+        ns["eod_load"]("2026-10-15", days=2)
+
+
+def test_a_day_in_two_folders_is_loaded_once_and_the_first_folder_wins(session):
+    ns, app, tmp = session
+    three_days(ns)
+    ns["eod_save"](day="2026-10-15", folder=str(tmp / "md"))                                  # the same day also sits in the market-data folder
+    ns["eod_load"](days=3, tables=["candles"])
+    assert len(ns["candles_hist"].df) == 9
+
+
+def test_days_with_other_columns_are_reported_not_merged_and_the_rest_still_load(session, capsys):
+    ns, app, tmp = session
+    three_days(ns)
+    old = pd.read_parquet(tmp / "eod" / "straddle_2026-10-13.parquet").drop(columns=["V"])   # a file from before a column was added
+    old.to_parquet(tmp / "eod" / "straddle_2026-10-13.parquet")
+    ns["eod_load"](days=3)
+    out = capsys.readouterr().out
+    assert "other columns" in out and "2026-10-13" in out and "straddle_hist" not in ns
+    assert len(ns["candles_hist"].df) == 9                                                  # candles are fine
+    ns["eod_load"](days=2, tables=["straddle_series"])                                      # the two newer days agree
+    assert len(ns["straddle_hist"].df) == 4
+
+
+def test_the_history_plugin_can_load_only_the_last_days(session):
+    ns, app, _ = session
+    three_days(ns)
+    app.run(History(days=1))
+    assert set(ns["candles_hist"].df.Date) == {"2026-10-15"}

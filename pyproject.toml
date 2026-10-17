@@ -1,12 +1,13 @@
 [project]
 name = "algo"
 version = "0.1.0"
-description = "Deephaven trading stack: master, candles, straddle, the NATS service, the book (portfolio numbers), end of day, console."
+description = "Deephaven trading stack: master, candles, straddle, absolute() and relative() comparisons over saved history, the NATS service, the book (portfolio numbers), end of day, console."
 requires-python = ">=3.10"
 dependencies = ["pandas", "numpy"]
 
 [project.optional-dependencies]
 runtime = ["nats-py"]      # installed in the Deephaven image; needed only by the bridge
+history = ["pyarrow"]      # reads the saved days for absolute() / relative(); always present next to Deephaven, so only needed on a PC without it
 dev = ["pytest"]
 
 [tool.setuptools.packages.find]

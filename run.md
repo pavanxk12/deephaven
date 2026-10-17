@@ -86,6 +86,12 @@ straddle_stop()
 ```
 Result: the table `straddle_series`. Weekly options use the monthly future; a symbol with no future uses its spot.
 
+Columns: `Time, Symbol, Expiry, Fut, ATMStrike, ATMStraddle, MinStrike, V, Cost, CumCost, D, AltCost, AltCumCost, AltD, Synthetic, IV`.
+`IV = V / Synthetic * sqrt(max(dte, 1)) * 100`, where `V` is the minimum straddle, `Synthetic` is CE - PE + strike at that strike, and `dte` is the calendar
+days from the sample day to the expiry (the expiry day counts as 1). It is NaN when the synthetic price is not positive.
+Straddle files saved before `IV` existed (`straddle_<day>.parquet`) do not have the column. A merge of days with different columns is refused with the days named (the other table still loads); load such days one at a time (`eod_load("<day>", tables=["straddle_series"])`),
+not merged with newer days in one `eod_load()`.
+
 ---
 
 ## 4. End of day (optional)
@@ -96,8 +102,122 @@ eod_save(tables=["candles"])
 eod_save(day="2026-10-14", folder="/data/eod")
 eod_auto()                               # saves every day 5 minutes after the close;  eod_auto("15:40"),  eod_auto(stop=True)
 eod_load("2026-10-15")                   # -> candles_20261015, straddle_20261015
+eod_load(days=5)                         # the LAST 5 saved days merged -> candles_hist, straddle_hist   (eod_load(5) is the same)
 eod_load()                               # every saved day merged -> candles_hist, straddle_hist
 ```
+
+---
+
+## 4b. History files: storing them small, and loading old days (optional)
+
+* **How files are stored.** `eod_save()` writes one Parquet file per table per day, now compressed with ZSTD (about 25% smaller than before; every Parquet reader
+  still reads them). Parquet is compressed already, so putting the files in a tar or zip saves nothing; a plain `tar` is only for copying many files as one.
+  Keep the files flat in one folder, one per day: `eod_load("2026-05-15")` finds `candles_2026-05-15.parquet` in the EOD folder and in `/data/fo_market_data`.
+* **Loading.** Load the days you need: `eod_load("2026-05-15")` for one day, `eod_load(days=20)` for the last 20 saved days merged. Avoid `eod_load()` with no day on a big history: it merges every file into one table
+  (the US 2026 set below is 208 million rows).
+* **Vendor 1-minute OHLCV files** (`ts_event, symbol, open, high, low, close, volume, instrument_id`, one file per day) are not in our format (other column
+  names, no `Date`, no `token`). Convert them with the stand-alone tool (needs `pyarrow`, not part of the wheel):
+  ```
+  python tools/convert_us_ohlcv.py  <folder of daily files>  <output folder>  [--symbols AAPL,SPY | --symbols-file list.txt]
+                                    [--session 09:30-16:00]  [--zstd-level 9]  [--tar out.tar]
+  ```
+  It writes `candles_<day>.parquet` (+ `.meta.json`) with the columns of the `candles` table (Minute, Symbol, token, Open, High, Low, Close, Volume) and a
+  `Date`, sorted by Symbol then Minute with ZSTD (about 28% smaller than the vendor file), and a `manifest.json` with row counts and SHA-256 per file. Each file is
+  checked (rows, volume) before it counts; nothing is overwritten without `--force`; a bad file is reported and the rest carry on. `token` is the vendor's
+  `instrument_id`, which is **not** a token of the contract master: join to the master by `Symbol`. To save disk, convert only the symbols you use (`--symbols-file`) and
+  the hours you need (`--session`): 9,600 symbols for pre-market to after-hours is 12 MB a day, a few hundred symbols is a small fraction of that.
+  Copy the output folder (or the tar, then `tar -xf`) into `/data/fo_market_data/` of the server that needs it.
+* **GDFL India cash CSVs** (`GFDLCM_STOCK_ddmmyyyy.csv`, columns `Ticker, Date, Time, Open, High, Low, Close, Volume, Open Interest`; the folders may be nested):
+  `python tools/convert_gdfl_csv.py <root folder> <output folder> [--symbols-file list.txt] [--session 09:15-15:30] [--tar out.tar]`. Same output as above
+  (`candles_<day>.parquet` + `.meta.json` + `manifest.json`). Details: the times are India time and end in `:59`, so a bar's `Minute` is the time without the
+  seconds (09:15:59 is the 09:15 bar), stored as UTC like the live candles; `Symbol` is the ticker without `.NSE` (`RELIANCE`, and `ABC.BE` for another series);
+  Open Interest is dropped. The CSV has no instrument ids, so `token` is a made-up number per ticker starting at 10,000,000, kept in `tickers.json` in the output
+  folder and reused by every later run (do not delete it; copy it with the files). It is **not** a token of the contract master: join by `Symbol`. A file whose
+  name and `Date` column disagree, with a missing column or with a zero price is reported and skipped; a second file for the same day is reported too.
+
+---
+
+## 4c. absolute(): where is the value now compared with the same time before (optional)
+
+A plain function: it computes when you call it and returns; nothing runs in the background (no listener, no thread, no start or stop).
+
+```python
+hist, idx = absolute("iv", "intraday", "NIFTY", 22)          # IV now against the IV at this minute on each of the last 22 days
+hist, idx = absolute("pct", "intraday", "NIFTY FUT", 22, ref="10min")   # % change from 10 minutes ago, now vs the same minute of the last 22 days
+hist, idx = absolute("pct", "intraweek", "RELIANCE FUT", 5, ref="vwap")  # % from the weekly VWAP, same weekday and minute, last 5 weeks
+r = absolute("pct", "intramonth", "AAPL", 4, ref="09:30")    # % from the 09:30 price; r.now  r.n_valid  r.pctile  r.minute  r.dates  r.ref
+absolute("pct", "intraday", "NIFTY FUT", 22, ref="prev_close", at="2026-03-20 11:30")   # as of another moment (exchange time)
+absolute("iv", "intraday", "NIFTY", 22, now=3.1)             # you give the current value
+absolute_warm("pct", "intraday", ["AAPL", "MSFT"], 22, ref="10min")   # read the history of many symbols ahead, one read per day file (same series and ref as the calls to come)
+absolute_settings(memory_mb=300)                              # the cache limit (default 200 MB); no arguments just shows it
+```
+* `hist` is the n past values at the same session minute (oldest first; NaN where that day had no value). `idx` is how many of them are below the value now:
+  0 = lowest, n_valid = highest, -1 = cannot tell (no value now, or fewer than half of n past values; `absolute_settings(min_valid=...)`).
+* **series and the reference point.** `pct` is the percent change of the price from a **reference point you choose with `ref=`** (the default is `"open"`), so one function covers every
+  case and nothing has to be written again; `iv` is the `IV` of the nearest expiry in `straddle_series` (with `ref=` it is the percent change of the IV from that point). The choices:
+
+  | `ref` | the price (or IV) is measured from |
+  |---|---|
+  | `"open"` | the open of the period: the day's (`intraday`), the week's (`intraweek`) or the month's (`intramonth`) |
+  | `"vwap"` | the VWAP since that open ((H+L+C)/3 x volume), prices only |
+  | `"prev_close"` | the last value of the previous trading day |
+  | `"10min"` (any `"1min"` to `"389min"`; a bare number is minutes too) | the value that many minutes earlier (NaN before the session has that many minutes) |
+  | `"09:30"` (any time inside the session, exchange time) | the value at that minute of the same day (NaN until that time has come) |
+
+  `pct_open` and `pct_vwap` still work as shorthands for `pct` with `ref="open"` / `"vwap"`. With `level="intraweek"` and `ref="10min"` the comparison points are the same weekday and minute
+  of the previous weeks, each measured from 10 minutes before itself. **level:** `intraday` (previous n trading days; open and VWAP restart each day), `intraweek` (same weekday and minute of the previous n weeks;
+  weekly open and VWAP), `intramonth` (same trading-day-of-the-month and minute of the previous n months; monthly open and VWAP).
+  **symbol:** `"RELIANCE"` (cash), `"NIFTY FUT"` (the nearest unexpired future of each day, so it rolls), `"NIFTY 27OCT26 FUT"` (one contract); for `iv` the underlying.
+* **Time** is the exchange's own session minute (minutes since the open, from its time zone), not UTC and not a position in an array: a bar missing on one day cannot shift the
+  rest, and the US clock change needs no care (09:30 New York is session minute 0 in summer and winter). A price is carried forward at most 5 minutes (an IV 3); beyond that the
+  point is NaN and left out. The comparison minute is the latest closed bar; before the open it is the first minute, after the close the last.
+* **Where the data comes from:** history from the saved `candles_<day>.parquet` / `straddle_<day>.parquet` files (the EOD folder and `/data/fo_market_data`), read with pyarrow one
+  symbol and one day at a time into ONE shared cache with a size limit, about 5 KB per symbol per day as float32 (22 days of 1,900 symbols fit in 200 MB; the oldest entries go first);
+  today so far is read from the `candles` / `straddle_series` table for that one symbol at the moment of the call. Deephaven's own memory is not used for history.
+* **Speed (measured on the real files):** the first call for a symbol reads its history, about 0.5 s for 22 days (0.1 s from smaller row groups); after that about 0.1 ms plus the read of
+  today's rows. `absolute_warm` reads each day file once for many symbols: 300 symbols x 22 days in 1.5 s, instead of 143 s one symbol at a time. Warm in your script before a
+  listener starts calling.
+* **History for each kind of symbol:** cash stocks: `candles_<day>` files (US vendor files and the GDFL cash files converted with `tools/`); futures: `tools/convert_gdfl_futures.py`
+  turns the futures of the F&O files into `candles_<day>` files named like the master (`NIFTY 27JAN26 FUT`); IV: `straddle_<day>` files (`tools/build_straddle_history.py`).
+  Put them in the EOD folder or `/data/fo_market_data/`. A missing day simply gives NaN for that day.
+
+---
+
+## 4d. relative(): where is a symbol now compared with a basket of other symbols (optional)
+
+Also a plain function that computes when called. The same three series and levels as `absolute()`, but the comparison is across symbols, now:
+
+```python
+values, idx = relative("pct", "intraday", "HDFCBANK", ref="10min")      # % change over the last 10 minutes: HDFCBANK against the other symbols of the basket it is defined in (baskets.txt), now
+values, idx = relative("pct", "intraday", "HDFCBANK", "banks")          # explicitly against that basket (it may or may not hold HDFCBANK); the default ref is the open
+values, idx = relative("pct", "intraweek", "RELIANCE", ["TCS", "INFY"], ref="vwap")   # a list works too; each from its weekly VWAP
+r = relative("iv", "intraday", "NIFTY", "index_complex")                  # r.now  r.symbols  r.n_valid  r.pctile  r.minute
+relative("pct", "intraday", "HDFCBANK", "banks", ref="09:45", at="2026-03-20 11:30")   # from the 09:45 price, as of another moment (exchange time)
+```
+* **Which basket:** with no basket given, the symbol is ranked in the basket it is defined in. If it is in no basket, or in several, the call says so and names the baskets to choose from
+  (`relative(..., "banks")`). With a basket name or a list, it is ranked there, whether or not it is one of its members; `r.basket` tells which basket was used.
+* `values` is the series now for each basket symbol (the symbol itself is left out; NaN where one has no value, and `r.symbols` names them in the same order). `idx` is how many of
+  them are below the symbol's own value: 0 = lowest, n = highest, -1 = cannot tell (no value for the symbol, or fewer than half of the basket has a value). `level` chooses what the
+  open / VWAP is measured from for every symbol: today's, this week's or this month's; the `ref` (open, vwap, prev_close, N minutes ago, a fixed time) is the same for every symbol; `iv`
+  uses the underlying's IV.
+* **Cost:** today's rows of the whole basket come from ONE read of the `candles` table; for a week or a month the earlier days of that period are read once for the whole basket from the
+  saved files. Measured: 60 symbols in 0.04 s (day) to 0.4 s (month); a basket of 1,500 symbols in 0.2 s (day) and 0.9 s (week).
+* **Baskets** live in a text file, `baskets.txt`, in `/data/fo_market_data/` (next to `stocks.txt`; else in the state folder; `absolute_settings(basket_file=...)` names another):
+  ```
+  # a comment
+  [banks]
+  HDFCBANK
+  ICICIBANK, SBIN, AXISBANK        # one symbol per line or separated by commas
+  [nifty_complex]
+  NIFTY FUT
+  BANKNIFTY FUT
+  ```
+  A symbol is written as in `absolute()` (`RELIANCE`, `NIFTY FUT`, `NIFTY 27OCT26 FUT`; spaces inside a symbol are part of it). Names use letters, digits and `_ . -`. The file is read again
+  whenever it changes (its time and size are checked at each call; nothing runs in the background). A mistake is reported with its line number and `relative()` refuses until it is fixed.
+* **From the terminal:** `basket()` lists the baskets, `basket("banks")` shows one, `basket("banks", ["HDFCBANK", "SBIN"])` creates or replaces it, `basket("banks", add=["AXISBANK"])`,
+  `basket("banks", remove=["SBIN"])`, `basket("banks", delete=True)`. These write into the same `baskets.txt`: only that basket's lines change, your comments and the other baskets stay.
+  A file in a read-only mounted folder is not changed from here (it says so); edit it on the host or point `basket_file` to a writable one. With no file yet, the first change creates it in the
+  first writable place.
 
 ---
 

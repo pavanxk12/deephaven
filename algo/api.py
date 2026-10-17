@@ -106,6 +106,121 @@ def straddle_stop() -> None:
     _app().stop("straddle")
 
 
+def absolute(series: str, level: str, symbol: str, n: int = 22, ref=None, now: "float | None" = None, at=None):
+    """Where does the value NOW stand among the values at the SAME POINT IN TIME of the previous n periods? A plain function: nothing runs in the background.
+        hist, idx = absolute("iv", "intraday", "NIFTY", 22)
+        hist, idx = absolute("pct", "intraday", "NIFTY FUT", 22, ref="10min")      % change from 10 minutes ago, now vs the same minute of the last 22 days
+        hist = the n past values at this session minute (oldest first, NaN where missing); idx = how many of them are below the value now (0 = lowest ... n = highest, -1 = cannot tell).
+        The result also has .now .n_valid .pctile .minute .dates .ref.
+    series: "pct" (the percent change of the price from a reference point, chosen with ref=) | "iv" (the IV of straddle_series; with ref= its percent change) |
+            "pct_open" and "pct_vwap" (shorthands for series "pct" with ref "open" / "vwap").
+    ref (the reference point a percent is measured from; default "open"):
+        "open"        the open of the period: day open (intraday), week open (intraweek), month open (intramonth)
+        "vwap"        the VWAP since that open (price only)
+        "prev_close"  the last value of the previous trading day
+        "10min"       10 minutes ago (any number of minutes: "1min" ... "389min")
+        "09:30"       a fixed time of the day (exchange time): the value at that minute; NaN before that time has come
+    level: "intraday" (same minute, previous n days) | "intraweek" (same weekday and minute, previous n weeks) | "intramonth" (same trading day of the month and minute, previous n months).
+    symbol: "RELIANCE" (cash), "NIFTY FUT" (nearest future, rolling), "NIFTY 27OCT26 FUT"; for "iv" the underlying.
+    now=: give the current value yourself.  at=: evaluate as of another moment, in exchange time: "HH:MM", "2026-03-20 11:30", a datetime or epoch seconds.
+    How it works: history is read from the saved candles_<day> / straddle_<day> files (one symbol and one day at a time, kept in one size-limited cache);
+    today so far is read from the candles / straddle_series table for this one symbol at the moment of the call. Time is the exchange's own session minute, so the
+    US clock change needs no care. The first call for a symbol reads its history (about half a second for 22 days); absolute_warm() does many symbols ahead in one go."""
+    return _absolute().absolute(series, level, symbol, n, ref=ref, now=now, at=at)
+
+
+def relative(series: str, level: str, symbol: str, basket=None, ref=None, now: "float | None" = None, at=None):
+    """Where does the value NOW of a symbol stand among the values now of the other symbols of a basket? A plain function, computed at the call.
+        values, idx = relative("pct", "intraday", "HDFCBANK", ref="10min")            the basket HDFCBANK is defined in (baskets.txt); says so if it is in none or in several
+        values, idx = relative("pct", "intraday", "HDFCBANK", "banks", ref="open")    explicitly that basket: it may or may not hold HDFCBANK
+        values = the series now for each basket symbol (the symbol itself left out; NaN where a symbol has no value); idx = how many of them are below the symbol's value
+        (0 = lowest ... n = highest, -1 = cannot tell). The result also has .now .n_valid .pctile .symbols (the names the values belong to) .basket .minute .ref.
+    series and ref: as in absolute(): series "pct" measured from ref ("open" | "vwap" | "prev_close" | "10min" minutes ago | "09:30" a fixed time of the day; default "open"),
+    "iv" (the IV of the underlying; with ref= its percent change), or the shorthands "pct_open" / "pct_vwap". level: "intraday" | "intraweek" | "intramonth": it sets which
+    period the open / VWAP belongs to (today's, this week's, this month's); every symbol of the basket is measured the same way. basket: None (the symbol's own basket), a
+    basket's NAME (see basket()) or a list of symbols.
+    Today's rows of all the symbols are read in ONE read; the earlier days a reference needs (a week's or month's, the previous day) are read once for the whole basket.
+    now=: give the symbol's value yourself. at=: evaluate as of another moment ("HH:MM", "2026-03-20 11:30", a datetime or epoch seconds, exchange time)."""
+    return _absolute().relative(series, level, symbol, basket, ref=ref, now=now, at=at)
+
+
+def basket(name: "str | None" = None, symbols=None, add=None, remove=None, delete: bool = False):
+    """Baskets of symbols for relative(): a text file you edit, or this function. They live in baskets.txt:
+        # baskets.txt   (in /data/fo_market_data/ next to stocks.txt, else in the state folder; absolute_settings(basket_file=...) names another file)
+        [banks]
+        HDFCBANK
+        ICICIBANK, SBIN, AXISBANK          # symbols one per line or separated by commas; # starts a comment
+        [nifty_complex]
+        NIFTY FUT
+        BANKNIFTY FUT
+    and then  relative("pct_open", "intraday", "HDFCBANK", "banks").
+    From the terminal:
+        basket()                                    the baskets in the file, with their sizes
+        basket("banks")                             the symbols of one
+        basket("banks", ["HDFCBANK", "SBIN"])       create it, or replace it
+        basket("banks", add=["AXISBANK"]);  basket("banks", remove=["SBIN"])
+        basket("banks", delete=True)
+    A change is written into the same baskets.txt; only that basket's lines change (your comments and the other baskets stay). The file is read again whenever it changes;
+    a mistake in it is reported with its line number (and relative() refuses until it is fixed). A file in a read-only mounted folder cannot be changed from here."""
+    store = _absolute().baskets
+    if name is None:
+        names = store.names()
+        print(f"baskets in {store.path or store.paths}: " + (", ".join(f"{n} ({len(store.get(n))})" for n in names) if names else "none"))
+        return names
+    if delete:
+        store.delete(name)
+        print(f"basket {name!r} deleted from {store.path or store.paths}")
+        return []
+    if symbols is not None:
+        store.define(name, symbols)
+    elif add is not None or remove is not None:
+        store.edit(name, add or (), remove or ())
+    out = store.get(name)
+    print(f"basket {name!r}: {len(out)} symbols: " + ", ".join(out[:12]) + (" ..." if len(out) > 12 else ""))
+    return out
+
+
+def absolute_warm(series: str, level: str, symbols, n: int = 22, ref=None, at=None) -> int:
+    """Read the saved history for many symbols ahead of time, each day file once for all of them (300 symbols x 22 days in about 1.5 s), so the absolute() calls that
+    follow are instant (about 0.1 ms plus the read of today's rows). Use the same series and ref as the calls that will follow. It warms as many symbols as the cache holds
+    and says so. Returns how many were warmed."""
+    return _absolute().warm(series, level, symbols, n, ref=ref, at=at)
+
+
+def absolute_settings(memory_mb: "float | None" = None, max_age: "int | None" = None, iv_max_age: "int | None" = None, min_valid: "int | None" = None,
+                      folder: "str | None" = None, basket_file: "str | None" = None, clear: bool = False) -> dict:
+    """Show or change what absolute() uses: memory_mb (the limit of its cache, default 200; about 5 KB per symbol per day), max_age (minutes a price is carried, 5),
+    iv_max_age (minutes an IV is carried, 3), min_valid (how many of the n past values must exist; default half of n), folder (where the saved files are; default the
+    EOD folder and the market-data folder), basket_file (the baskets text file; default baskets.txt in the market-data folder, then in the state folder). Changing any of them, or clear=True, empties the cache. Returns the current cache numbers."""
+    app = _app()
+    cfg = app.shared.setdefault("absolute_settings", {"memory_mb": 200, "max_age": 5, "iv_max_age": 3, "min_valid": None, "folder": None, "basket_file": None})
+    changed = clear
+    for key, value in (("memory_mb", memory_mb), ("max_age", max_age), ("iv_max_age", iv_max_age), ("min_valid", min_valid), ("folder", folder), ("basket_file", basket_file)):
+        if value is not None and cfg[key] != value:
+            cfg[key], changed = value, True
+    if changed:
+        app.shared.pop("absolute_service", None)
+    stats = _absolute().stats()
+    print(f"absolute(): {cfg} | cache {stats['cache_mb']} MB in {stats['cache_entries']} entries")
+    return stats
+
+
+def _absolute():
+    """The one shared AbsoluteService of the session (made on first use; only a cache, no thread, no listener)."""
+    from algo.series.absolute import AbsoluteService, Baskets, Clock, ParquetSource, deephaven_readers
+    app = _app()
+    svc = app.shared.get("absolute_service")
+    if svc is None:
+        cfg = app.shared.setdefault("absolute_settings", {"memory_mb": 200, "max_age": 5, "iv_max_age": 3, "min_valid": None, "folder": None, "basket_file": None})
+        today_bars, today_iv, today_bars_many, today_iv_many = deephaven_readers(app)
+        places = [cfg["basket_file"]] if cfg.get("basket_file") else [os.path.join(app.paths.market_data, "baskets.txt"), os.path.join(app.paths.state, "baskets.txt")]
+        baskets = Baskets(places)
+        svc = app.shared["absolute_service"] = AbsoluteService(
+            Clock(app.market.zone, app.market.session), ParquetSource(make_store(app, cfg["folder"])), cfg["memory_mb"], cfg["max_age"], cfg["iv_max_age"],
+            cfg["min_valid"], today_bars, today_iv, None, today_bars_many, today_iv_many, baskets)
+    return svc
+
+
 def eod_save(day: str | None = None, folder: str | None = None, tables=None, snapshot: bool = True) -> None:
     """Save the whole candles and straddle tables to Parquet files: candles_<day>.parquet, straddle_<day>.parquet (each with
     a Date column and a small .meta.json beside it). `tables=["candles", "straddle_series"]` chooses.
@@ -117,21 +232,29 @@ def eod_save(day: str | None = None, folder: str | None = None, tables=None, sna
         print(f"  {r['table']:<17} {r['status']:<8} {r['rows']:>12,} rows  {r['path'] or ''}")
 
 
-def eod_load(day: str | None = None, folder: str | None = None, tables=None) -> None:
-    """Load saved files back as tables. eod_load("2026-10-15") -> candles_20261015, straddle_20261015;
-    eod_load() merges every saved day -> candles_hist, straddle_hist."""
+def eod_load(day: "str | int | None" = None, folder: str | None = None, tables=None, days: int | None = None) -> None:
+    """Load saved files back as tables. eod_load("2026-10-15") -> candles_20261015, straddle_20261015.
+    eod_load(days=5) (or eod_load(5)) merges the LAST 5 saved days -> candles_hist, straddle_hist; eod_load() merges every saved day.
+    `tables=["straddle_series"]` chooses. A day is looked for in the EOD folder and in the market-data folder."""
     app = _app()
+    if isinstance(day, int) and not isinstance(day, bool):                    # eod_load(5) means the last 5 days
+        day, days = None, (day if days is None else days)
+    if day is not None and days is not None:
+        raise ValueError("give a day (eod_load('2026-10-15')) or a number of days (eod_load(days=5)), not both")
+    if days is not None and (isinstance(days, bool) or not isinstance(days, int) or days < 1):
+        raise ValueError(f"days must be a whole number from 1, like 5, got {days!r}")
     store = make_store(app, folder)
     for prefix in [PREFIX[t] for t in (tables or DEFAULT_TABLES)]:
         try:
             if day is None:
-                table, n = store.load_all(prefix)
-                name, note = f"{prefix}hist", f"{n} file(s)"
+                table, n = store.load_all(prefix, last=days)
+                span = [d for d, _ in store.days(prefix)][-n:]
+                name, note = f"{prefix}hist", f"{n} day(s): {span[0]} to {span[-1]}"
             else:
                 d = normalise_day(day, app.market.zone)
                 table = store.load_day(prefix, d)
                 name, note = f"{prefix}{d.replace('-', '')}", d
-        except FileNotFoundError as e:
+        except (FileNotFoundError, ValueError) as e:                              # no such file, or days with different columns: say so, go on
             print(f"  {prefix}: {e}")
             continue
         app.publish(name, table)
@@ -482,6 +605,7 @@ GROUPS = {
                         "pf_unpause", "pf_squareup", "pf_unsubscribe", "pf_apply", "nats_block", "nats_unblock"),
     "AUTOMATIONS (a script you write)": ("algo_start", "algo_stop", "pf_track", "pf_assign", "pf_activate", "pf_leg", "pf_mark", "pf_cooling", "pf_allowed",
                                          "algo_sending", "watch", "algo_portfolios", "algo_pause", "algo_unpause", "algo_exit", "algo_unsubscribe"),
+    "ABSOLUTE / RELATIVE (now vs before, now vs a basket)": ("absolute", "relative", "basket", "absolute_warm", "absolute_settings"),
     "CONSOLE (one window per strategy)": ("console_open",),
     "WHAT IS RUNNING": ("algo_status", "algo_help"),
 }
@@ -508,7 +632,7 @@ FUNCTIONS = (master_build, contract, contracts, expiries, strikes, nearest_strik
              pf_subscribe, pf_pause, pf_unpause, pf_squareup, pf_unsubscribe, pf_apply, nats_block, nats_unblock,
              registry_start, registry_connect, registry_stop, pf_create, pf_register, pf_list, algo_start, algo_stop, pf_track,
              pf_assign, pf_activate, pf_leg, pf_mark, pf_cooling, pf_allowed, algo_sending, watch, algo_portfolios, algo_pause, algo_unpause, algo_exit,
-             algo_unsubscribe, console_open, algo_status, algo_help)
+             algo_unsubscribe, console_open, absolute, relative, basket, absolute_warm, absolute_settings, algo_status, algo_help)
 
 
 def install(ns: dict, market: str = "NSE", paths: Paths | None = None, level: int = logging.INFO) -> App:

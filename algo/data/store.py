@@ -25,6 +25,7 @@ _log = logmod.get("eod")
 PREFIX = {"candles": "candles_", "straddle_series": "straddle_"}
 PLUGIN = {"candles": "candles", "straddle_series": "straddle"}
 DEFAULT_TABLES = ("candles", "straddle_series")
+COMPRESSION = "ZSTD"                                      # the codec of the Parquet files this module writes (any reader handles them)
 
 
 def normalise_day(day: "str | None", zone) -> str:
@@ -66,7 +67,10 @@ class Store:
         final = self.path(prefix, day)
         tmp = final[:-len(".parquet")] + ".tmp.parquet"
         try:
-            parquet.write(out, tmp)
+            try:
+                parquet.write(out, tmp, compression_codec_name=COMPRESSION)       # ZSTD: about 25% smaller than the default codec
+            except TypeError:                                                     # an older Deephaven without that argument
+                parquet.write(out, tmp)
             replace_with_retry(tmp, final)
         finally:
             if os.path.exists(tmp):
@@ -92,14 +96,33 @@ class Store:
             raise FileNotFoundError(f"no {prefix}{day}.parquet in {', '.join(self.read_dirs)}")
         return parquet.read(p)
 
-    def load_all(self, prefix: str):
-        """Merge every saved day with this prefix into one table. Returns (table, number of files)."""
+    def days(self, prefix: str) -> list[tuple[str, str]]:
+        """[(day, path)] of every saved day with this prefix, oldest first. A day that is in two folders is taken from the first."""
+        found: dict[str, str] = {}
+        for d in self.read_dirs:
+            for f in sorted(glob.glob(os.path.join(d, f"{prefix}*.parquet"))):
+                name = os.path.basename(f)
+                if ".tmp." not in name:
+                    found.setdefault(name[len(prefix):-len(".parquet")], f)
+        return sorted(found.items())
+
+    def load_all(self, prefix: str, last: int | None = None):
+        """Merge the saved days with this prefix into one table: every day, or only the `last` N days. Returns (table, number of files)."""
         from deephaven import merge, parquet
-        files = sorted({f for d in self.read_dirs for f in glob.glob(os.path.join(d, f"{prefix}*.parquet"))
-                        if ".tmp." not in f})
-        if not files:
+        if last is not None and (isinstance(last, bool) or not isinstance(last, int) or last < 1):
+            raise ValueError(f"days must be a whole number from 1, like 5, got {last!r}")
+        days = self.days(prefix)
+        if not days:
             raise FileNotFoundError(f"no {prefix}*.parquet in {', '.join(self.read_dirs)}")
-        return merge([parquet.read(f) for f in files]), len(files)
+        if last is not None:
+            days = days[-last:]
+        tables = [(day, parquet.read(path)) for day, path in days]
+        first = getattr(tables[0][1], "column_names", None)
+        odd = [day for day, t in tables if getattr(t, "column_names", first) != first]
+        if odd:                                                    # a table needs the same columns in every day it is merged from
+            raise ValueError(f"{prefix}: the days {', '.join(odd[:5])} have other columns than {tables[0][0]} (files saved by an older version?). "
+                             f"Load the days one at a time, or load fewer days")
+        return merge([t for _, t in tables]), len(tables)
 
 
 def make_store(app, folder: str | None = None) -> Store:
@@ -188,16 +211,16 @@ class History(Plugin):
     """Loads every saved day back as tables `<prefix>hist` (`candles_hist`, `straddle_hist`)."""
     name = "history"
 
-    def __init__(self, prefixes: tuple[str, ...] = ("straddle_", "candles_"), folder: str | None = None):
+    def __init__(self, prefixes: tuple[str, ...] = ("straddle_", "candles_"), folder: str | None = None, days: int | None = None):
         super().__init__()
-        self.prefixes, self.folder = prefixes, folder
+        self.prefixes, self.folder, self.days = prefixes, folder, days            # days: only the last N days (None = every day)
 
     def start(self) -> None:
         store = make_store(self.app, self.folder)
         for prefix in self.prefixes:
             try:
-                table, n = store.load_all(prefix)
-            except FileNotFoundError as e:
+                table, n = store.load_all(prefix, last=self.days)
+            except (FileNotFoundError, ValueError) as e:
                 self.log.warning("%s", e)
                 continue
             self.app.publish(f"{prefix}hist", table)

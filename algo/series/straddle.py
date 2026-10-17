@@ -6,9 +6,10 @@ the `candles` table and writes `straddle_series`.
 from __future__ import annotations
 
 import itertools
+import math
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -38,6 +39,14 @@ class SeriesDef:
     ce: tuple[int, ...]
     pe: tuple[int, ...]
     ref_kind: str = "FUT"
+
+
+def implied_vol(v: float, synthetic: float, dte: int) -> float:
+    """The IV column: v / synthetic * sqrt(max(dte, 1)) * 100, with `dte` the calendar days left to the expiry (at least 1, so the expiry day
+    itself counts as one day). NaN when the synthetic price is not positive."""
+    if not synthetic > 0:
+        return float("nan")
+    return float(v / synthetic * math.sqrt(max(dte, 1)) * 100.0)
 
 
 def reference_future(fut_expiries: list, option_expiry) -> int:
@@ -120,7 +129,7 @@ class StraddleEngine:
     """Feed prices with `set_price`, call `sample(when, now_ts)` once per minute; get one output row per series."""
 
     COLUMNS = ("Time", "Symbol", "Expiry", "Fut", "ATMStrike", "ATMStraddle", "MinStrike", "V",
-               "Cost", "CumCost", "D", "AltCost", "AltCumCost", "AltD", "Synthetic")
+               "Cost", "CumCost", "D", "AltCost", "AltCumCost", "AltD", "Synthetic", "IV")
 
     def __init__(self, defs: dict, cfg: StraddleConfig):
         self.defs, self.cfg = defs, cfg
@@ -224,10 +233,11 @@ class StraddleEngine:
         st.altcum += alt_cost
 
         synth = get(d.ce[best_i]) - get(d.pe[best_i]) + float(strikes[best_i])
+        iv = implied_vol(best_v, synth, (date.fromisoformat(key[1]) - st.day).days)
         return (stamp, key[0], key[1], float(fut),
                 float(strikes[atm]), float(strad(atm)), float(strikes[best_i]), float(best_v),
                 float(cost), float(st.cum), float(best_v + st.cum),
-                float(alt_cost), float(st.altcum), float(best_v + st.altcum), float(synth))
+                float(alt_cost), float(st.altcum), float(best_v + st.altcum), float(synth), iv)
 
 
 def replay(engine: "StraddleEngine", ts, token, close, bucket: int, cadence: int, offset_s: int, session, zone, write) -> int:
@@ -289,7 +299,7 @@ class Straddle(Plugin):
         self.follow("candles", self._restart)
         s = dht.string
         d = dht.double
-        self._writer = DynamicTableWriter(dict(zip(StraddleEngine.COLUMNS, (s, s, s, d, d, d, d, d, d, d, d, d, d, d, d))))
+        self._writer = DynamicTableWriter(dict(zip(StraddleEngine.COLUMNS, (s, s, s, d, d, d, d, d, d, d, d, d, d, d, d, d))))
         app.publish("straddle_series", self._writer.table)
 
         self.listen(app.table("candles"), self._on_candles, replay=False)        # live prices first, as before the backfill

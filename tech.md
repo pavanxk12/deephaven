@@ -272,6 +272,12 @@ Allowed imports (test-enforced): `core` knows nothing; `data` uses core; `series
 
 ---
 
+## 10b. History, `absolute()` and `relative()`
+
+Saved days (`candles_<day>`, `straddle_<day>` Parquet files, from `eod_save` and the converters in `tools/`) feed two plain functions that compute on call and keep only a size-limited cache: `absolute(series, level, symbol, n)` compares a symbol with its own past at the same exchange session minute, and `relative(series, level, symbol, basket)` compares it with a basket from `baskets.txt`. Details, formulas, costs and checks: `docs/history_absolute_relative.md`.
+
+---
+
 ## 11. Extending it
 
 * **A new algo**: copy `examples/03_algo_template.py`, change `STRATEGY`, `USER`, the signal and the sizing. Nothing in the package changes.
