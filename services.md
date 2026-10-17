@@ -74,7 +74,7 @@ One connection for every algo and the UI, for subscribe, pause, unpause, squareu
 - **Started once, connected to by everyone:** `nats_start(...)` is run once for all the users and is safe to call again (it does nothing); an algo
   calls `nats_connect(user=..., client=...)`, which only checks. `nats_restart(...)` is the deliberate restart, `nats_add_user(...)` adds a user
   without one. The registry works the same way (`registry_start` / `registry_connect`).
-- **A switch for each algo and the UI:** they all start OFF and each says `nats_send(True, client="bridge_nifty")` for itself, so one algo
+- **A switch for each strategy:** they all start OFF and each says `nats_send(True, client="nifty_sma")` for itself, so one algo
   stopping never stops another. There is also a master switch (`nats_send(False)`) for everyone. A command goes out only when both are on.
 - **Users and portfolios:** started with the users that may send (`users=[3,4]`); every command is for one user; a portfolio is user + number.
 - **Order and speed:** one event loop on one thread, one queue per (user, portfolio) so commands for one portfolio stay in order and different

@@ -319,7 +319,7 @@ def _nats_line(cfg) -> str:
 
 def nats_start(ip: str | None = None, port: int | None = None, users=None, *, send: bool = True,
                dry_run: bool | None = None, **config) -> None:
-    """Start the ONE NATS service that every algo and the UI send portfolio commands through. Start it once, for everyone:
+    """Start the ONE NATS service that every algo and the console send portfolio commands through. Start it once, for everyone:
 
         nats_start("192.168.1.130", 4222, users=[3, 4])  the server's address and port, and ALL the users that may send
 
@@ -328,7 +328,7 @@ def nats_start(ip: str | None = None, port: int | None = None, users=None, *, se
     because restarting cuts off every algo. An algo should call nats_connect() instead.
     Every command says which user it is for (pf_pause(1913, user=4)); with a single user it may be left out; a command for a user
     not listed is refused (user_not_allowed). nats_start(dry_run=True) opens no connection and only logs.
-    The master switch starts ON, but each algo and the UI starts OFF and must switch itself on (bridge.send_on()).
+    The master switch starts ON, but each strategy starts OFF and must switch itself on (nats_send(True, client="name")).
     Other settings: timeout_s, max_in_flight, lane_depth, sender (see NatsConfig)."""
     previous = _app().get("nats")
     cfg, given = _nats_wanted(previous, ip, port, users, send, dry_run, config)
@@ -351,7 +351,7 @@ def nats_start(ip: str | None = None, port: int | None = None, users=None, *, se
 def nats_restart(ip: str | None = None, port: int | None = None, users=None, *, send: bool = True,
                  dry_run: bool | None = None, **config) -> None:
     """Stop the NATS service and start it again, on purpose: nats_restart(port=4223). The ip, port, users and other settings are
-    those of the running service unless you name them. It cuts off every algo for a moment, and every algo and the UI starts OFF
+    those of the running service unless you name them. It cuts off every algo for a moment, and every strategy starts OFF
     again and must switch itself on. Naming users here UNBLOCKS them and every portfolio under them (you are allowing them
     again); a restart with no users keeps every block."""
     previous = _app().get("nats")
@@ -374,8 +374,8 @@ def _service_down(what: str) -> None:
 
 
 def nats_connect(user: int | None = None, client: str | None = None) -> bool:
-    """What an algo or the UI calls instead of nats_start: it only CHECKS that the shared service is running (and that your user may
-    send), changes nothing, and says so. Returns True when you can go on.  nats_connect(user=4, client="bridge_nifty")"""
+    """What an algo calls instead of nats_start: it only CHECKS that the shared service is running (and that your user may
+    send), changes nothing, and says so. Returns True when you can go on.  nats_connect(user=4, client="nifty_sma")"""
     svc = _nats()
     if svc is None:
         print("The NATS service is not running. Start it once with nats_start(ip, port, users=[...]); do not start it from an algo.")
@@ -403,12 +403,14 @@ def nats_add_user(user) -> None:
 
 
 def nats_send(on: bool = True, client: str | None = None) -> None:
-    """The switches. Every algo and the UI has its own, and they all start OFF; the service also has a master switch for everyone.
+    """The switches. Every automation (strategy) has its own and starts OFF; the service also has a master switch for everyone. (The console's buttons are not a
+    client: they send as an operator and need only the master switch; its ON / OFF button flips the master in the all-strategies window and one strategy's switch in that
+    strategy's window.)
 
-        nats_send(True, client="bridge_nifty")    this algo may send (nats_send(False, client=...) stops only this algo)
+        nats_send(True, client="nifty_sma")       this strategy may send (nats_send(False, client="nifty_sma") stops only it); the name is the one given to algo_start
         nats_send(False)                          the master switch: nothing is sent for anyone;  nats_send(True) lets them again
 
-    A command goes out only when the master switch and its own algo's switch are both on."""
+    A command goes out only when the master switch and its own strategy's switch are both on. A name that is not a running strategy is refused with the list of those that are."""
     svc = _nats()
     if svc is None:
         return _service_down("nats_send")
@@ -416,10 +418,12 @@ def nats_send(on: bool = True, client: str | None = None) -> None:
         (svc.send_on if on else svc.send_off)()
         return
     plugin = _app().get(client)
-    if plugin is not None and hasattr(plugin, "send_on"):         # a Bridge: its strategies re-check tokens already in a signal zone
-        (plugin.send_on if on else plugin.send_off)()
-    else:
-        (svc.enable if on else svc.disable)(client)
+    if plugin is None or not hasattr(plugin, "send_on"):           # a typo would otherwise create a switch nobody reads and print nothing
+        running = sorted(n for n, p in _app().plugins.items() if hasattr(p, "send_on") and hasattr(p, "send_off"))
+        print(f"nats_send: no automation called {client!r} is running, so nothing was changed. Start it with algo_start(user, {client!r}). "
+              f"Running: {', '.join(running) or 'none'}")
+        return
+    (plugin.send_on if on else plugin.send_off)()                   # the automation's own switch (and it re-checks what it was waiting for)
 
 
 def _answer(call, what: str, paused: "tuple[int, bool] | None" = None) -> None:

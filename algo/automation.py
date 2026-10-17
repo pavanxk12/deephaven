@@ -206,6 +206,9 @@ def algo_start(user: int, strategy: str, pf_start: int = FIRST_PF, map_file: str
     other = app.get(strategy)
     if other is not None and not isinstance(other, _AlgoRun):
         raise ValueError(f"{strategy!r} is already the name of another service; choose a different strategy name")
+    if isinstance(other, _AlgoRun) and other.user != int(user):
+        print(f"algo_start: {strategy!r} was running for user {other.user}; it is replaced and now runs for user {int(user)} (its portfolios stay with user {other.user}). "
+              f"To run the same logic for two users, give each its own strategy name.")
     try:
         app.run(_AlgoRun(int(user), strategy, pf_start, options, map_file, sub_file))
     except MissingDependency:

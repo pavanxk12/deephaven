@@ -234,9 +234,9 @@ nats_restart(port=4223)                        # on purpose: stop and start agai
 nats_stop()
 
 # ---- in every algo script ----
-nats_connect(user=4, client="bridge_nifty")    # only checks the service is up and user 4 may send; starts nothing
-nats_send(True, client="bridge_nifty")         # THIS algo may send (every algo and the UI starts OFF)
-nats_send(False, client="bridge_nifty")        # stops only this algo
+nats_connect(user=4, client="nifty_sma")    # only checks the service is up and user 4 may send; starts nothing
+nats_send(True, client="nifty_sma")            # THIS strategy may send (every strategy starts OFF)
+nats_send(False, client="nifty_sma")           # stops only this strategy
 nats_send(False)                               # the master switch: nothing is sent for anyone;  nats_send(True) lets them again
 
 pf_subscribe(1913, 47162, user=4)              # portfolio 1913 -> option token 47162, sent as user 4

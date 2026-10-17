@@ -86,7 +86,7 @@ There is ONE service for all the algos and the UI. It is started once (`examples
 | who | calls | what it does |
 |---|---|---|
 | whoever runs the services, once | `nats_start("192.168.1.130", 4222, users=[3, 4])` | starts the service for **all** the users |
-| every algo script | `nats_connect(user=4, client="bridge_nifty")` | only **checks** that the service is up and that user 4 may send; starts and changes nothing |
+| every algo script | `nats_connect(user=4, client="nifty_sma")` | only **checks** that the service is up and that user 4 may send; starts and changes nothing |
 | you, on purpose | `nats_restart(port=4223)` | stops and starts it again; this cuts every algo off for a moment |
 | you, on purpose | `nats_add_user(5)` | lets one more user send, **without** a restart |
 
@@ -94,15 +94,16 @@ There is ONE service for all the algos and the UI. It is started once (`examples
 script may call it. With different settings it **raises an error** pointing to `nats_restart`, because an algo script must never restart the
 service the others are using. The same goes for `registry_start` / `registry_connect`.
 
-### The send switches: one master, one for each algo and the UI
+### The send switches: one master, one for each strategy
 
 | switch | where | default | effect |
 |---|---|---|---|
 | **master** | `nats_send(False)` / `nats_send(True)` | ON once started | OFF stops sending for **everyone** |
-| **each algo / the UI** | `nats_send(True, client="bridge_nifty")` (or `bridge.send_on()`) | **OFF**, until it says so | stops or starts only that algo |
+| **each strategy** | `nats_send(True, client="nifty_sma")` (the name given to `algo_start`) | **OFF**, until it says so | stops or starts only that strategy; a name that is not a running strategy is refused |
 
 A command goes out only when the master switch AND its own algo's switch are both on, so one algo stopping never stops another. A typed
-command (`pf_pause(...)`) has no algo behind it and only needs the master switch. A bridge's name is its client name (`bridge`, `bridge_nifty`).
+command (`pf_pause(...)`) has no algo behind it and only needs the master switch. A strategy's client name is its strategy name. The console is not a client: its row buttons and Controls panel send as an operator and need only the master switch. The Controls panel's
+ON / OFF button flips the master switch in the all-strategies window and only that strategy's switch in a strategy's own window.
 When the service is restarted every algo is OFF again and has to say `send` again. A refused command is answered `off` with the reason in
 `reply.data["detail"]` (`sending is off for everyone`, or `<name> has not switched sending on`). `nats_start(dry_run=True)` opens no connection and
 only logs `[DRY] ...`, answering `dry`.
@@ -123,7 +124,8 @@ command changes nothing. Each change is also a row in the table **`portfolio_sta
 
 The console ties a row to its portfolio by the option the portfolio is subscribed to (within the strategy's own window, only that strategy's portfolios). Rules kept from before: Square up only while paused (two clicks), and
 an untick only when the net position is 0. After a Deephaven restart the states start empty; each algo's book re-adopts the portfolios it had subscribed.
-The Controls panel's switch is the service's master switch (`nats_send`); it does not follow a change made elsewhere until something redraws it.
+The Controls panel's ON / OFF button is the service's master switch in the all-strategies window and that one strategy's own switch in a strategy's window (a strategy
+switched on while the master is off waits for the master, and the window says so); neither follows a change made elsewhere until something redraws it.
 
 ---
 
@@ -265,8 +267,8 @@ Every command the bridge **accepted** is also a row in `cmd_queue_automated` (th
 ```python
 nats_start("192.168.1.130", 4222, users=[3, 4])          # ONCE: start the shared service for users 3 and 4 (master switch ON)
 nats_start()                                             # again: nothing happens ("already running"), so any script may call it
-nats_connect(user=4, client="bridge_nifty")              # what an algo calls: only checks that the service is up and user 4 may send
-nats_send(True, client="bridge_nifty")                   # this algo may send (it starts OFF);  nats_send(False, client=...) stops only it
+nats_connect(user=4, client="nifty_sma")                 # what an algo calls: only checks that the service is up and user 4 may send
+nats_send(True, client="nifty_sma")                      # this strategy may send (it starts OFF);  nats_send(False, client=...) stops only it
 nats_add_user(5)                                         # one more user, no restart
 nats_restart(port=4223)                                  # on purpose: stop and start again (every algo goes back to OFF)
 nats_send(False)                                         # the master switch: nothing is sent for anyone

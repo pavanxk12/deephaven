@@ -33,6 +33,7 @@ from algo.comms.nats_service import NO_SERVICE
 from algo.core.pfstate import pf_states
 from algo.core.plugin import Plugin
 from algo.ui import tables as q
+from algo.ui.controls import is_sending, master_is_off, set_sending
 from algo.ui.filters import PF_PER_USER, Filters, Strategies, safe_strategy, strategy_cond, time_conds
 
 GREEN, RED, BLUE, ORANGE, AMBER, PURPLE, GREY, INK = (
@@ -485,14 +486,13 @@ def control_panel(ctx: Ctx):
     redraw = use_redraw(ctx)
 
     svc = service(ctx)
-    sending = svc.sending and svc.state != "service_down"
+    sending = is_sending(svc, ctx.strategy)                # a strategy window: that strategy's own switch (and the master); the other window: the master
     live = [(u, pf, st) for u, pf, st in ctx.states.items() if st.subscribed and mine(ctx, u, pf)]    # this strategy's portfolios that are subscribed now
     n_paused, n_all = sum(1 for _, _, st in live if st.paused), len(live)
     all_paused = n_all > 0 and n_paused == n_all        # same rule as per position: Square off only when paused
 
     def handle_switch(on):
-        (svc.send_on if on else svc.send_off)()
-        set_warn("" if svc.state != "service_down" else WHY["service_down"])
+        set_warn(set_sending(ctx.app, svc, ctx.strategy, on))
         redraw()
 
     def handle_pause_all():
@@ -541,6 +541,8 @@ def control_panel(ctx: Ctx):
                     square, gap="size-100", wrap=True),
             ui.html.div(f"{n_paused}/{n_all} portfolios paused  (Square off needs all paused)",
                         style={"color": GREY, "fontSize": "11px"}),
+            *([ui.html.div("the master switch is OFF: nothing is sent for anyone", style={"color": AMBER, "fontSize": "11px", "fontWeight": "600"})]
+              if ctx.strategy and master_is_off(svc) else []),
             *([ui.html.div(warn, style={"color": RED, "fontSize": "12px", "fontWeight": "600"})] if warn else []),
             direction="column", gap="size-150",
         ),

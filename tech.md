@@ -183,7 +183,7 @@ Any step that is not `ok` stops the sequence, leaves the portfolio **paused**, r
   console keep working and say what is wrong.
 * **Users and blocks**: `nats_start(users=[3,4])` lists who may send (`nats_add_user` adds one live); `nats_block(user=)` / `(user=, pf=)` stops sending for a user
   or one portfolio; blocks live in `app.shared` and **survive a service restart** (a restart that names a user lifts that user's block).
-* **Switches**: master (`nats_send(True/False)`) and one per client (algo / console). A command goes out only if both are on. Typed commands (`pf_pause(...)`) and the
+* **Switches**: master (`nats_send(True/False)`) and one per strategy (`nats_send(True/False, client="name")`, the name given to `algo_start`; a name that is not a running strategy is refused). A command goes out only if both are on. Typed commands (`pf_pause(...)`) and the
   console buttons have no client and need only the master switch.
 * **Dry run**: `nats_start(dry_run=True)` opens no connection and only logs.
 
@@ -214,6 +214,8 @@ empty and each book re-adopts what it had subscribed.
   order book, controls. A new `algo_start` opens its window; `console_open("name")` by hand. Names may only hold letters, digits, `_ . -`.
 * **Net positions** per row: tick box = subscribe/unsubscribe, Pause/Resume, Square up (two clicks, only while paused), all from the shared state (5.5). Rules kept:
   Square up needs Pause first; untick only at net 0. Commands go through the NATS service with no client name (operator). Failures are written under the buttons.
+* **ON / OFF button** (Controls panel, `algo/ui/controls.py`): in `operator_console` it flips the service's master switch for everyone; in a strategy's own window it flips only that
+  strategy's switch (the same as `nats_send(..., client="name")`) and shows ON only when the master is on too. Pause all / Resume all / Square off all act on that strategy's portfolios only.
 * Memory/CPU: every table is a lazy chain; per-row text is joined, not stored; the whole-day net table per strategy is created when its window renders.
 
 ---

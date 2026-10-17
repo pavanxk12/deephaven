@@ -349,7 +349,7 @@ def test_nats_add_user_adds_without_a_restart(session, capsys):
     svc.on_stop()
 
 
-def test_nats_send_has_a_master_switch_and_one_for_each_algo(session, tmp_path):
+def test_nats_send_has_a_master_switch_and_one_for_each_algo(session, tmp_path, capsys):
     ns, app = session
     svc, wire = _with_nats(app, send_on=True)
     app.plugins["nats"] = svc
@@ -365,14 +365,17 @@ def test_nats_send_has_a_master_switch_and_one_for_each_algo(session, tmp_path):
     bridge.on_enable(lambda: seen.append("recheck"))
     ns["nats_send"](True, client="bridge_nifty")                       # goes through the bridge, so the algo re-checks its zones
     assert bridge.sending and seen == ["recheck"]
-    ns["nats_send"](True, client="console_panel")                      # a name with no bridge behind it: the service's own list
-    assert svc.is_enabled("console_panel")
+    ns["nats_send"](True, client="bridge_niftyy")                      # a typo, or a strategy that was never started: refused, nothing is created
+    out = capsys.readouterr().out
+    assert not svc.is_enabled("bridge_niftyy") and "no automation called 'bridge_niftyy' is running" in out and "Running: bridge_nifty" in out
     ns["nats_send"](False, client="bridge_nifty")
-    assert not bridge.sending and svc.is_enabled("console_panel")      # only that one stopped
+    assert not bridge.sending                                          # only that one stopped
     ns["nats_send"](False)                                             # the master switch
-    assert svc.sending is False and svc.pause(1, client="console_panel").result(5).status == "off"
+    assert svc.sending is False and svc.pause(1, client="bridge_nifty").result(5).status == "off"
     ns["nats_send"](True)
-    assert svc.sending is True and svc.pause(1, client="console_panel").result(5).ok
+    assert svc.sending is True and svc.pause(1).result(5).ok                                   # a typed command (no client) needs only the master switch
+    ns["nats_send"](True, client="bridge_nifty")
+    assert svc.pause(1, client="bridge_nifty").result(5).ok                                    # its own switch plus the master
     svc.on_stop()
 
 
