@@ -127,6 +127,11 @@ eod_load()                               # every saved day merged -> candles_his
   `instrument_id`, which is **not** a token of the contract master: join to the master by `Symbol`. To save disk, convert only the symbols you use (`--symbols-file`) and
   the hours you need (`--session`): 9,600 symbols for pre-market to after-hours is 12 MB a day, a few hundred symbols is a small fraction of that.
   Copy the output folder (or the tar, then `tar -xf`) into `/data/fo_market_data/` of the server that needs it.
+* **Databento batch downloads** (`xnas-itch-<yyyymmdd>.ohlcv-1m.dbn.zst`, one file per day, schema `ohlcv-1m`): `python tools/convert_databento_dbn.py <download folder> <output folder> [--tar out.tar]`
+  (needs the `databento` package). The ticker of each bar comes from the symbol mappings inside the file (the download has no `symbol` column), `token` is the vendor's instrument id, and the output
+  is the same as for the Parquet vendor files. It **adds** to a folder that already holds other days: a day already there is left alone (`--force` redoes it), the manifest and the tar list every
+  file of the folder, and the manifest says `mixed_sources: true` (with the days of each) when the folder holds days from different feeds. Different feeds do not agree bar for bar: for the days both
+  covered, the Databento XNAS.ITCH download has about 25% more bars, a median of twice the volume and the same close on only about a third of the common bars, so compare across the join knowing that.
 * **GDFL India cash CSVs** (`GFDLCM_STOCK_ddmmyyyy.csv`, columns `Ticker, Date, Time, Open, High, Low, Close, Volume, Open Interest`; the folders may be nested):
   `python tools/convert_gdfl_csv.py <root folder> <output folder> [--symbols-file list.txt] [--session 09:15-15:30] [--tar out.tar]`. Same output as above
   (`candles_<day>.parquet` + `.meta.json` + `manifest.json`). Details: the times are India time and end in `:59`, so a bar's `Minute` is the time without the

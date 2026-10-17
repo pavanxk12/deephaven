@@ -120,14 +120,15 @@ def sha256(path: str) -> str:
 
 
 def convert_file(src: str, out_dir: str, symbols: set[str] | None = None, session: tuple[dtime, dtime] | None = None, level: int = 9,
-                 force: bool = False) -> dict:
-    """Convert one day. Returns {day, status, rows, ...}; status is converted, exists, empty or (an exception) failed."""
-    day = day_of(src)
+                 force: bool = False, read=None, dayfn=None, label: str = "vendor 1-minute OHLCV") -> dict:
+    """Convert one day. Returns {day, status, rows, ...}; status is converted, exists, empty or (an exception) failed.
+    `read(path)` returns the vendor table (default: a Parquet file) and `dayfn(path)` the day of a file name, for other kinds of vendor file."""
+    day = (dayfn or day_of)(src)
     final = os.path.join(out_dir, f"candles_{day}.parquet")
     if os.path.exists(final) and not force:
         return {"day": day, "status": "exists", "file": os.path.basename(final), "rows": pq.ParquetFile(final).metadata.num_rows,
                 "bytes": os.path.getsize(final)}
-    source = pq.read_table(src)
+    source = (read or pq.read_table)(src)
     result = to_candles(source, day, symbols, session)
     if result.num_rows == 0:
         return {"day": day, "status": "empty", "rows": 0}
@@ -149,7 +150,7 @@ def convert_file(src: str, out_dir: str, symbols: set[str] | None = None, sessio
     lo, hi = mm["min"].as_py(), mm["max"].as_py()
     meta = {"table": "candles", "day": day, "market": "US", "timezone": NEW_YORK, "rows": result.num_rows, "file": os.path.basename(final),
             "columns": COLUMNS, "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "built_by": "converted from vendor 1-minute OHLCV; token = the vendor's instrument_id (not the contract master's token), sorted by Symbol, Minute",
+            "built_by": f"converted from {label}; token = the vendor's instrument_id (not the contract master's token), sorted by Symbol, Minute",
             "source": os.path.basename(src), "source_rows": source.num_rows, "symbols": int(pc.count_distinct(result["Symbol"]).as_py()),
             "first_minute": str(lo), "last_minute": str(hi)}
     with open(final[:-len(".parquet")] + ".meta.json.tmp", "w", encoding="utf-8") as f:
@@ -159,28 +160,62 @@ def convert_file(src: str, out_dir: str, symbols: set[str] | None = None, sessio
             "bytes": os.path.getsize(final)}
 
 
-def convert_folder(src_dir: str, out_dir: str, symbols=None, session=None, level: int = 9, force: bool = False, log=print) -> dict:
-    files = sorted(glob.glob(os.path.join(src_dir, "*.parquet")))
+def folder_manifest(out_dir: str, src_dir: str, failed: list, holidays: list) -> dict:
+    """The manifest of EVERYTHING in the output folder (not only what this run touched), so adding days to a folder that already holds others keeps all of them listed."""
+    files = sorted(glob.glob(os.path.join(out_dir, "candles_*.parquet")))
+    files = [f for f in files if ".tmp." not in f]
+    old = {}
+    path = os.path.join(out_dir, "manifest.json")
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            old = {}
+    names = [os.path.basename(f) for f in files]
+    sources: dict = {}                                                       # which feed each day came from (the .meta.json of each file says so)
+    for f in files:
+        try:
+            with open(f[:-len(".parquet")] + ".meta.json", encoding="utf-8") as m:
+                src = json.load(m).get("built_by", "unknown").split(";")[0]
+        except (OSError, ValueError):
+            src = "unknown"
+        sources.setdefault(src, []).append(os.path.basename(f)[8:18])
+    rows = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
+    manifest = {"made_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source_folder": os.path.abspath(src_dir),
+                "files": len(files), "rows": rows, "bytes": sum(os.path.getsize(f) for f in files), "failed": failed,
+                "holidays": sorted(set(old.get("holidays", [])) | set(holidays)),
+                "first_day": names[0][8:18] if names else None, "last_day": names[-1][8:18] if names else None,
+                "sources": {k: {"days": len(v), "first": v[0], "last": v[-1]} for k, v in sources.items()},
+                "mixed_sources": len(sources) > 1,                            # True when the folder holds days from different feeds: prices, volumes and bar counts differ between them
+                "sha256": {os.path.basename(f): sha256(f) for f in files}}
+    return manifest
+
+
+def convert_folder(src_dir: str, out_dir: str, symbols=None, session=None, level: int = 9, force: bool = False, log=print,
+                   pattern: str = "*.parquet", read=None, dayfn=None, label: str = "vendor 1-minute OHLCV") -> dict:
+    files = sorted(glob.glob(os.path.join(src_dir, pattern)))
     holidays = sorted(os.path.basename(p)[:-len(".empty")] for p in glob.glob(os.path.join(src_dir, "*.empty")))
     if not files:
-        raise FileNotFoundError(f"no *.parquet in {src_dir}")
+        raise FileNotFoundError(f"no {pattern} in {src_dir}")
     results = []
     for src in files:
         try:
-            r = convert_file(src, out_dir, symbols, session, level, force)
+            r = convert_file(src, out_dir, symbols, session, level, force, read, dayfn, label)
         except Exception as e:                                               # one bad file must not stop the rest
-            r = {"day": os.path.basename(src)[:10], "status": "failed", "error": f"{type(e).__name__}: {e}"}
+            try:
+                shown = (dayfn or day_of)(src)
+            except ValueError:
+                shown = os.path.basename(src)
+            r = {"day": shown, "status": "failed", "error": f"{type(e).__name__}: {e}"}
         results.append(r)
         log(f"{r['day']}  {r['status']:<9} {r.get('rows', ''):>10}  {r.get('error', '')}")
-    done = [r for r in results if r["status"] in ("converted", "exists")]
-    manifest = {"made_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source_folder": os.path.abspath(src_dir),
-                "files": len(done), "rows": sum(r.get("rows", 0) for r in done), "bytes": sum(r.get("bytes", 0) for r in done),
-                "failed": [r for r in results if r["status"] == "failed"], "holidays": holidays,
-                "first_day": done[0]["day"] if done else None, "last_day": done[-1]["day"] if done else None,
-                "sha256": {r["file"]: sha256(os.path.join(out_dir, r["file"])) for r in done}}
     os.makedirs(out_dir, exist_ok=True)
+    manifest = folder_manifest(out_dir, src_dir, [r for r in results if r["status"] == "failed"], holidays)
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
+    manifest["this_run"] = {"converted": [r["day"] for r in results if r["status"] == "converted"], "already_there": [r["day"] for r in results if r["status"] == "exists"],
+                            "empty": [r["day"] for r in results if r["status"] == "empty"]}
     return manifest
 
 
