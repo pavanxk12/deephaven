@@ -57,7 +57,7 @@ What stays in your script is the part that is yours: the settings, which option,
 | `SENDER`, `TIMEOUT_S`, `MAX_PARALLEL` | `nats_start(sender=, timeout_s=, max_in_flight=)`; the defaults are AUTOMATION, 5 and 64 |
 | `PF_START` | `algo_start(..., pf_start=1001)` |
 | `PF_MAP_FILE`, `PF_SUB_FILE` | `algo_start(..., map_file=, sub_file=)` to keep the portfolios of the stocks script; the numbers are also in the registry |
-| `SUB_PAYLOAD` | `nats_start(sub_payload={...})`: one for the whole service (see gap 1). The stocks one is the default |
+| `SUB_PAYLOAD` | the service holds the defaults (`nats_start(sub_payload={...})`, for everyone); each strategy adds its own fields: `algo_start(..., subscribe={"strategyname": "Churning"})`. The service no longer sends a `strategyname` |
 | `APPLY_PARAMS`, `OPT_IVAL_PCT`, `OPT_RANGE_*_PCT`, `TRP_PCT`, `JVAL_FRAC`, `SVAL_MULT` | the `SIZING` dict and `order_params(...)` inside the script |
 | `ADD_QTY`, `UNSUBSCRIBE_ON_RETIRE`, `SQUAREUP_ON_REPOINT` | `algo_start(..., add_qty=, unsubscribe_on_retire=, squareup_on_repoint=)` |
 | `RSI_HIGH`, `RSI_LOW`, `N_STRIKES`, `STRIKE_MODE`, `STRIKE_GAP`, `OPT_EXPIRY_IDX`, `FAIL_COOLDOWN_S` | constants at the top of your script (04 has them all) |

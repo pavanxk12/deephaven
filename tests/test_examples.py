@@ -27,7 +27,7 @@ EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 
 OLD_STOCKS_SUB = {"T1": 0, "gtw": 32395, "PRNT": 1, "code": "", "ival": 1, "jval": 0.75, "side": "BUY", "sval": 3, "trp": 0,
                   "jqty1": 1, "jqty2": 1, "openq": 0, "maxqty": 0, "target": 1000, "maxloss": -1000, "stoploss": -1000,
-                  "lowerrange": 0, "upperrange": 10000, "max_unhedge": 1, "strategyname": "Churning"}
+                  "lowerrange": 0, "upperrange": 10000, "max_unhedge": 1}
 
 
 def run_example(name, monkeypatch):

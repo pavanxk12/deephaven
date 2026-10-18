@@ -37,6 +37,10 @@ def set_sending(app, svc, strategy: "str | None", on: bool) -> str:
     if run is None:
         return f"{strategy!r} is not running (algo_start)"
     if on:
+        limits = app.shared.get("limits")
+        why = limits.blocked(strategy) if limits is not None else ""
+        if why:
+            return f"cannot switch ON: {why}"
         if not run.send_on():                                       # refused: there is no NATS connection (a dry run, or it is down)
             return "cannot switch ON: no NATS connection (dry run, or the connection is down)"
     else:

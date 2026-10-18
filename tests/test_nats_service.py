@@ -135,7 +135,7 @@ def test_every_command_carries_the_user_and_only_non_subscribes_carry_sender():
         assert p["USERIDENTIFIER"] == 4 and p["user_id"] == 4
     assert "SENDER" not in by["subscribe"] and "SENDER" not in by["unsubscribe"]
     assert by["pause_unpause:Pause"]["SENDER"] == by["squareup"]["SENDER"] == by["apply"]["SENDER"] == "ALGO7"
-    assert by["subscribe"]["T1"] == 47158 and by["subscribe"]["strategyname"] == "Churning" and by["apply"]["ival"] == 1.5
+    assert by["subscribe"]["T1"] == 47158 and "strategyname" not in by["subscribe"] and by["apply"]["ival"] == 1.5
     svc.on_stop()
 
 

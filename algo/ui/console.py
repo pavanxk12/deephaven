@@ -30,8 +30,10 @@ from deephaven import agg, ui
 from deephaven.time import to_j_instant, to_j_zdt
 
 from algo.comms.nats_service import NO_SERVICE
+from algo.core.limits import limits_of
 from algo.core.pfstate import pf_states
 from algo.core.plugin import Plugin
+from algo.strategy.guard import guard_of
 from algo.ui import tables as q
 from algo.ui.controls import is_sending, master_is_off, set_sending
 from algo.ui.filters import PF_PER_USER, Filters, Strategies, safe_strategy, strategy_cond, time_conds
@@ -87,6 +89,8 @@ class Ctx:
     fills: object                # fills per order
     messages: object
     book_all: object             # order book, whole day
+    limits: object = None        # Limits: the turnover and M2M limit of each strategy (and whether it is breached)
+    guard: object = None         # Guard: changes a limit and acts when one is breached
 
 
 class TimeTools:
@@ -235,7 +239,7 @@ def use_redraw(ctx: Ctx):
 # panels
 # =================================================================================================
 @ui.component
-def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, title="Summary"):
+def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, title="Summary", limit_ctl=None):
     totals = ui.use_memo(
         lambda: net_tbl.agg_by([agg.sum_(["BuyVal", "SellVal", "Realised", "M2M", "Fills"])]).view([
             "Turnover = (BuyVal + SellVal) / 1.0E7",
@@ -273,13 +277,51 @@ def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, ti
         wrap=True, align_items="center",
         UNSAFE_style={"flex": "1", "minHeight": "0"},
     )
-    body = [tiles]
+    body = [tiles] if limit_ctl is None else [tiles, limit_ctl]
     if filter_ctl is not None or logo_src:
         logo = ui.html.img(src=logo_src, style={"height": logo_height, "display": "block"}) if logo_src else ui.html.div()
         body.insert(0, ui.flex(logo, filter_ctl if filter_ctl is not None else ui.html.div(),
                                justify_content="space-between", align_items="center",
                                UNSAFE_style={"flex": "0 0 auto", "padding": "2px 8px"}))
     return ui.panel(ui.flex(*body, direction="column", height="100%"), title=title)
+
+
+@ui.component
+def limit_boxes(ctx: Ctx):
+    """The turnover limit and the M2M limit of this strategy, as input boxes. A limit may be changed at any time; 0 or empty = no limit.
+    A breach is shown here; the strategy stays OFF until the limit is raised past its value (algo.strategy.guard does the switching, with no browser open)."""
+    name, limits, guard = ctx.strategy, ctx.limits, ctx.guard
+    cur = limits.get(name)
+    t_draft, set_t = ui.use_state(cur["turnover"])
+    m_draft, set_m = ui.use_state(cur["m2m"])
+    warn, set_warn = ui.use_state("")
+    _, bump = ui.use_state(0)
+    ui.use_effect(lambda: limits.on_change(lambda s: s == name and bump(lambda n: n + 1)), [])
+    cur = limits.get(name)
+    turnover, m2m = limits.seen(name)
+
+    def apply(kind, value):
+        set_warn(guard.set_limit(name, kind, value) or "")
+        bump(lambda n: n + 1)
+
+    def box(label, value, on_change, kind, step):
+        return ui.flex(
+            ui.number_field(label=label, value=value, on_change=on_change, min_value=0, step=step, width="size-2000"),
+            ui.button("Set", variant="accent", on_press=lambda: apply(kind, value), UNSAFE_style={"alignSelf": "end"}),
+            gap="size-100", align_items="end")
+
+    used_t = "-" if not cur["turnover"] or turnover is None else f"{turnover:,.2f} of {cur['turnover']:,.2f} Cr ({100 * turnover / cur['turnover']:.0f}%)"
+    used_m = "-" if not cur["m2m"] or m2m is None else f"{m2m:+,.0f} against -{cur['m2m']:,.0f}"
+    why = limits.blocked(name)
+    return ui.flex(
+        ui.flex(box("Turnover limit (₹ Cr)", t_draft, set_t, "turnover", 0.5), ui.text(used_t, UNSAFE_style={"fontSize": "12px", "color": GREY}),
+                direction="column", gap="size-50"),
+        ui.flex(box("M2M loss limit (₹)", m_draft, set_m, "m2m", 1000), ui.text(used_m, UNSAFE_style={"fontSize": "12px", "color": GREY}),
+                direction="column", gap="size-50"),
+        *([ui.html.div(f"LIMIT BREACHED: {why}", style={"color": "#ffffff", "background": RED, "fontWeight": "700", "padding": "4px 10px", "borderRadius": "4px"})] if why else []),
+        *([ui.html.div(warn, style={"color": RED, "fontSize": "12px", "fontWeight": "600"})] if warn else []),
+        gap="size-300", wrap=True, align_items="start", UNSAFE_style={"flex": "0 0 auto", "padding": "2px 16px 8px"},
+    )
 
 
 @ui.component
@@ -683,9 +725,10 @@ def build_dashboard(base: Ctx):
         return ui.dashboard(
             ui.column(
                 ui.row(
-                    ui.column(summary_window(net_tbl, book_tbl, ctx.logo_src, cfg.logo_height, filters_bar, title), width=72),
+                    ui.column(summary_window(net_tbl, book_tbl, ctx.logo_src, cfg.logo_height, filters_bar, title,
+                                             limit_boxes(ctx) if strategy and ctx.limits is not None else None), width=72),
                     ui.column(control_panel(ctx), width=28),
-                    height=26,
+                    height=30,
                 ),
                 ui.row(
                     message_window(msgs, hide_strategy=bool(strategy)),
@@ -730,7 +773,8 @@ class Console(Plugin):
                         tz_label="IST" if mk.code == "NSE" else mk.tz, logo_src=self._logo(), time=TimeTools(mk.tz),
                         trades=trades, acks=acks, feed=feed, symbols=symbols, fills=fills,
                         messages=q.tag(q.messages(events, cfg.event_cols, mk.tz), "Pf", smap),
-                        book_all=q.order_book(acks, fills, symbols, mk.price_div, cfg.order_time, mk.tz))
+                        book_all=q.order_book(acks, fills, symbols, mk.price_div, cfg.order_time, mk.tz),
+                        limits=limits_of(app.shared, f"{app.paths.state}/limits.json"), guard=guard_of(app, f"{app.paths.state}/limits.json"))
         app.publish("operator_console", build_dashboard(self.base))
         self.opened = set()
         for name in strategies.names():
@@ -749,7 +793,26 @@ class Console(Plugin):
         self.app.publish(f"console_{strategy}".replace("-", "_").replace(".", "_"), build_dashboard(ctx))
         self.base.strategies.add(strategy)
         self.opened.add(strategy)
+        self._watch_limits(strategy)
         return True
+
+    def _watch_limits(self, strategy: str) -> None:
+        """Feed the strategy's whole-day turnover (₹ crore) and gross M2M to the guard on every change. This runs on the server, whether or not a browser is open."""
+        from deephaven.table_listener import listen
+        base, mk = self.base, self.app.market
+        tot = (q.net_positions(base.trades.where(strategy_cond(strategy)), base.feed, base.symbols, mk.price_div)
+               .agg_by([agg.sum_(["BuyVal", "SellVal", "M2M"])]).view(["Turnover = (BuyVal + SellVal) / 1.0E7", "M2M"]))
+        guard = base.guard
+
+        def changed(update, is_replay):
+            for rows in (update.added(), update.modified()):
+                if rows and len(rows.get("Turnover", ())):
+                    guard.on_values(strategy, rows["Turnover"][-1], rows["M2M"][-1])
+                    return
+
+        handle = listen(tot, changed, do_replay=True)
+        self._undo.append(handle.stop)
+        self._totals = getattr(self, "_totals", []) + [tot]            # keep the table alive
 
     def _logo(self) -> str | None:
         path = f"{self.app.paths.market_data}/{self.cfg.logo_file}"

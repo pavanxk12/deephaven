@@ -11,6 +11,7 @@ import numpy as np
 # ---- 1. WHO and the settings (your old USER INPUT block) ----------------------------------------------------------------------
 USER = 3                                     # the user it trades as (one of the users given to nats_start)
 STRATEGY = "template"                        # its name: recorded with every portfolio, and the name of its own sending switch
+ENGINE_STRATEGY = "Churning"         # the strategyname sent on subscribe: which logic the trading engine runs for these portfolios (this script sends it, not the NATS service)
 PF_START = 5000                              # where its portfolio numbers begin
 UNDERLYING = "NIFTY"
 RSI_N, RSI_LOW, RSI_HIGH = 9, 30, 70
@@ -18,7 +19,7 @@ COOLDOWN_S = 30                              # after a failed order, wait this l
 
 nats_connect(user=USER, client=STRATEGY)                     # CONNECT: only checks the NATS service is up and this user may send
 registry_connect()                                           # ... and that the portfolio registry is up. Neither starts anything.
-algo_start(USER, STRATEGY, pf_start=PF_START, add_qty=3)    # registers it with the book. It starts OFF.
+algo_start(USER, STRATEGY, pf_start=PF_START, add_qty=3, subscribe={"strategyname": ENGINE_STRATEGY})    # registers it with the book. It starts OFF.
 future = contract(UNDERLYING, show=False)["token"]          # the signal source: the nearest future
 pf_track(STRATEGY, [future])                                 # find the portfolio it had before a restart
 ltp = {}                                                     # token -> last close, filled by the listener below

@@ -15,6 +15,7 @@ import numpy as np
 # =============================== SETTINGS ===============================
 USER = 3                         # the user it trades as (one of the users given to nats_start)
 STRATEGY = "nifty_sma"           # its name: recorded with every portfolio, the name of its sending switch and of its console window
+ENGINE_STRATEGY = "Churning"         # the strategyname sent on subscribe: which logic the trading engine runs for these portfolios (this script sends it, not the NATS service)
 UNDERLYING = "NIFTY"
 EXPIRY_INDEX = 0                 # 0 = the nearest expiry that has not passed
 N_STRIKES = 5                    # how many strikes nearest the money
@@ -29,7 +30,7 @@ if not (1 <= N_STRIKES < 100 and 1 <= FAST < SLOW):
 
 nats_connect(user=USER, client=STRATEGY)                     # only checks the NATS service is up and this user may send
 registry_connect()                                           # ... and that the portfolio registry is up. Neither starts anything.
-algo_start(USER, STRATEGY, add_qty=ADD_QTY)                  # its own book, bridge and sending switch (OFF), and its console window
+algo_start(USER, STRATEGY, add_qty=ADD_QTY, subscribe={"strategyname": ENGINE_STRATEGY})                  # its own book, bridge and sending switch (OFF), and its console window
 future = contract(UNDERLYING, show=False)["token"]           # the signal source: the nearest NIFTY future
 pf_track(STRATEGY, [future], slots=N_STRIKES)                # find the portfolios it had before a restart (one per strike slot)
 ltp = {}                                                     # token -> last close, filled by the listener below

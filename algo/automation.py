@@ -173,7 +173,13 @@ class _AlgoRun(Plugin):
         return f"user {self.user}, {len(self.book.all()) if self.book else 0} portfolios, sending {self.nats.state if self.nats else '-'}"
 
     def send_on(self) -> bool:
-        """So that  nats_send(True, client=<strategy>)  works."""
+        """So that  nats_send(True, client=<strategy>)  works. Refused while a turnover or M2M limit of the strategy is breached."""
+        limits = self.app.shared.get("limits")
+        why = limits.blocked(self.name) if limits is not None else ""
+        if why:
+            print(f"{self.name}: cannot switch ON: {why}")
+            self.log.warning("switch ON refused: %s", why)
+            return False
         return self.nats.bridge.send_on()
 
     def send_off(self) -> None:

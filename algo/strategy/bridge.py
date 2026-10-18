@@ -184,6 +184,10 @@ class Bridge(Plugin):
         return self.nats.go(coro, client=self.client) is not None
 
     # ---- command sequences ---------------------------------------------------------------------
+    def _sub(self, option: int) -> dict:
+        """The subscribe / unsubscribe payload: the service's defaults, then this automation's own fields (such as strategyname), then the option."""
+        return {**self.nats.cfg.sub_payload, **self.cfg.subscribe, "T1": option}
+
     async def retire(self, old_pf: int) -> None:
         """The stock moves to another option: pause the old portfolio, optionally square it up and unsubscribe it.
         It keeps its number and option; a new portfolio takes over the stock."""
@@ -194,7 +198,7 @@ class Bridge(Plugin):
             if cfg.squareup_on_repoint:
                 await _step(call, "squareup", None, f"squareup of old PF {old_pf} not ok, new PF skipped")
             if cfg.unsubscribe_on_retire:
-                reply = await call("unsubscribe", {**self.nats.cfg.sub_payload, "T1": self.book.subscribed.get(old_pf, 0)})
+                reply = await call("unsubscribe", self._sub(self.book.subscribed.get(old_pf, 0)))
                 if not reply.ok:                           # already paused and squared up: do not block the new PF
                     self.log.warning("unsubscribe of old PF %s not ok (left paused): %s", old_pf, reply.status)
 
@@ -210,7 +214,7 @@ class Bridge(Plugin):
             seen = self.nats.pf_state(pf, self.user)
             held = bool(seen and seen.paused and seen.by != self.client)  # paused by the console (or another algo): their pause stands
             if book.subscribed.get(pf) is None:                           # new PF: subscribe it to the option
-                await _step(call, "subscribe", {**self.nats.cfg.sub_payload, "T1": option}, "subscribe not ok, apply skipped")
+                await _step(call, "subscribe", self._sub(option), "subscribe not ok, apply skipped")
                 book.subscribe(pf, option)
             _need(await self._pause(call, pf, "Pause"), "pause not ok, apply skipped")
             cap = book.caps.get(pf, 0) + cfg.add_qty
@@ -246,7 +250,7 @@ class Bridge(Plugin):
                 return
             steps = (("pause_unpause", lambda: self._pause(call, pf, "Pause")),
                      ("squareup", lambda: call("squareup", None)),
-                     ("unsubscribe", lambda: call("unsubscribe", {**self.nats.cfg.sub_payload, "T1": opt})))
+                     ("unsubscribe", lambda: call("unsubscribe", self._sub(opt))))
             for cmd, step in steps:
                 reply = await step()
                 if not reply.ok:

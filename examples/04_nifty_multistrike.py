@@ -18,6 +18,7 @@ import numpy as np
 # =============================== USER INPUT ===============================
 USER = 4                         # USER_ID
 STRATEGY = "nifty_multi"         # its name: recorded with every portfolio, and the name of its own sending switch
+ENGINE_STRATEGY = "Churning"         # the strategyname sent on subscribe: which logic the trading engine runs for these portfolios (this script sends it, not the NATS service)
 PF_START = 1933                  # PF_START
 ADD_QTY = 3                      # ADD_QTY
 UNDERLYING = "NIFTY"             # UNDERLYING
@@ -36,7 +37,7 @@ if not (N_STRIKES >= 1 and STRIKE_GAP >= 1 and STRIKE_MODE in ("OTM", "ITM", "BO
 
 nats_connect(user=USER, client=STRATEGY)                               # CONNECT: only checks the NATS service is up and this user may send
 registry_connect()                                                     # ... and that the portfolio registry is up. Neither starts anything.
-algo_start(USER, STRATEGY, pf_start=PF_START, add_qty=ADD_QTY)       # registers it with the book. It starts OFF.
+algo_start(USER, STRATEGY, pf_start=PF_START, add_qty=ADD_QTY, subscribe={"strategyname": ENGINE_STRATEGY})       # registers it with the book. It starts OFF.
 future = contract(UNDERLYING, show=False)["token"]
 pf_track(STRATEGY, [future], slots=N_STRIKES)                          # find the portfolios it had before a restart
 ltp = {}                                                               # token -> last close, filled by the listener below

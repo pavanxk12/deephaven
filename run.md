@@ -293,6 +293,16 @@ for each portfolio it uses. The same number under two different users is fine. T
 
 ---
 
+## 6b. Turnover and M2M limits per strategy (the strategy's own console window)
+
+In `console_<strategy>`, under the Summary tiles, there are two boxes: **Turnover limit (₹ Cr)** and **M2M loss limit (₹)**. Type a number and press **Set**; 0 or empty means no limit. They can be changed at any time.
+
+- **Turnover limit reached** (the strategy's whole-day turnover, the tile's number, is at or above the limit): a red LIMIT BREACHED line is shown, a row goes to `nats_events` (`cmd = limit`) and the log, and **that strategy's sending is switched OFF** (other strategies and the master are untouched).
+- **M2M limit reached** (the strategy's gross M2M is at or below minus the limit): every subscribed portfolio of the strategy is **paused and squared up**, then its sending is switched OFF. A profit never trips it.
+- The breach is **latched**: the ON button (and `nats_send(True, client=...)`) is refused until the limit is changed to a value the strategy is no longer past. Raising it does not switch the strategy ON by itself: press ON.
+- Lowering a limit below the current value breaches it at once. The checks run on the server on every change of the trades, so they work with no browser open. Limits and latches are kept in `<work>/state/limits.json`.
+- The square up goes out as an operator command, so it needs the master switch ON. With the master OFF nothing can be sent, and only the log line says so.
+
 ## 7. Writing your own algo (optional)
 
 Write a plain script in the terminal: `algo_start(3, "my_algo")`, then `pf_assign(...)` to get a portfolio from the book and `pf_activate(...)` to

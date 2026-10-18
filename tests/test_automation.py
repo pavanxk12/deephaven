@@ -354,3 +354,19 @@ def test_watch_says_when_the_table_is_not_there(console, capsys):
     assert watch("straddle_series", lambda u, r: None) is None and watch("candles", lambda u, r: None) is None
     out = capsys.readouterr().out
     assert "straddle_start(0)" in out and "candles_start()" in out
+
+
+def test_a_strategy_sends_its_own_strategyname_on_subscribe_and_unsubscribe(console):
+    app, svc, wire = console
+    algo_start(3, "a", subscribe={"strategyname": "MyLogic"})
+    algo_start(3, "b")
+    pf_track("a", [1])
+    pf_track("b", [2])
+    on("a")
+    on("b")
+    for name, ins, opt in (("a", 1, 55), ("b", 2, 66)):
+        assert pf_activate(pf_assign(name, ins, opt, name="N"), "CALL", {"ival": 1})
+    assert wait_for(lambda: len(wire.sent) == 8)
+    subs = {p["T1"]: p for _, lab, p in wire.sent if lab == "subscribe"}
+    assert subs[55]["strategyname"] == "MyLogic" and "strategyname" not in subs[66]        # the service no longer adds one
+    assert subs[55]["gtw"] == 32395                                                       # the rest of the service's defaults are kept

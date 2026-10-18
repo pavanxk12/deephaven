@@ -262,7 +262,7 @@ Every command the bridge **accepted** is also a row in `cmd_queue_automated` (th
 | `subject` | `cmd.hft.{pf}` | where each portfolio's commands go |
 | `send_on` | `False` | the master switch at start (`nats_start` sets it ON; each algo is still OFF) |
 | `dry_run` | `False` | no connection, log only |
-| `sub_payload` | the default subscribe fields | sent on `subscribe` / `unsubscribe`; only `T1` changes |
+| `sub_payload` | the default subscribe fields (no `strategyname`) | sent on `subscribe` / `unsubscribe`; only `T1` changes. A strategy adds its own with `algo_start(..., subscribe={"strategyname": ...})` |
 
 ```python
 nats_start("192.168.1.130", 4222, users=[3, 4])          # ONCE: start the shared service for users 3 and 4 (master switch ON)
