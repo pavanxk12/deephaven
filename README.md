@@ -8,6 +8,7 @@ they find each other through the `App`.
 algo/
   core/        app.py (App: running plugins + published tables)   plugin.py (lifecycle, listeners, threads)
                pfstate.py (what the commands did to each portfolio: shared by algos and the console)
+               limits.py (the turnover and M2M limit of each strategy, and whether it is breached)
                config.py (Market NSE/US, Paths)                    log.py   nulls.py
   data/        master.py     contract master from the dated .db3, cached      -> master
                candles.py    1-minute candles from the tick table             -> candles
@@ -18,6 +19,7 @@ algo/
                registry.py   portfolio numbers, unique per user, with strategy and name         -> portfolio_registry
                bridge.py     the command sequence of a portfolio (retire, subscribe, pause, apply, unpause)
                config.py     the bridge's settings
+               guard.py      a turnover / M2M breach: switch the strategy off (and square up its portfolios for M2M)
   ui/          console.py    operator console, one window per strategy (same pause / squareup / tick state as the algos)  -> operator_console, console_<strategy>
   lookup.py    plain lookups: contract, strikes, nearest_strikes, last_price ...
   automation.py  plain functions for a script: algo_start, pf_assign, pf_activate ...

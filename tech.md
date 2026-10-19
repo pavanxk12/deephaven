@@ -216,6 +216,11 @@ empty and each book re-adopts what it had subscribed.
   Square up needs Pause first; untick only at net 0. Commands go through the NATS service with no client name (operator). Failures are written under the buttons.
 * **ON / OFF button** (Controls panel, `algo/ui/controls.py`): in `operator_console` it flips the service's master switch for everyone; in a strategy's own window it flips only that
   strategy's switch (the same as `nats_send(..., client="name")`) and shows ON only when the master is on too. Pause all / Resume all / Square off all act on that strategy's portfolios only.
+* **Limits** (`algo/core/limits.py` numbers and latches, `algo/strategy/guard.py` the action): a strategy window has a **turnover limit (₹ Cr)** and an **M2M loss limit (₹)** box in its Summary,
+  changeable any time (0 = none). The console feeds the guard the strategy's whole-day turnover and gross M2M from a server-side table listener on every change, so it works with no browser open.
+  Turnover at/above its limit: that strategy's sending switch goes OFF. M2M at/below minus its limit: its subscribed portfolios (registry algo = the strategy, each under its own user) are paused and squared up
+  as operator commands, then its switch goes OFF. Either way a row goes to `nats_events` (`cmd = limit`), the window shows LIMIT BREACHED and the ON / OFF button flips to OFF. The breach is **latched**: ON (the button,
+  or `nats_send(True, client=...)`) is refused until the limit is set to a value the strategy is no longer past; raising it does not switch ON by itself. State: `<work>/state/limits.json`.
 * Memory/CPU: every table is a lazy chain; per-row text is joined, not stored; the whole-day net table per strategy is created when its window renders.
 
 ---
@@ -260,11 +265,11 @@ Published tables (Deephaven IDE variables): `candles`, `straddle_series`, `portf
 ## 10. Where each thing lives in the code
 
 ```
-algo/core/      app.py plugin.py config.py pfstate.py files.py log.py nulls.py timeframe.py
+algo/core/      app.py plugin.py config.py pfstate.py limits.py files.py log.py nulls.py timeframe.py
 algo/data/      master.py candles.py store.py symbols.py
 algo/series/    straddle.py
 algo/comms/     nats_service.py
-algo/strategy/  registry.py book.py bridge.py config.py
+algo/strategy/  registry.py book.py bridge.py config.py guard.py
 algo/ui/        console.py tables.py filters.py
 algo/           api.py (functions you type)  automation.py (functions an algo script uses)  lookup.py (contract/price lookups)
 examples/       00_services.py .. 04_nifty_multistrike.py   (plain scripts; 03/04 compute their own RSI and sizing)
