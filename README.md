@@ -163,7 +163,7 @@ read-only mount:
 | straddle.py | `algo.Straddle` |
 | eod.py / bod.py | `eod_save()` / `eod_auto()` / `eod_load()` (`algo.Eod`, `algo.History`) |
 | automation_rsi.py | a plain script on the services: `examples/03_algo_template.py` is the shape; the stocks logic (baskets, mid filter) is yours to write in it |
-| niftyrsi.py | `examples/04_nifty_multistrike.py` (a plain script, with the multi-strike part) |
+| niftyrsi.py | `examples/06_nifty_rsi_churning.py` (5-minute RSI, your settings and `blocked` slots) or `examples/04_nifty_multistrike.py` (1-minute RSI) |
 | dashboard_blackbox.py | `algo.Console` |
 
 The numbers that sat in the USER INPUT blocks stay as constants at the top of your script; the connection, the users and the subscribe payload

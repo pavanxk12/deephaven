@@ -10,6 +10,7 @@ Each file is meant to be pasted (or run) in the terminal after `import algo; alg
 | `02_manual_trade.py` | a trade by hand: find the option, take a portfolio number, send subscribe / pause / apply / unpause |
 | `03_algo_template.py` | **an automation as a plain script**: your settings, a few functions, two listeners. Copy it for a new one |
 | `04_nifty_multistrike.py` | your NIFTY automation with `N_STRIKES` strikes, as a plain script (functions and listeners, like your old one) |
+| `06_nifty_rsi_churning.py` | the same on a **5-minute RSI** (made from the 1-minute candles), with your subscribe fields, the `blocked` slots, `buy()` / `sell()` / `exit_all()` and a check when it is switched on |
 
 An automation script uses only the five services, through functions: `contract` / `strikes` / `nearest_strikes` (master), `last_price` and the
 table `candles` (candles), `algo_start` / `pf_assign` / `pf_activate` (the book and NATS) and `nats_send`.

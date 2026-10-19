@@ -289,7 +289,7 @@ def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, ti
 @ui.component
 def limit_boxes(ctx: Ctx):
     """The turnover limit and the M2M limit of this strategy, as input boxes. A limit may be changed at any time; 0 or empty = no limit.
-    A breach is shown here; the strategy stays OFF until the limit is raised past its value (algo.strategy.guard does the switching, with no browser open)."""
+    A breach is shown here; the strategy stays OFF until the limit is changed to a value it is no longer past (algo.strategy.guard does the switching, with no browser open)."""
     name, limits, guard = ctx.strategy, ctx.limits, ctx.guard
     cur = limits.get(name)
     t_draft, set_t = ui.use_state(cur["turnover"])
@@ -301,25 +301,30 @@ def limit_boxes(ctx: Ctx):
     turnover, m2m = limits.seen(name)
 
     def apply(kind, value):
-        set_warn(guard.set_limit(name, kind, value) or "")
+        problem = guard.set_limit(name, kind, value)
+        now = limits.get(name)
+        set_t(now["turnover"]) if kind == "turnover" else set_m(now["m2m"])          # the box shows what was kept
+        set_warn(problem or "limit saved")
         bump(lambda n: n + 1)
 
     def box(label, value, on_change, kind, step):
         return ui.flex(
-            ui.number_field(label=label, value=value, on_change=on_change, min_value=0, step=step, width="size-2000"),
+            ui.number_field(label=label, value=value, on_change=on_change, **({"min_value": 0} if kind == "turnover" else {}), step=step, width="size-2000"),
             ui.button("Set", variant="accent", on_press=lambda: apply(kind, value), UNSAFE_style={"alignSelf": "end"}),
             gap="size-100", align_items="end")
 
-    used_t = "-" if not cur["turnover"] or turnover is None else f"{turnover:,.2f} of {cur['turnover']:,.2f} Cr ({100 * turnover / cur['turnover']:.0f}%)"
-    used_m = "-" if not cur["m2m"] or m2m is None else f"{m2m:+,.0f} against -{cur['m2m']:,.0f}"
+    used_t = ("no limit set" if not cur["turnover"] else f"limit {cur['turnover']:,.0f}") + (
+        "" if not cur["turnover"] or turnover is None else f", now {turnover:,.0f} ({100 * turnover / cur['turnover']:.0f}%)")
+    used_m = ("no limit set" if not cur["m2m"] else f"limit {cur['m2m']:+,.0f}") + (
+        "" if not cur["m2m"] or m2m is None else f", now {m2m:+,.0f}")
     why = limits.blocked(name)
     return ui.flex(
-        ui.flex(box("Turnover limit (₹ Cr)", t_draft, set_t, "turnover", 0.5), ui.text(used_t, UNSAFE_style={"fontSize": "12px", "color": GREY}),
+        ui.flex(box("Turnover limit (₹)", t_draft, set_t, "turnover", 100000), ui.text(used_t, UNSAFE_style={"fontSize": "12px", "color": GREY}),
                 direction="column", gap="size-50"),
-        ui.flex(box("M2M loss limit (₹)", m_draft, set_m, "m2m", 1000), ui.text(used_m, UNSAFE_style={"fontSize": "12px", "color": GREY}),
+        ui.flex(box("M2M limit (₹)", m_draft, set_m, "m2m", 1000), ui.text(used_m, UNSAFE_style={"fontSize": "12px", "color": GREY}),
                 direction="column", gap="size-50"),
         *([ui.html.div(f"LIMIT BREACHED: {why}", style={"color": "#ffffff", "background": RED, "fontWeight": "700", "padding": "4px 10px", "borderRadius": "4px"})] if why else []),
-        *([ui.html.div(warn, style={"color": RED, "fontSize": "12px", "fontWeight": "600"})] if warn else []),
+        *([ui.html.div(warn, style={"color": GREEN if warn == "limit saved" else RED, "fontSize": "12px", "fontWeight": "600"})] if warn else []),
         gap="size-300", wrap=True, align_items="start", UNSAFE_style={"flex": "0 0 auto", "padding": "2px 16px 8px"},
     )
 
@@ -799,11 +804,11 @@ class Console(Plugin):
         return True
 
     def _watch_limits(self, strategy: str) -> None:
-        """Feed the strategy's whole-day turnover (₹ crore) and gross M2M to the guard on every change. This runs on the server, whether or not a browser is open."""
+        """Feed the strategy's whole-day turnover (₹) and gross M2M to the guard on every change. This runs on the server, whether or not a browser is open."""
         from deephaven.table_listener import listen
         base, mk = self.base, self.app.market
         tot = (q.net_positions(base.trades.where(strategy_cond(strategy)), base.feed, base.symbols, mk.price_div)
-               .agg_by([agg.sum_(["BuyVal", "SellVal", "M2M"])]).view(["Turnover = (BuyVal + SellVal) / 1.0E7", "M2M"]))
+               .agg_by([agg.sum_(["BuyVal", "SellVal", "M2M"])]).view(["Turnover = BuyVal + SellVal", "M2M"]))
         guard = base.guard
 
         def changed(update, is_replay):

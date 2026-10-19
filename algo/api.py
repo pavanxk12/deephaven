@@ -46,13 +46,17 @@ def _run(plugin) -> None:
         raise RuntimeError(f"{e}. Call " + " then ".join(HINTS.get(d, d) for d in needed) + " first.") from None
 
 
-def master_build(exchange: str | None = None, day: str | None = None, force: bool = False, file: str | None = None) -> None:
+def master_build(exchange: str | None = None, day: str | None = None, force: bool = False, file: str | None = None,
+                 source: str = "file", pg: dict | None = None) -> None:
     """Build the contract master: master_build("NSE") or master_build("US"). The exchange sets the timezone, price scale,
     session and file formats for everything after it. Naming a different exchange than the running one stops the plugins
     that are running (they belong to the other market); no argument keeps the current exchange.
     Reads today's .db3 (or `day`, e.g. "20261015"); uses the cache unless force=True.
     `file="20261015DB_US.db3"` names the file when more than one in the folder matches the day (it is also refused if the file
-    belongs to the other market)."""
+    belongs to the other market).
+    `source="postgres"` reads the same contracts from the Postgres table resultset_<day> (needs the pg8000 driver; the password in the ALGO_PG_PASSWORD environment
+    variable, or pg={"password": ...}; host, port, database and user default to the Docker service: pg={"host": "postgres", "database": "algofusion", ...});
+    `source="auto"` tries Postgres and uses the .db3 file when it cannot; the default "file" is the .db3 as before. Naming `file=` always means that file."""
     app = _app()
     if exchange is not None:
         market = market_for(exchange)
@@ -62,7 +66,7 @@ def master_build(exchange: str | None = None, day: str | None = None, force: boo
             app = connect(app.ns, market, app.paths)
     print(f"exchange: {app.market.code}")
     path = None if file is None else (file if os.path.isabs(file) else os.path.join(app.paths.market_data, file))
-    _run(Master(day=day, db_path=path, force_rebuild=force))
+    _run(Master(day=day, db_path=path, force_rebuild=force, source=source, pg=pg))
 
 
 def candles_start(timeframe: str = "1min", multiplier: float | None = None, *, symbols=None, kind: str | None = None,

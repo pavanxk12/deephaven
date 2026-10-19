@@ -49,6 +49,15 @@ master_build("US", file="20261015DB_US.db3")   # name the file when more than on
 the saved days `candles_<day>.parquet` / `straddle_<day>.parquet` for `eod_load`, and `stocks.txt` / `logo.png` for your scripts
 and console. If two files match one day (an NSE one and a US one), it uses the last by name and logs a warning that lists them;
 a file that belongs to the other market is refused with a message, never read as the wrong market.
+**From Postgres instead of the file.** The same contracts are in the Postgres container, one table per day, `resultset_<yyyymmdd>` (checked against the `.db3` of 2026-10-16: the same 85,591 rows, no field differs). To read them from there:
+
+```python
+master_build("NSE", source="postgres")   # the table resultset_<today>; an error if Postgres cannot be reached or the day is empty (a holiday)
+master_build("NSE", source="auto")       # Postgres first, the .db3 file when Postgres cannot give it
+master_build("NSE", day="20261016", source="postgres", pg={"host": "postgres", "database": "algofusion", "user": "algofusion"})   # the defaults
+```
+The driver is whichever is there: `pg8000`, else `psycopg` (3) or `psycopg2`, also looked for in `/data/deephaven/operator/pylibs` (the Deephaven volume already keeps psycopg there). The login is taken from the Postgres URL the container already has (`AUTOMATION_DATABASE_URL`, or `ALGO_DATABASE_URL`), then `ALGO_PG_PASSWORD`, then `pg={...}`; nothing is kept in this repository and the password is only held in memory. The default is still `source="file"`. Naming `file=` always reads that file. The cache is kept per day and row count, so a restart does not read the table again.
+
 Result: the dict `master`, and everything below uses it. Look at it: `algo_status()`.
 
 ---
@@ -295,12 +304,12 @@ for each portfolio it uses. The same number under two different users is fine. T
 
 ## 6b. Turnover and M2M limits per strategy (the strategy's own console window)
 
-In `console_<strategy>`, under the Summary tiles, there are two boxes: **Turnover limit (₹ Cr)** and **M2M loss limit (₹)**. Type a number and press **Set**; 0 or empty means no limit. They can be changed at any time.
+In `console_<strategy>`, under the Summary tiles, there are two boxes: **Turnover limit (₹)** and **M2M limit (₹)**, both in plain rupees. Type a number and press **Set**; 0 or empty means no limit. They can be changed at any time. The box keeps the value, and a line under it says what is set and where the strategy stands ("limit 5,000,000, now 3,200,000 (64%)"). The M2M limit is the number as you type it, sign included: -5000 is -5000 and 50000 is 50000.
 
-- **Turnover limit reached** (the strategy's whole-day turnover, the tile's number, is at or above the limit): a red LIMIT BREACHED line is shown, a row goes to `nats_events` (`cmd = limit`) and the log, and **that strategy's sending is switched OFF** (other strategies and the master are untouched).
-- **M2M limit reached** (the strategy's gross M2M is at or below minus the limit): every subscribed portfolio of the strategy is **paused and squared up**, then its sending is switched OFF. A profit never trips it.
-- The breach is **latched**: the ON button (and `nats_send(True, client=...)`) is refused until the limit is changed to a value the strategy is no longer past. Raising it does not switch the strategy ON by itself: press ON.
-- Lowering a limit below the current value breaches it at once. The checks run on the server on every change of the trades, so they work with no browser open. Limits and latches are kept in `<work>/state/limits.json`.
+- **Turnover limit reached** (the strategy's whole-day turnover in rupees, buys plus sells, is at or above the limit): a red LIMIT BREACHED line is shown, a row goes to `nats_events` (`cmd = limit`) and the log, and **that strategy's sending is switched OFF** (other strategies and the master are untouched).
+- **M2M limit reached** (the strategy's live gross M2M is **at or below the limit**): every subscribed portfolio of the strategy is **paused and squared up**, then its sending is switched OFF. For a loss limit type a negative number: -5000 breaches at -5000 and lower. A positive limit works the same way, so 50000 breaches whenever M2M is at or below +50,000, which includes right now unless the strategy is already above it.
+- The breach is **latched**: the ON button (and `nats_send(True, client=...)`) is refused until the limit is changed to a value the strategy is no longer past. Changing it does not switch the strategy ON by itself: press ON.
+- A turnover limit set below the current turnover, or an M2M limit set at or above the current M2M, breaches at once. The checks run on the server on every change of the trades, so they work with no browser open. Limits and latches are kept in `<work>/state/limits.json`.
 - The square up goes out as an operator command, so it needs the master switch ON. With the master OFF nothing can be sent, and only the log line says so.
 
 ## 7. Writing your own algo (optional)
@@ -337,13 +346,17 @@ algo.api.install(globals(), "NSE")      # re-binds the functions; then paste the
 
 ## A normal morning
 
-**India**
+**India** (`scripts/05_start_day.py` is this in one file; strategies are pasted after it)
 ```python
-import algo; algo.install(globals(), "NSE")
-master_build("NSE")
+import algo
+app = algo.install(globals(), "NSE")
+master_build("NSE", source="postgres")     # the contracts from Postgres; source="auto" falls back to the .db3 file; plain master_build("NSE") reads the file
 candles_start("1min")
-straddle_start(1)
-eod_auto()
+registry_start()
+nats_start("192.168.1.130", 4222, users=[3, 4])
+app.run(algo.Console())                    # operator_console + one console_<strategy> window per strategy
+straddle_start(1)                          # optional
+eod_auto()                                 # optional
 algo_status()
 ```
 

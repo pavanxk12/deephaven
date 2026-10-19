@@ -1,10 +1,11 @@
-"""Risk limits per strategy: a TURNOVER limit (₹ crore, the number on the Summary tile) and an M2M limit (a loss, in ₹).
+"""Risk limits per strategy: a TURNOVER limit (in ₹, the value traded: buys + sells) and an M2M limit (in ₹). Both are plain rupee values.
 
     turnover limit    breached when the strategy's turnover reaches it            -> sending is switched OFF for the strategy
-    M2M limit         breached when the strategy's gross M2M falls to -limit      -> its portfolios are squared up and sending is switched OFF
+    M2M limit         breached when the strategy's live gross M2M is AT OR BELOW the limit, the number as typed: -5000 breaches at -5000 and lower,
+                      50000 breaches at 50000 and lower (so a positive limit is breached at once unless M2M is above it)  -> its portfolios are squared up and sending is switched OFF
 
 A breach is LATCHED: the strategy stays blocked (it cannot be switched ON) until that limit is changed to a value the strategy is no longer past.
-A limit of 0 or None means no limit. Limits can be changed at any time; they are kept in a small JSON file so a restart keeps them and the latches.
+The sign of an M2M limit counts. A limit of 0 or None (an empty box) means no limit. Limits can be changed at any time; they are kept in a small JSON file so a restart keeps them and the latches.
 
 This module holds the numbers only (no Deephaven, no NATS): algo.strategy.guard feeds it the live values and acts on a breach.
 """
@@ -42,7 +43,7 @@ class Limits:
             return dict(self._rec(strategy))
 
     def seen(self, strategy: str) -> tuple:
-        """(turnover in ₹ crore, M2M in ₹) as last reported, None where nothing was reported."""
+        """(turnover in ₹, M2M in ₹) as last reported, None where nothing was reported."""
         return self._seen.get(strategy, (None, None))
 
     def blocked(self, strategy: str) -> str:
@@ -51,10 +52,10 @@ class Limits:
         turnover, m2m = self.seen(strategy)
         why = []
         if r["turnover_hit"]:
-            why.append(f"turnover limit {r['turnover']:,.2f} Cr reached ({'-' if turnover is None else format(turnover, ',.2f')} Cr)")
+            why.append(f"turnover limit {r['turnover']:,.0f} reached ({'-' if turnover is None else format(turnover, ',.0f')})")
         if r["m2m_hit"]:
-            why.append(f"M2M limit {r['m2m']:,.0f} reached ({'-' if m2m is None else format(m2m, '+,.0f')})")
-        return "; ".join(why) + ("; raise the limit to send again" if why else "")
+            why.append(f"M2M limit {r['m2m']:+,.0f} reached ({'-' if m2m is None else format(m2m, '+,.0f')})")
+        return "; ".join(why) + ("; change the limit to send again" if why else "")
 
     # ---- changing ------------------------------------------------------------------------------
     def update(self, strategy: str, turnover, m2m) -> list[str]:
@@ -72,8 +73,9 @@ class Limits:
         if kind not in KINDS:
             raise ValueError(f"limit must be one of {KINDS}, got {kind!r}")
         v = _num(value)
-        if value is not None and (v is None or v < 0):
-            raise ValueError(f"the {kind} limit must be a number from 0 up (0 = no limit), got {value!r}")
+        if value is not None and (v is None or (v < 0 and kind == "turnover")):
+            raise ValueError(f"the {kind} limit must be a number from 0 up (0 = no limit), got {value!r}" if kind == "turnover"
+                             else f"the m2m limit must be a number (empty or 0 = no limit), got {value!r}")
         with self._lock:
             r = self._rec(strategy)
             r[kind] = v if v else None
@@ -114,7 +116,7 @@ class Limits:
         limit, (turnover, m2m) = self._rec(strategy)[kind], self._seen.get(strategy, (None, None))
         if not limit:
             return False
-        return (turnover is not None and turnover >= limit) if kind == "turnover" else (m2m is not None and m2m <= -limit)
+        return (turnover is not None and turnover >= limit) if kind == "turnover" else (m2m is not None and m2m <= limit)
 
     def _check(self, strategy: str) -> list[str]:
         r, newly = self._rec(strategy), []

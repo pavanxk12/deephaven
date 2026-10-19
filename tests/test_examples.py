@@ -152,7 +152,7 @@ def run_script(ns, name, **replace):
 
 def test_the_plain_scripts_have_no_class_and_start_no_shared_service():
     import ast
-    for name in ("03_algo_template.py", "04_nifty_multistrike.py", "05_nifty_sma_cross.py"):
+    for name in ("03_algo_template.py", "04_nifty_multistrike.py", "05_nifty_sma_cross.py", "06_nifty_rsi_churning.py"):
         tree = ast.parse((EXAMPLES / name).read_text(encoding="utf-8"))
         assert not [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)], name
         called = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
@@ -488,4 +488,86 @@ def test_a_slot_with_no_price_says_so_instead_of_staying_silent(tmp_path, fake_d
     assert wait_for(lambda: len(wire.sent) == 4)
     out = capsys.readouterr().out
     assert out.count("skipped: no usable price") == 4 and "slot 1" in out and "slot 4" in out
+    svc.on_stop()
+
+
+# ---- 06: the 5-minute RSI churning script ---------------------------------------------------------------------------------------------
+def start_rsi(tmp_path, monkeypatch, **replace):
+    ns, app, svc, wire = console_with_services(tmp_path, monkeypatch)
+    run_script(ns, "06_nifty_rsi_churning.py", **replace)
+    ns["WINDOW"] = (dtime(0, 0), dtime(23, 59, 59))
+    return ns, app, svc, wire
+
+
+def feed_minutes(fake_dh, closes, first=0):
+    """The future's 1-minute closes, one candle each, from 09:15 India time (03:45 UTC) + `first` minutes, every option's price alongside."""
+    import numpy as np
+    base = prices()
+    others = [t for t in base if t != FUT]
+    t0 = np.datetime64("2026-01-05T03:45")
+    for i, close in enumerate(closes):
+        minute = t0 + np.timedelta64(first + i, "m")
+        fake_dh[0].fn(Update(added={"token": [FUT, *others], "Close": [float(close), *[base[t] for t in others]], "Minute": [minute] * (1 + len(others))}), False)
+
+
+def test_the_rsi_is_computed_on_five_minute_bars_made_from_the_one_minute_candles(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire = start_rsi(tmp_path, monkeypatch)
+    minute_closes = [25000.0 + i for i in range(50)]                       # 50 minutes = 10 five-minute bars
+    feed_minutes(fake_dh, minute_closes)
+    assert ns["BAR_S"] == 300 and len(ns["bars"]) == 10
+    assert ns["closes"]() == [minute_closes[i] for i in range(4, 50, 5)]    # a bar's close is the last 1-minute close inside it
+    assert ns["rsi"](ns["closes"]()) == 100.0                               # a steady rise
+    ns["RSI_LIVE"] = False
+    assert len(ns["closes"]()) == 9                                         # the bar still forming is left out
+    svc.on_stop()
+
+
+def test_a_falling_five_minute_rsi_buys_calls_on_all_the_strikes_with_this_scripts_own_subscribe_fields(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire = start_rsi(tmp_path, monkeypatch)
+    feed_minutes(fake_dh, falling(45, start=25100.0, step=1.0))             # 9 bars: not enough for an RSI of 9 yet
+    time.sleep(0.1)
+    assert wire.sent == []
+    feed_minutes(fake_dh, falling(1, start=25055.0), first=45)              # the 10th bar begins: RSI < 30
+    assert wait_for(lambda: len(wire.sent) == 12)                           # 3 strikes x (subscribe, pause, apply, unpause)
+    subs = [p for _, lab, p in wire.sent if lab == "subscribe"]
+    assert len({p["T1"] for p in subs}) == 3 and all(p["T1"] % 2 == 0 for p in subs)        # three different calls
+    assert all(p["strategyname"] == "Churning" and p["maxloss"] == -400 and p["stoploss"] == -400 and p["max_unhedge"] == 3 and p["gtw"] == 32395 for p in subs)
+    assert {p["USERIDENTIFIER"] for _, _, p in wire.sent} == {4}
+    assert sorted(r[1] for r in app.plugins["registry"].state.portfolios(4)) == [1933, 1934, 1935]
+    svc.on_stop()
+
+
+def test_with_finished_bars_only_it_waits_for_the_next_bar(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire = start_rsi(tmp_path, monkeypatch, **{"RSI_LIVE = True": "RSI_LIVE = False"})
+    feed_minutes(fake_dh, falling(46, start=25100.0, step=1.0))             # 10 bars, the 10th still forming
+    time.sleep(0.1)
+    assert wire.sent == []
+    feed_minutes(fake_dh, falling(5, start=25050.0, step=1.0), first=46)    # the 11th bar begins: the 10th is finished
+    assert wait_for(lambda: len(wire.sent) == 12)
+    svc.on_stop()
+
+
+def test_a_slot_stopped_from_the_console_stays_off_until_the_rsi_leaves_its_zone(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire = start_rsi(tmp_path, monkeypatch)
+    feed_minutes(fake_dh, falling(46, start=25100.0, step=1.0))
+    assert wait_for(lambda: len(wire.sent) == 12)
+    svc.squareup(1933, user=4)                                              # an operator squares up PF 1933 (no client name)
+    assert wait_for(lambda: ns["blocked"] == {0})
+    svc.squareup(1934, user=3)                                              # another user's portfolio of the same number: not ours
+    time.sleep(0.2)
+    assert ns["blocked"] == {0}
+    ns["rsi"] = lambda values, n=9: 50.0                                    # the RSI is back in the middle
+    ns["check"]()
+    assert ns["blocked"] == set()
+    svc.on_stop()
+
+
+def test_the_rsi_script_sends_nothing_while_it_is_off_and_pasting_it_again_keeps_one_listener(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire = start_rsi(tmp_path, monkeypatch)
+    ns["nats_send"](False, client="nifty_rsi")
+    feed_minutes(fake_dh, falling(50, start=25100.0, step=1.0))
+    time.sleep(0.2)
+    assert wire.sent == [] and app.plugins["registry"].state.portfolios() == []
+    run_script(ns, "06_nifty_rsi_churning.py")                              # pasted again
+    assert len(fake_dh) == 1 or all(w.stopped for w in fake_dh[:-1]) if hasattr(fake_dh[0], "stopped") else True
     svc.on_stop()

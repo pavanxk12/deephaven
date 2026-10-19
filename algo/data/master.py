@@ -1,4 +1,4 @@
-"""Contract master: parsed once per contract file from the dated SQLite (.db3) and cached as a pickle.
+"""Contract master: parsed once per day from the dated SQLite (.db3) file, or from the Postgres table `resultset_<yyyymmdd>` that holds the same rows, and cached as a pickle.
 
 `MasterData` is plain pandas/numpy with the lookups the other plugins need, so it can be tested without Deephaven.
 `Master` is the plugin that builds it and publishes `master` (a dict, for notebooks that used the old script).
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import sqlite3
 import tempfile
 from dataclasses import dataclass
@@ -299,6 +300,93 @@ def read_contracts(db_path: str, market: Market, table: str | None = None,
         con.close()
 
 
+# ---- the same contracts from Postgres: table `resultset_<yyyymmdd>` (the .db3 file's `ResultSet`, one table per day) -----------------------------------------
+PG_DEFAULTS = {"host": "postgres", "port": 5432, "database": "algofusion", "user": "algofusion"}      # the Docker service names; the password is never kept here
+PG_LIBS = "/data/deephaven/operator/pylibs"                                                          # where the Deephaven volume keeps psycopg (the image has no Postgres driver)
+
+
+def pg_settings(pg: dict | None = None, environ=None) -> dict:
+    """Where and how to connect, in this order: the defaults, then the Postgres URL the container already has (AUTOMATION_DATABASE_URL or ALGO_DATABASE_URL),
+    then ALGO_PG_PASSWORD, then what you pass in `pg`. The password is only ever held in memory."""
+    from urllib.parse import unquote, urlparse
+    env = os.environ if environ is None else environ
+    cfg = dict(PG_DEFAULTS)
+    url = env.get("ALGO_DATABASE_URL") or env.get("AUTOMATION_DATABASE_URL")
+    if url:
+        u = urlparse(url)
+        for key, value in (("host", u.hostname), ("port", u.port), ("database", (u.path or "").lstrip("/") or None),
+                           ("user", unquote(u.username) if u.username else None), ("password", unquote(u.password) if u.password else None)):
+            if value:
+                cfg[key] = value
+    if env.get("ALGO_PG_PASSWORD"):
+        cfg["password"] = env["ALGO_PG_PASSWORD"]
+    cfg.update({k: v for k, v in (pg or {}).items() if v is not None})
+    return cfg
+
+
+def _pg_connect(pg: dict | None):
+    """A Postgres connection from whichever driver is there: pg8000, else psycopg (3) / psycopg2 (also looked for in the Deephaven volume's pylibs folder)."""
+    import sys
+    cfg = pg_settings(pg)
+    host, port, db, user, password = cfg["host"], int(cfg["port"]), cfg["database"], cfg["user"], cfg.get("password")
+    try:
+        from pg8000 import dbapi
+        return dbapi.connect(host=host, port=port, database=db, user=user, password=password, timeout=15)
+    except ImportError:
+        pass
+    if os.path.isdir(PG_LIBS) and PG_LIBS not in sys.path:
+        sys.path.append(PG_LIBS)
+    for name in ("psycopg", "psycopg2"):
+        try:
+            driver = __import__(name)
+        except ImportError:
+            continue
+        return driver.connect(host=host, port=port, dbname=db, user=user, password=password, connect_timeout=15)
+    raise RuntimeError("reading the contracts from Postgres needs a driver: pg8000, psycopg or psycopg2 (pip install pg8000)")
+
+
+def _pg_table(day: str) -> str:
+    if not re.fullmatch(r"\d{8}", str(day)):
+        raise ValueError(f"the day must be yyyymmdd, like 20261016, got {day!r}")
+    return f"resultset_{day}"
+
+
+def pg_row_count(day: str, pg: dict | None = None) -> int:
+    """How many contracts Postgres holds for `day` (0 for a holiday: the table exists but is empty). Raises when there is no such table."""
+    table = _pg_table(day)
+    con = _pg_connect(pg)
+    try:
+        cur = con.cursor()
+        cur.execute(f'SELECT count(*) FROM "{table}"')
+        return int(cur.fetchone()[0])
+    finally:
+        con.close()
+
+
+def read_contracts_pg(day: str, market: Market, pg: dict | None = None, extra: tuple[str, ...] = ()) -> tuple[pd.DataFrame, str]:
+    """The contracts of `day` from Postgres, with the same column names read_contracts gives from the .db3 file (Postgres keeps them in lower case)."""
+    table = _pg_table(day)
+    c = market.contract_columns
+    con = _pg_connect(pg)
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = %s", (table,))
+        have = {r[0].lower(): r[0] for r in cur.fetchall()}
+        if not have:
+            raise RuntimeError(f"Postgres has no table {table}")
+        need = [c["token"], c["symbol"], c["expiry"], c["inst"]]
+        if [n for n in need if n.lower() not in have]:
+            raise RuntimeError(f"{table} lacks columns {[n for n in need if n.lower() not in have]}; it has {sorted(have)}")
+        want = [n for n in dict.fromkeys([*c.values(), *extra]) if n.lower() in have]
+        cur.execute("SELECT " + ", ".join(f'"{have[n.lower()]}" AS "{n}"' for n in want) + f' FROM "{table}"')
+        rows = cur.fetchall()
+    finally:
+        con.close()
+    if not rows:
+        raise RuntimeError(f"{table} is empty (a market holiday?)")
+    return pd.DataFrame(rows, columns=want), table
+
+
 def pick_cache_dir(preferred: str | None) -> str | None:
     """First writable directory, else None (caching disabled)."""
     for d in (preferred, os.path.join(tempfile.gettempdir(), "fo_master_cache"), os.path.expanduser("~/.cache/fo_master")):
@@ -321,14 +409,54 @@ class Master(Plugin):
     name = "master"
 
     def __init__(self, day: str | None = None, db_path: str | None = None, table: str | None = None,
-                 force_rebuild: bool = False):
+                 force_rebuild: bool = False, source: str = "file", pg: dict | None = None):
         super().__init__()
+        if source not in ("file", "postgres", "auto"):
+            raise ValueError(f"source must be \"file\" (the .db3), \"postgres\" or \"auto\" (Postgres, else the file), got {source!r}")
         self.day, self.db_path, self.table, self.force = day, db_path, table, force_rebuild
+        self.source, self.pg = source, pg
         self.data: MasterData | None = None
 
     def start(self) -> None:
         mk, paths = self.app.market, self.app.paths
         day = self.day or datetime.now(mk.zone).strftime("%Y%m%d")
+        cache_dir = pick_cache_dir(paths.cache)
+        data = None
+        if self.source in ("postgres", "auto") and not self.db_path:          # naming a file always means that file
+            try:
+                data = self._from_postgres(day, mk, cache_dir)
+            except Exception as e:
+                if self.source == "postgres":
+                    raise
+                self.log.warning("the contracts were not read from Postgres (%s); using the .db3 file", e)
+        if data is None:
+            data = self._from_file(day, mk, paths, cache_dir)
+        self.data = data
+        self.app.ns["master"] = data.as_dict()           # the dict old notebooks expect
+        self.log.info("%d chain rows, %d option contracts, %d futures, %d equities, %d tokens mapped",
+                      len(data.chain), len(data.opt), len(data.futs), len(data.eqs), len(data.symbol_of))
+
+    def _build(self, raw: pd.DataFrame, mk: Market, where: str) -> MasterData:
+        check_exchange(raw, mk, where)
+        df = normalise(raw, mk)
+        if df["expiry"].notna().sum() == 0:
+            raise RuntimeError("could not parse the expiry column (all NaT) - check Market.expiry_epoch")
+        return classify(df)
+
+    def _from_postgres(self, day: str, mk: Market, cache_dir: str | None) -> MasterData:
+        rows = pg_row_count(day, self.pg)
+        if rows == 0:
+            raise RuntimeError(f"Postgres has no contracts for {day} (a market holiday?)")
+        cache = os.path.join(cache_dir, f"master_{CACHE_VERSION}_{mk.code}_{day}_pg_{rows}.pkl") if cache_dir else None      # a changed row count is a new key
+        data = self._load(cache)
+        if data is None:
+            raw, table = read_contracts_pg(day, mk, self.pg)
+            data = self._build(raw, mk, f"Postgres {table}")
+            self.log.info("built from Postgres (table '%s', %d rows)", table, rows)
+            self._save(cache, data)
+        return data
+
+    def _from_file(self, day: str, mk: Market, paths, cache_dir: str | None) -> MasterData:
         db = self.db_path or find_db(paths.market_data, day)
         if not self.db_path:
             near = db_candidates(paths.market_data, day)
@@ -336,25 +464,15 @@ class Master(Plugin):
                 self.log.warning("%d files match %s: %s. Using %s; pass file=... to choose", len(near), day,
                                  ", ".join(os.path.basename(p) for p in near), os.path.basename(db))
         st = os.stat(db)
-        cache_dir = pick_cache_dir(paths.cache)
         cache = (os.path.join(cache_dir, f"master_{CACHE_VERSION}_{mk.code}_{day}_{int(st.st_mtime)}_{st.st_size}.pkl")
                  if cache_dir else None)
-
         data = self._load(cache)
         if data is None:
             raw, table = read_contracts(db, mk, self.table)
-            check_exchange(raw, mk, db)
-            df = normalise(raw, mk)
-            if df["expiry"].notna().sum() == 0:
-                raise RuntimeError("could not parse the expiry column (all NaT) - check Market.expiry_epoch")
-            data = classify(df)
+            data = self._build(raw, mk, db)
             self.log.info("built from %s (table '%s')", db, table)
             self._save(cache, data)
-
-        self.data = data
-        self.app.ns["master"] = data.as_dict()           # the dict old notebooks expect
-        self.log.info("%d chain rows, %d option contracts, %d futures, %d equities, %d tokens mapped",
-                      len(data.chain), len(data.opt), len(data.futs), len(data.eqs), len(data.symbol_of))
+        return data
 
     def describe(self) -> str:
         d = self.data

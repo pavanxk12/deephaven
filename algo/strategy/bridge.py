@@ -115,6 +115,10 @@ class Bridge(Plugin):
         if self._unhook is not None:
             self._unhook()
         self._hub = self._unhook = None
+        try:
+            self.nats.disable(self.client)                # a stopped strategy is OFF: its console button must not keep showing ON
+        except Exception:
+            self.log.exception("sending switch not turned off")
 
     @property
     def user(self) -> "int | None":

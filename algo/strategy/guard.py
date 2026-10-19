@@ -5,7 +5,7 @@
 
 Both put a line in the nats_events table and in the log. The live values come from `Guard.on_values` (the console feeds it from the strategy's trades,
 so it works with no browser open); `Guard.set_limit` changes a limit and acts at once if the strategy is already past the new one.
-A strategy that is blocked cannot be switched back ON until its limit is raised past the value (algo.automation and the console both ask `Limits.blocked`).
+A strategy that is blocked cannot be switched back ON until its limit is changed to a value it is no longer past (algo.automation and the console both ask `Limits.blocked`).
 """
 from __future__ import annotations
 
@@ -40,9 +40,9 @@ class Guard:
         turnover, m2m = self.limits.seen(strategy)
         limit = self.limits.get(strategy)[kind]
         if kind == "turnover":
-            text = f"{strategy}: TURNOVER limit {limit:,.2f} Cr reached ({turnover:,.2f} Cr): sending switched OFF until the limit is raised"
+            text = f"{strategy}: TURNOVER limit {limit:,.0f} reached ({turnover:,.0f}): sending switched OFF until the limit is changed"
         else:
-            text = f"{strategy}: M2M limit -{limit:,.0f} reached ({m2m:+,.0f}): squaring up all portfolios, sending switched OFF until the limit is raised"
+            text = f"{strategy}: M2M limit {limit:+,.0f} reached ({m2m:+,.0f}): squaring up all portfolios, sending switched OFF until the limit is changed"
         log.warning(text)
         svc = self.app.get("nats")
         run = self.app.get(strategy)

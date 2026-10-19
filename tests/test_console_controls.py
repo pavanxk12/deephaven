@@ -65,3 +65,16 @@ def test_starting_a_strategy_again_for_another_user_says_it_replaced_the_first(c
     out = capsys.readouterr().out
     assert "was running for user 3" in out and "now runs for user 4" in out and "give each its own strategy name" in out
     assert app["a"].user == 4
+
+
+def test_a_stopped_strategy_reads_off_and_a_restart_begins_off(console):
+    from algo.automation import algo_stop
+    app, svc, wire = console
+    algo_start(3, "a")
+    on("a")
+    assert is_sending(svc, "a")
+    algo_stop("a")
+    assert not is_sending(svc, "a") and not svc.is_enabled("a")                         # the button no longer shows ON for a strategy that is not running
+    assert "not running (algo_start)" in set_sending(app, svc, "a", True)               # and it cannot be switched on from the window
+    algo_start(3, "a")
+    assert not is_sending(svc, "a")                                                     # started again: OFF until it says so

@@ -104,7 +104,7 @@ service the others are using. The same goes for `registry_start` / `registry_con
 A command goes out only when the master switch AND its own algo's switch are both on, so one algo stopping never stops another. A typed
 command (`pf_pause(...)`) has no algo behind it and only needs the master switch. A strategy's client name is its strategy name. The console is not a client: its row buttons and Controls panel send as an operator and need only the master switch. The Controls panel's
 ON / OFF button flips the master switch in the all-strategies window and only that strategy's switch in a strategy's own window.
-A strategy's turnover or M2M limit (console, `run.md` 6b) switches its own switch OFF when breached, and `nats_send(True, client=...)` or the ON button is refused until the limit is raised.
+A strategy's turnover or M2M limit (console, `run.md` 6b) switches its own switch OFF when breached, and `nats_send(True, client=...)` or the ON button is refused until the limit is changed to a value the strategy is no longer past.
 When the service is restarted every algo is OFF again and has to say `send` again. A refused command is answered `off` with the reason in
 `reply.data["detail"]` (`sending is off for everyone`, or `<name> has not switched sending on`). `nats_start(dry_run=True)` opens no connection and
 only logs `[DRY] ...`, answering `dry`.
