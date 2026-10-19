@@ -131,7 +131,7 @@ class App:
             return contextlib.nullcontext()
 
 
-def connect(ns: dict, market: "str | Market" = "NSE", paths: Paths | None = None,
+def connect(ns: dict, market: "str | Market | None" = None, paths: Paths | None = None,
             level: int = logging.INFO) -> App:
     """Return the session's App, creating it on first use. Call once at the top of every script."""
     global _APP

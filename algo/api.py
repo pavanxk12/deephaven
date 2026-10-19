@@ -333,6 +333,7 @@ def nats_start(ip: str | None = None, port: int | None = None, users=None, *, se
     """Start the ONE NATS service that every algo and the console send portfolio commands through. Start it once, for everyone:
 
         nats_start("192.168.1.130", 4222, users=[3, 4])  the server's address and port, and ALL the users that may send
+        nats_start(users=[3, 4])                         the address left out: ALGO_NATS_IP of the server's image (the US image sets its own)
 
     Safe to call again: if the service is already running with these settings (or none are given) nothing happens, so every
     algo script may call it; it does NOT restart the service. Different settings raise an error that points to nats_restart(),
@@ -650,8 +651,8 @@ FUNCTIONS = (master_build, contract, contracts, expiries, strikes, nearest_strik
              algo_unsubscribe, console_open, absolute, relative, basket, absolute_warm, absolute_settings, algo_status, algo_help)
 
 
-def install(ns: dict, market: str = "NSE", paths: Paths | None = None, level: int = logging.INFO) -> App:
-    """Connect to the session and put the functions above into `ns`."""
+def install(ns: dict, market: "str | None" = None, paths: Paths | None = None, level: int = logging.INFO) -> App:
+    """Connect to the session and put the functions above into `ns`. `market` is "NSE" or "US"; left out it is the environment variable ALGO_MARKET, else "NSE"."""
     app = connect(ns, market, paths, level)
     for fn in FUNCTIONS:
         ns[fn.__name__] = fn

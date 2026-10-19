@@ -67,9 +67,20 @@ US = Market(
 MARKETS: Mapping[str, Market] = {"NSE": NSE, "US": US}
 
 
-def market_for(market: "str | Market") -> Market:
+def default_market() -> str:
+    """The market a call uses when it names none: the environment variable ALGO_MARKET ("NSE" or "US"), else "NSE". The US server's image sets ALGO_MARKET=US."""
+    return os.environ.get("ALGO_MARKET", "").strip() or "NSE"
+
+
+def default_nats_ip() -> str:
+    """The NATS server's address when a call names none: ALGO_NATS_IP, else the India server's. The US server's image sets ALGO_NATS_IP to its own address."""
+    return os.environ.get("ALGO_NATS_IP", "").strip() or "192.168.1.130"
+
+
+def market_for(market: "str | Market | None" = None) -> Market:
     if isinstance(market, Market):
         return market
+    market = market or default_market()
     try:
         return MARKETS[market.upper()]
     except KeyError:

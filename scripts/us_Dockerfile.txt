@@ -1,0 +1,10 @@
+FROM ghcr.io/deephaven/server:latest
+
+RUN python3 -m pip install --no-cache-dir nats-py==2.7.2
+
+COPY algo-0.1.0-py3-none-any.whl /tmp/
+RUN python3 -m pip install --no-cache-dir /tmp/algo-0.1.0-py3-none-any.whl
+
+# the US server: the market and the NATS address every call uses when it names none
+ENV ALGO_MARKET=US
+ENV ALGO_NATS_IP=192.168.1.131

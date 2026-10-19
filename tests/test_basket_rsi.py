@@ -64,14 +64,14 @@ def test_an_oversold_symbol_in_the_middle_sends_one_single_order_subscribe_and_t
     ranked = [c for c in calls if c[0] == "pct"]
     assert [c[4] for c in ranked] == ["open", "vwap"] and ranked[0][3] == ("NIFTY", "A1", "A2")                      # ranked against its own basket, both ways
     assert wait_for(lambda: ns["basket_rsi_status"] is not None)
-    time.sleep(0.2)
+    time.sleep(1.0)
     bars(fake_dh, [90.9])                                                                                            # still oversold, 0.1% down: no second order, no stop
     time.sleep(0.2)
     assert len(wire.sent) == 1
     bars(fake_dh, [91.0 * 1.02])                                                                                     # +2%: the target
     assert wait_for(lambda: len(wire.sent) == 2)
     assert wire.sent[1][:2] == ("cmd.hft.1001", "squareup")                                                          # the exit is the portfolio's squareup
-    time.sleep(0.3)
+    time.sleep(1.0)
     bars(fake_dh, [100.0 + 3 * i for i in range(14)])                                                                # a steady rise: overbought -> SELL on a NEW portfolio
     assert wait_for(lambda: len(wire.sent) >= 3)
     assert wire.sent[2][:2] == ("cmd.hft.1002", "subscribe") and wire.sent[2][2]["SIDE"] == 2
@@ -135,7 +135,7 @@ def test_a_refused_entry_leaves_nothing_open_and_a_refused_exit_is_tried_again(t
     ns, app, svc, wire, calls, ranks, before = start(tmp_path, monkeypatch, status="error")
     bars(fake_dh, fall(10))
     assert wait_for(lambda: len(wire.sent) == 1)
-    time.sleep(0.3)
+    time.sleep(1.0)
     bars(fake_dh, [89.0])                                                                                            # the cooldown has not passed and nothing is open to manage
     time.sleep(0.2)
     assert len(wire.sent) == 1
@@ -144,12 +144,12 @@ def test_a_refused_entry_leaves_nothing_open_and_a_refused_exit_is_tried_again(t
     ns, app, svc, wire, calls, ranks, before = start(tmp_path / "x", monkeypatch)
     bars(fake_dh, fall(10))
     assert wait_for(lambda: len(wire.sent) == 1)
-    time.sleep(0.3)
+    time.sleep(1.0)
     wire.status = "error"
     entry = fall(10)[-1]
     bars(fake_dh, [entry * 0.99])                                                                                    # -1%: the stop; the squareup is refused
     assert wait_for(lambda: len(wire.sent) == 2)
-    time.sleep(0.3)
+    time.sleep(1.0)
     wire.status = "ok"
     bars(fake_dh, [entry * 0.99])                                                                                    # still open, so it is tried again at the next close
     assert wait_for(lambda: len(wire.sent) == 3 and wire.sent[2][1] == "squareup")

@@ -42,6 +42,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
 
+from algo.core.config import default_nats_ip
 from algo.core.pfstate import PfStates, pf_states
 from algo.core.plugin import Plugin
 
@@ -58,7 +59,7 @@ def _sub_payload() -> dict:
 
 @dataclass
 class NatsConfig:
-    ip: str = "192.168.1.130"              # the NATS server
+    ip: str = field(default_factory=default_nats_ip)     # the NATS server (ALGO_NATS_IP, else the India server's address)
     port: int = 4222
     users: tuple = (3,)                    # the users that may send; every command is for one of them (stamped as USERIDENTIFIER, user_id)
     sender: str = "AUTOMATION"             # stamped as SENDER (not on subscribe / unsubscribe)
