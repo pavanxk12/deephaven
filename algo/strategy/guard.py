@@ -54,6 +54,7 @@ class Guard:
         if svc is not None:
             user = next(iter(users), 0)
             svc.note(0, "limit", f"{kind}_breached", text, user)
+        self.limits.notify(strategy)                                 # screens redraw now: the ON / OFF button reads the switch that was just turned off
 
     def _square_all(self, strategy: str, svc) -> dict:
         """Pause and square up the subscribed portfolios of the strategy, as an operator command (the strategy's own switch is already off)."""

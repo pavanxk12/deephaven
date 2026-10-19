@@ -526,6 +526,8 @@ def control_panel(ctx: Ctx):
     confirm, set_confirm = ui.use_state(False)          # square off needs a second click
     warn, set_warn = ui.use_state("")
     redraw = use_redraw(ctx)
+    if ctx.limits is not None:                           # a limit breach switches the strategy off: redraw so the button follows
+        ui.use_effect(lambda: ctx.limits.on_change(lambda s: s == ctx.strategy and redraw()), [])
 
     svc = service(ctx)
     sending = is_sending(svc, ctx.strategy)                # a strategy window: that strategy's own switch (and the master); the other window: the master

@@ -131,3 +131,17 @@ def test_the_message_is_in_the_nats_events_table_and_a_stopped_service_does_not_
     svc.on_stop()
     g.set_limit("c", "m2m", 5)
     g.on_values("c", 0, -9)                                               # the service is gone: logged, nothing raised
+
+
+def test_listeners_are_told_after_the_strategy_was_switched_off(console):
+    app, svc, wire = console
+    algo_start(3, "a")
+    on("a")
+    lim = app.shared.setdefault("limits", Limits())
+    seen = []
+    lim.on_change(lambda s: seen.append(svc.allowed("a")))                 # what a redrawing button would read
+    g = Guard(app, lim)
+    g.set_limit("a", "turnover", 1)
+    seen.clear()
+    g.on_values("a", 2, 0)
+    assert seen and seen[-1] is False                                      # the last call comes after send_off

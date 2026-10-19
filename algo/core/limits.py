@@ -102,6 +102,10 @@ class Limits:
                     self._cbs.remove(fn)
         return undo
 
+    def notify(self, strategy: str) -> None:
+        """Tell the listeners again (the guard calls it AFTER it has switched the strategy off, so a screen that redraws reads the new switch)."""
+        self._after(strategy, [], save=False, tell=True)
+
     # ---- inside --------------------------------------------------------------------------------
     def _rec(self, strategy: str) -> dict:
         return self._d.setdefault(strategy, {"turnover": None, "m2m": None, "turnover_hit": False, "m2m_hit": False})
@@ -120,9 +124,10 @@ class Limits:
                 newly.append(kind)
         return newly
 
-    def _after(self, strategy: str, newly: list, save: bool) -> None:
+    def _after(self, strategy: str, newly: list, save: bool, tell: bool = False) -> None:
         if save:
             self._save()
+        if save or tell:
             for fn in list(self._cbs):
                 try:
                     fn(strategy)
