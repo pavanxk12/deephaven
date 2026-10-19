@@ -57,6 +57,14 @@ def test_lowering_a_limit_below_the_current_value_breaches_it_at_once():
     assert lim.set_limit("a", "turnover", 2) == ["turnover"] and lim.set_limit("a", "m2m", -10000) == ["m2m"]
 
 
+def test_a_missing_value_never_breaches_and_the_names_are_listed():
+    lim = Limits()
+    lim.set_limit("a", "m2m", -5000)
+    lim.set_limit("b", "turnover", 10)
+    assert lim.update("a", float("nan"), -1.7976931348623157e308) == [] and lim.blocked("a") == ""      # NaN and Deephaven's double null
+    assert lim.seen("a") == (None, None) and lim.names() == ["a", "b"]
+
+
 def test_the_limits_of_two_strategies_are_separate_and_bad_values_are_refused():
     lim = Limits()
     lim.set_limit("a", "turnover", 1)

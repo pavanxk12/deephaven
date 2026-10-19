@@ -137,8 +137,8 @@ feed, EOD, straddle maths are untouched. Nothing here is deployed to the host or
 ## The console, one window per strategy
 
 `app.run(algo.Console())` (needs the registry running) publishes **`operator_console`** (all strategies, with a strategy picker and a time window) and, for
-every strategy that has portfolios, **`console_<strategy>`**: that strategy's own **summary, net positions, message window and order book**, with the
-tick box / Pause / Square up / controls of *its* portfolios only. Starting a new algo (`algo_start(user, "name")`) opens its window by itself;
+every strategy that has portfolios, **`<strategy>`**: that strategy's own **summary, net positions, message window and order book**, with the
+Pause / Square up / Subscribe toolbar (click a row first) and controls of *its* portfolios only. The positions are a native table. Starting a new algo (`algo_start(user, "name")`) opens its window by itself;
 `console_open("name")` makes one by hand.
 
 How a row finds its strategy: the registry records, for every (user, portfolio number), the strategy (the algo) that uses it. The order, trade and

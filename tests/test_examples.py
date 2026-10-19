@@ -152,7 +152,7 @@ def run_script(ns, name, **replace):
 
 def test_the_plain_scripts_have_no_class_and_start_no_shared_service():
     import ast
-    for name in ("03_algo_template.py", "04_nifty_multistrike.py", "05_nifty_sma_cross.py", "06_nifty_rsi_churning.py"):
+    for name in ("03_algo_template.py", "04_nifty_multistrike.py", "05_nifty_sma_cross.py", "06_nifty_rsi_churning.py", "07_basket_rsi_crossorder.py"):
         tree = ast.parse((EXAMPLES / name).read_text(encoding="utf-8"))
         assert not [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)], name
         called = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}

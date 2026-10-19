@@ -593,7 +593,7 @@ def pf_list(user: int | None = None) -> None:
 
 
 def console_open(strategy: str) -> bool:
-    """Make the console window of one strategy: its own summary, net positions, messages and order book, as `console_<strategy>`.
+    """Make the console window of one strategy: its own summary, net positions, messages and order book, as `<strategy>`.
     (algo_start does this by itself while the console is running; this is for a strategy that has portfolios but was not started
     with algo_start, such as "manual".)"""
     c = current().get("console")
@@ -601,7 +601,7 @@ def console_open(strategy: str) -> bool:
         print("The console is not running. Start it with  app.run(algo.Console())  (scripts/03_console.py).")
         return False
     done = c.open(strategy)
-    print(f"console_{strategy}: " + ("published" if done else "nothing to do (already there, or not a plain name)"))
+    print(f"{strategy.replace('-', '_').replace('.', '_')}: " + ("published" if done else "nothing to do (already there, or not a plain name)"))
     return done
 
 

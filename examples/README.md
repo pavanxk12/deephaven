@@ -11,6 +11,7 @@ Each file is meant to be pasted (or run) in the terminal after `import algo; alg
 | `03_algo_template.py` | **an automation as a plain script**: your settings, a few functions, two listeners. Copy it for a new one |
 | `04_nifty_multistrike.py` | your NIFTY automation with `N_STRIKES` strikes, as a plain script (functions and listeners, like your old one) |
 | `06_nifty_rsi_churning.py` | the same on a **5-minute RSI** (made from the 1-minute candles), with your subscribe fields, the `blocked` slots, `buy()` / `sell()` / `exit_all()` and a check when it is switched on |
+| `07_basket_rsi_crossorder.py` | a basket of symbols, a **1-minute RSI** entry (oversold buy / overbought sell) allowed only while the % from open and from VWAP sit in the middle of the basket (Q2 to Q3), your own target 1.5% and stop 0.5%, and the engine's single-order strategy (`single` / CrossOrder), started by one `subscribe` per trade on a new portfolio and closed with `squareup` |
 
 An automation script uses only the five services, through functions: `contract` / `strikes` / `nearest_strikes` (master), `last_price` and the
 table `candles` (candles), `algo_start` / `pf_assign` / `pf_activate` (the book and NATS) and `nats_send`.
@@ -79,7 +80,7 @@ What stays in your script is the part that is yours: the settings, which option,
    `unsubscribe_pf` for one portfolio (use `pf_unsubscribe` / `pf_squareup`), and re-checking the RSI at the moment the automation is switched on.
 5. **The stocks logic (baskets, the middle-half filter by percent-from-open, `stocks.txt`)** is not provided as a function: write it in the script,
    as in the old `automation_rsi.py`; `03_algo_template.py` is the shape. There is no packaged strategy any more.
-6. **The console's per-instrument checkbox** keys on the signal future. A slot (`future * 100 + k`) is not a future, so the console will not show
+6. **The console's per-instrument Subscribe / Unsubscribe** keys on the signal future. A slot (`future * 100 + k`) is not a future, so the console will not show
    the three strikes as separate stocks.
 
 ## 4. Still open (decisions for you)

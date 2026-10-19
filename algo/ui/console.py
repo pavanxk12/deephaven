@@ -1,7 +1,7 @@
 """Operator console: summary, message window, order book, net positions and the controls, per STRATEGY.
 
     app.run(algo.ui.Console())          # publishes `operator_console` (all strategies, with a strategy picker) and one
-                                        # `console_<strategy>` per strategy that has portfolios (each with its OWN four windows)
+                                        # `<strategy>` per strategy that has portfolios (each with its OWN four windows)
 
 A portfolio belongs to the strategy (the algo) the registry recorded for it; the order, trade and message tables are tied to a strategy through the
 PF number (PF = user * 10000 + portfolio number). A strategy that is started later (`algo_start`) gets its window by itself while this plugin is
@@ -36,19 +36,13 @@ from algo.core.plugin import Plugin
 from algo.strategy.guard import guard_of
 from algo.ui import tables as q
 from algo.ui.controls import is_sending, master_is_off, set_sending
-from algo.ui.filters import PF_PER_USER, Filters, Strategies, safe_strategy, strategy_cond, time_conds
+from algo.ui.filters import PF_PER_USER, Filters, Strategies, as_int, number_of, plain, row_value, safe_strategy, strategy_cond, time_conds
 
 GREEN, RED, BLUE, ORANGE, AMBER, PURPLE, GREY, INK = (
     "#1a7f37", "#cf222e", "#1f5fbf", "#c2410c", "#b45309", "#8250df", "#6e7781", "#1f2328")
 TYPE_COLOR = {"TRADE": GREEN, "ORDER": BLUE, "EVENT": PURPLE, "ERROR": RED, "INFO": GREY}
 TYPE_TINT = {"TRADE": "#e6f4ea", "ORDER": "#eaf1fc", "EVENT": "#f1ebfb", "ERROR": "#fde8e8", "INFO": "#ffffff"}
 
-POS_COLS = ["token", "Symbol", "BuyQty", "BuyAvg", "BuyVal", "SellQty", "SellAvg", "SellVal",
-            "NetQty", "Ltp", "Realised", "M2M"]
-# symbol (with checkbox) | BUY qty avg value | SELL qty avg value | NET qty ltp realised m2m | Pause | Square up
-GRID_COLS = ("minmax(230px, 2.2fr) minmax(64px, 1fr) minmax(70px, 1fr) minmax(100px, 1.4fr) "
-             "minmax(64px, 1fr) minmax(70px, 1fr) minmax(100px, 1.4fr) minmax(56px, 0.8fr) "
-             "minmax(76px, 1fr) minmax(76px, 1fr) minmax(76px, 1fr) 70px 90px")
 BUY_BG, SELL_BG = "#f7faff", "#fffaf6"
 
 
@@ -90,6 +84,8 @@ class Ctx:
     messages: object
     book_all: object             # order book, whole day
     limits: object = None        # Limits: the turnover and M2M limit of each strategy (and whether it is breached)
+    limits_table: object = None  # the live table `strategy_limits`: what the windows show of the limits
+    pf_table: object = None      # the live table `pf_by_option`: the state of the portfolio that trades each option (the native positions table reads it)
     guard: object = None         # Guard: changes a limit and acts when one is breached
 
 
@@ -132,26 +128,6 @@ def fmt(x, spec):
 
 def sign_color(x):
     return INK if x is None or x != x or x == 0 else (GREEN if x > 0 else RED)
-
-
-def cell(text, color=INK, bg="transparent", bold=False, size="14px"):
-    return ui.html.div(text, style={"textAlign": "right", "padding": "4px 8px", "color": color, "background": bg,
-                                    "fontSize": size, "fontWeight": "700" if bold else "400"})
-
-
-def grid_row(*cells, **kw):
-    return ui.html.div(*cells, **kw, style={"display": "grid", "gridTemplateColumns": GRID_COLS, "alignItems": "center",
-                                            "borderBottom": "1px solid #eef1f4"})
-
-
-def group_cell(text, span, bg):
-    return ui.html.div(text, style={"gridColumn": f"span {span}", "textAlign": "center", "background": bg,
-                                    "fontSize": "12px", "fontWeight": "700", "padding": "3px"})
-
-
-def head_cell(text, left=False):
-    return ui.html.div(text, style={"textAlign": "left" if left else "right", "padding": "2px 8px",
-                                    "fontSize": "12px", "fontWeight": "700", "color": GREY})
 
 
 def small_btn(label, color, on_press, disabled=False):
@@ -287,31 +263,74 @@ def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, ti
 
 
 @ui.component
+def limits_overview(ctx: Ctx):
+    """All strategies at once: the live table `strategy_limits` (limit, where it stands, breached or not)."""
+    return ui.flex(
+        ui.table(ctx.limits_table, density="compact", show_search=False,
+                 format_=[ui.TableFormat(cols="Status", if_="Status == `BREACHED`", color="#ffffff", background_color=RED),
+                          ui.TableFormat(cols=["TurnoverLimit", "Turnover", "M2MLimit", "M2M"], value="#,##0"),
+                          ui.TableFormat(cols="TurnoverUsedPct", value="0.0")],
+                 hidden_columns=["TurnoverHit", "M2MHit"],
+                 column_display_names={"TurnoverLimit": "TURNOVER LIMIT", "Turnover": "TURNOVER", "TurnoverUsedPct": "USED %", "M2MLimit": "M2M LIMIT", "M2M": "M2M"}),
+        UNSAFE_style={"height": "150px", "flex": "0 0 auto", "padding": "2px 16px 8px"},
+    )
+
+
+@ui.component
 def limit_boxes(ctx: Ctx):
     """The turnover limit and the M2M limit of this strategy, as input boxes. A limit may be changed at any time; 0 or empty = no limit.
     A breach is shown here; the strategy stays OFF until the limit is changed to a value it is no longer past (algo.strategy.guard does the switching, with no browser open)."""
     name, limits, guard = ctx.strategy, ctx.limits, ctx.guard
     cur = limits.get(name)
-    t_draft, set_t = ui.use_state(cur["turnover"])
-    m_draft, set_m = ui.use_state(cur["m2m"])
+    t_draft, set_t = ui.use_state(plain(cur["turnover"]))              # the text in each box
+    m_draft, set_m = ui.use_state(plain(cur["m2m"]))
+    latest = ui.use_ref({"turnover": plain(cur["turnover"]), "m2m": plain(cur["m2m"])})     # what is typed NOW (a text box sends every key, so this is always current)
     warn, set_warn = ui.use_state("")
     _, bump = ui.use_state(0)
     ui.use_effect(lambda: limits.on_change(lambda s: s == name and bump(lambda n: n + 1)), [])
-    cur = limits.get(name)
-    turnover, m2m = limits.seen(name)
+    mine_tbl = ui.use_memo(lambda: ctx.limits_table.where(f"Strategy == `{name}`"), [name])
+    row = ui.use_row_data(mine_tbl)                       # this strategy's row of `strategy_limits`: it ticks by itself, so what is shown is what the table holds
+    row = row if isinstance(row, dict) else {}
 
-    def apply(kind, value):
+    def got(key):
+        x = row.get(key)
+        return None if x is None or (isinstance(x, float) and (x != x or x <= -1.0e300)) else x          # None, NaN and the null of a double are "nothing"
+    cur = {"turnover": got("TurnoverLimit"), "m2m": got("M2MLimit")}
+    turnover, m2m = got("Turnover"), got("M2M")
+    if not row:                                           # the table has not reached this strategy yet: what the Limits object holds
+        cur, (turnover, m2m) = limits.get(name), limits.seen(name)
+
+    def apply(kind):
+        """Set: write what is typed in the box to the limits (and so to the `strategy_limits` table)."""
+        text = latest.current[kind]
+        try:
+            value = number_of(text)
+        except ValueError:
+            set_warn(f"{kind}: {text!r} is not a number (empty or 0 = no limit)")
+            return
         problem = guard.set_limit(name, kind, value)
-        now = limits.get(name)
-        set_t(now["turnover"]) if kind == "turnover" else set_m(now["m2m"])          # the box shows what was kept
+        shown = plain(limits.get(name)[kind])                        # the box shows what was kept
+        latest.current[kind] = shown
+        (set_t if kind == "turnover" else set_m)(shown)
         set_warn(problem or "limit saved")
         bump(lambda n: n + 1)
 
-    def box(label, value, on_change, kind, step):
+    def typed(kind, setter):
+        def on_change(text):
+            latest.current[kind] = text                              # at once; nothing is saved until Set (or Enter)
+            setter(text)
+        return on_change
+
+    def enter(kind):
+        return lambda e: apply(kind) if isinstance(e, dict) and e.get("key") == "Enter" else None
+
+    def box(label, value, on_change, kind, status):
+        """The box, its Set button and, to the RIGHT, what is set now and where the strategy stands."""
         return ui.flex(
-            ui.number_field(label=label, value=value, on_change=on_change, **({"min_value": 0} if kind == "turnover" else {}), step=step, width="size-2000"),
-            ui.button("Set", variant="accent", on_press=lambda: apply(kind, value), UNSAFE_style={"alignSelf": "end"}),
-            gap="size-100", align_items="end")
+            ui.text_field(label=label, value=value, on_change=on_change, on_key_down=enter(kind), width="size-2000"),
+            ui.button("Set", variant="accent", on_press=lambda: apply(kind), UNSAFE_style={"alignSelf": "end"}),
+            ui.text(status, UNSAFE_style={"fontSize": "13px", "fontWeight": "600", "color": INK, "alignSelf": "end", "paddingBottom": "6px", "whiteSpace": "nowrap"}),
+            gap="size-150", align_items="end")
 
     used_t = ("no limit set" if not cur["turnover"] else f"limit {cur['turnover']:,.0f}") + (
         "" if not cur["turnover"] or turnover is None else f", now {turnover:,.0f} ({100 * turnover / cur['turnover']:.0f}%)")
@@ -319,10 +338,8 @@ def limit_boxes(ctx: Ctx):
         "" if not cur["m2m"] or m2m is None else f", now {m2m:+,.0f}")
     why = limits.blocked(name)
     return ui.flex(
-        ui.flex(box("Turnover limit (₹)", t_draft, set_t, "turnover", 100000), ui.text(used_t, UNSAFE_style={"fontSize": "12px", "color": GREY}),
-                direction="column", gap="size-50"),
-        ui.flex(box("M2M limit (₹)", m_draft, set_m, "m2m", 1000), ui.text(used_m, UNSAFE_style={"fontSize": "12px", "color": GREY}),
-                direction="column", gap="size-50"),
+        box("Turnover limit (₹)", t_draft, typed("turnover", set_t), "turnover", used_t),
+        box("M2M limit (₹)", m_draft, typed("m2m", set_m), "m2m", used_m),
         *([ui.html.div(f"LIMIT BREACHED: {why}", style={"color": "#ffffff", "background": RED, "fontWeight": "700", "padding": "4px 10px", "borderRadius": "4px"})] if why else []),
         *([ui.html.div(warn, style={"color": GREEN if warn == "limit saved" else RED, "fontSize": "12px", "fontWeight": "600"})] if warn else []),
         gap="size-300", wrap=True, align_items="start", UNSAFE_style={"flex": "0 0 auto", "padding": "2px 16px 8px"},
@@ -380,146 +397,120 @@ def order_book(book_tbl, order_time):
 
 
 @ui.component
-def positions_grid(table, ctx: Ctx):
-    """Net positions drawn as real rows, so each row can hold a checkbox (left of the symbol) and
-    Pause / Square up buttons (right of M2M). Rows = positions only (tens)."""
-    sym = ctx.symbol_of
-    src = ui.use_memo(lambda: table.view(POS_COLS), [table])
-    data = ui.use_table_data(src)
-    full_src = ui.use_memo(lambda: ctx.net_all.view(["token", "NetQty"]), [])      # whole-day net, for the rules
-    full = ui.use_table_data(full_src)
-    armed, set_armed = ui.use_state(None)           # (user, PF) whose Square up is waiting for its confirm click
-    warn, set_warn = ui.use_state("")               # why the last tick / untick was refused
-    redraw = use_redraw(ctx)
+def fast_toolbar(ctx: Ctx, pick):
+    """The buttons for the selected row of the native positions table: Pause / Resume, Square up (two clicks), Subscribe / Unsubscribe. `pick` is the clicked row."""
+    armed, set_armed = ui.use_state(False)
+    warn, set_warn = ui.use_state("")
+    redraw = use_redraw(ctx)                       # only this small bar redraws when a portfolio changes, not the table
+    svc = service(ctx)
+    token = pick.get("token") if pick else None
+    entry = ctx.states.by_option(keep=lambda u, p, s: mine(ctx, u, p)).get(token) if token is not None else None
+    user, pf, st = entry if entry is not None else (None, None, None)
+    paused = bool(st and st.paused)
 
-    d = data if isinstance(data, dict) else {}
-    rows = [{c: d[c][i] for c in POS_COLS} for i in range(len(d.get("token", [])))]
-    fd = full if isinstance(full, dict) else {}
-    full_net = {int(t): int(n) for t, n in zip(fd.get("token", []), fd.get("NetQty", []))}
-    by_option = ctx.states.by_option(keep=lambda u, p, s: mine(ctx, u, p))   # option token -> (user, pf, state): the portfolio of this strategy that trades the row
-    has_portfolios = len(by_option) > 0
+    def on_pause():
+        set_armed(False)
+        set_warn("")
+        send(ctx, (svc.unpause if paused else svc.pause)(pf, user=user), f"{'resume' if paused else 'pause'} PF {pf}", set_warn)
+        redraw()
 
-    def on_allow(token, net, on, user, pf):
-        """The tick box is subscribe / unsubscribe. An open position must be paused and squared up first."""
-        svc = service(ctx)
-        if not on and net != 0:                     # rule: cannot unsubscribe while a position is open
-            set_warn(f"{sym(token)}: cannot untick, net position is {net:+,}. Pause and Square up first.")
-        elif pf is None:
-            set_warn(f"{sym(token)}: no portfolio trades this instrument (yet), nothing to change.")
+    def on_square():
+        if not paused:
+            set_warn(f"square up PF {pf} refused: press Pause first")
+            set_armed(False)
+        elif not armed:
+            set_armed(True)                        # the first click arms it, the second sends it
+        else:
+            set_armed(False)
+            send(ctx, svc.squareup(pf, user=user), f"square up PF {pf}", set_warn)
+        redraw()
+
+    def on_sub():
+        on = not st.subscribed
+        net = int(pick.get("net") or 0)
+        if not on and net != 0:                    # rule: cannot unsubscribe while a position is open
+            set_warn(f"{pick['symbol']}: cannot unsubscribe, net position is {net:+,}. Pause and Square up first.")
         else:
             set_warn("")
-            what = f"{'subscribe' if on else 'unsubscribe'} PF {pf}"
-            send(ctx, svc.subscribe(pf, token, user=user) if on else svc.unsubscribe(pf, token, user=user), what, set_warn)
+            send(ctx, svc.subscribe(pf, token, user=user) if on else svc.unsubscribe(pf, token, user=user), f"{'subscribe' if on else 'unsubscribe'} PF {pf}", set_warn)
         redraw()
 
-    def on_pause(user, pf, is_paused):
-        set_armed(None)
-        svc = service(ctx)
-        send(ctx, (svc.unpause if is_paused else svc.pause)(pf, user=user), f"{'resume' if is_paused else 'pause'} PF {pf}", set_warn)
-        redraw()
-
-    def on_square(user, pf):
-        st = ctx.states.get(user, pf)
-        if st is None or not st.paused:             # rule: no square up until the PF is paused
-            set_warn(f"square up PF {pf} refused: press Pause first")
-            set_armed(None)
-        elif armed != (user, pf):
-            set_armed((user, pf))                   # first click arms it, second click sends it
-        else:
-            set_armed(None)
-            send(ctx, service(ctx).squareup(pf, user=user), f"square up PF {pf}", set_warn)
-        redraw()
-
-    def line(r):
-        token = int(r["token"])
-        net = full_net.get(token, int(r["NetQty"]))         # rules use the whole-day position, not the window
-        shown_net = int(r["NetQty"])
-        entry = by_option.get(token)                        # the portfolio subscribed to this option, if any
-        user, pf, st = entry if entry is not None else (None, None, None)
-        has_pf = entry is not None
-        is_allowed = st.subscribed if has_pf else True      # the tick box: subscribed
-        is_paused = has_pf and st.paused
-        return grid_row(
-            ui.checkbox(str(r["Symbol"]), is_selected=is_allowed,
-                        is_disabled=not has_pf, on_change=lambda on: on_allow(token, net, on, user, pf),
-                        UNSAFE_style={"fontSize": "14px", "height": "26px", "minHeight": "0", "paddingLeft": "6px",
-                                      "whiteSpace": "nowrap"}),
-            cell(fmt(r["BuyQty"], ",.0f"), bg=BUY_BG), cell(fmt(r["BuyAvg"], ",.2f"), bg=BUY_BG),
-            cell(fmt(r["BuyVal"], ",.0f"), bg=BUY_BG),
-            cell(fmt(r["SellQty"], ",.0f"), bg=SELL_BG), cell(fmt(r["SellAvg"], ",.2f"), bg=SELL_BG),
-            cell(fmt(r["SellVal"], ",.0f"), bg=SELL_BG),
-            cell(fmt(shown_net, ",.0f"), color=BLUE if shown_net > 0 else ORANGE if shown_net < 0 else INK, bold=True),
-            cell(fmt(r["Ltp"], ",.2f")),
-            cell(fmt(r["Realised"], ",.0f"), color=sign_color(r["Realised"]), bold=True),
-            cell(fmt(r["M2M"], ",.0f"), color=sign_color(r["M2M"]), bold=True),
-            ui.flex(small_btn("Resume" if is_paused else "Pause", GREEN if is_paused else AMBER,
-                              lambda: on_pause(user, pf, is_paused), disabled=not has_pf), justify_content="center"),
-            ui.flex(small_btn("Confirm?" if has_pf and armed == (user, pf) else "Square up", RED,
-                              lambda: on_square(user, pf), disabled=not is_paused), justify_content="center"),
-            key=str(token),
-        )
-
-    header = ui.html.div(
-        grid_row(ui.html.div(), group_cell("BUY", 3, "#e8f0fe"), group_cell("SELL", 3, "#fdeee4"),
-                 group_cell("NET", 4, "#eef1f4"), ui.html.div(), ui.html.div()),
-        grid_row(head_cell("SYMBOL", left=True), head_cell("QTY"), head_cell("AVG"), head_cell("VALUE"),
-                 head_cell("QTY"), head_cell("AVG"), head_cell("VALUE"),
-                 head_cell("QTY"), head_cell("LTP"), head_cell("REALISED"), head_cell("M2M"),
-                 ui.html.div(), ui.html.div()),
-        style={"position": "sticky", "top": "0", "background": "#ffffff", "zIndex": "2"},
-    )
-
-    def total(key):                                  # sum of what is shown (follows the filters), skips missing values
-        return sum(r[key] for r in rows if r[key] is not None and r[key] == r[key])
-
-    big = "15px"
-    footer = ui.html.div(
-        grid_row(
-            ui.html.div("TOTAL", style={"padding": "3px 8px", "fontSize": "12px", "fontWeight": "700", "color": GREY}),
-            cell(fmt(total("BuyQty"), ",.0f"), bg=BUY_BG, bold=True, size=big), cell("", bg=BUY_BG),
-            cell(fmt(total("BuyVal"), ",.0f"), bg=BUY_BG, bold=True, size=big),
-            cell(fmt(total("SellQty"), ",.0f"), bg=SELL_BG, bold=True, size=big), cell("", bg=SELL_BG),
-            cell(fmt(total("SellVal"), ",.0f"), bg=SELL_BG, bold=True, size=big),
-            cell(fmt(total("NetQty"), "+,.0f"), bold=True, size=big), cell(""),
-            cell(fmt(total("Realised"), "+,.0f"), color=sign_color(total("Realised")), bold=True, size=big),
-            cell(fmt(total("M2M"), "+,.0f"), color=sign_color(total("M2M")), bold=True, size=big),
-            ui.html.div(), ui.html.div(),
-        ),
-        style={"position": "sticky", "bottom": "0", "background": "#eef1f4", "borderTop": "2px solid #c9d1d9", "zIndex": "2"},
-    )
-    note = ([] if has_portfolios else [ui.text("no portfolio has been subscribed yet - checkboxes and buttons are disabled")]) + (
-        [ui.html.div(warn, style={"color": RED, "fontSize": "13px", "fontWeight": "600", "padding": "2px 8px"})] if warn else [])
-    return ui.html.div(                              # outer box scrolls, inner box keeps the columns from squeezing
-        *note,
-        ui.html.div(header, *[line(r) for r in rows], footer, style={"minWidth": "1140px"}),
-        style={"flex": "1", "minHeight": "0", "overflow": "auto"},
+    has = entry is not None
+    label = (f"{pick['symbol']}   PF {pf}   " + ("PAUSED" if paused else "RUNNING" if st.subscribed else "UNSUBSCRIBED")) if has else (
+        f"{pick['symbol']}: no portfolio trades this instrument" if pick else "click a row to select it")
+    return ui.flex(
+        ui.html.div(label, style={"fontWeight": "700", "fontSize": "13px", "color": INK if has else GREY, "padding": "0 8px", "alignSelf": "center", "minWidth": "260px"}),
+        small_btn("Resume" if paused else "Pause", GREEN if paused else AMBER, on_pause, disabled=not has),
+        small_btn("Confirm?" if armed and has else "Square up", RED, on_square, disabled=not (has and paused)),
+        small_btn("Unsubscribe" if has and st.subscribed else "Subscribe", BLUE, on_sub, disabled=not has),
+        *([ui.html.div(warn, style={"color": RED, "fontSize": "12px", "fontWeight": "600", "padding": "0 8px"})] if warn else []),
+        gap="size-100", align_items="center", wrap=True, UNSAFE_style={"flex": "0 0 auto", "padding": "2px 4px"},
     )
 
 
 @ui.component
-def net_positions(net_tbl, ctx: Ctx):
+def fast_positions(net_tbl, ctx: Ctx):
+    """Net positions as a NATIVE table: the browser draws it and the engine streams only the cells that changed, so a price tick costs no Python redraw.
+    Row buttons are replaced by a toolbar that acts on the clicked row. The state (running / paused / squared) is read from the live table `pf_by_option`."""
     hide_flat, set_hide_flat = ui.use_state(False)
-    kind, set_kind = ui.use_state("ALL")            # ALL, FUT, OPT, EQ
+    kind, set_kind = ui.use_state("ALL")
+    pick, set_pick = ui.use_state(None)
 
     def build():
         conds = (["NetQty != 0"] if hide_flat else []) + ([f"Kind == `{kind}`"] if kind != "ALL" else [])
-        return net_tbl.where(conds) if conds else net_tbl
+        shown = net_tbl.where(conds) if conds else net_tbl
+        states = ctx.pf_table.where(f"Strategy == `{ctx.strategy}`") if ctx.strategy else ctx.pf_table
+        return (shown.update_view("TokenL = (long) token")
+                .natural_join(states, on="TokenL = Option", joins="User, PF, Subscribed, Paused, Squared")
+                .update_view("State = isNull(PF) ? `-` : (Squared != null && Squared && Paused != null && Paused) ? `SQUARED` : (Paused != null && Paused) ? `PAUSED`"
+                             " : (Subscribed != null && Subscribed) ? `RUNNING` : `UNSUBSCRIBED`")
+                .view(["Symbol", "State", "PF", "BuyQty", "BuyAvg", "BuyVal", "SellQty", "SellAvg", "SellVal", "NetQty", "Ltp", "Realised", "M2M",
+                       "token", "User", "Subscribed", "Paused", "Kind", "Fills"]))
 
-    shown = ui.use_memo(build, [hide_flat, kind, net_tbl])
+    tbl = ui.use_memo(build, [hide_flat, kind, net_tbl, ctx.strategy])
+
+    def pressed(row):
+        """A click on a row selects it for the toolbar. It must never raise: whatever the row holds, the worst case is that nothing is selected."""
+        try:
+            token = as_int(row_value(row, "token"), -1)
+            if token < 0:
+                return
+            set_pick({"token": token, "symbol": str(row_value(row, "Symbol", token)), "net": as_int(row_value(row, "NetQty", 0))})
+        except Exception:
+            import logging
+            logging.getLogger("algo.ui").exception("a click on a row of the positions table was not understood")
 
     def kind_button(label, value):
         return ui.toggle_button(label, is_selected=kind == value, on_change=lambda _: set_kind(value))
 
+    formats = [
+        ui.TableFormat(cols=["BuyQty", "BuyAvg", "BuyVal"], background_color=BUY_BG),
+        ui.TableFormat(cols=["SellQty", "SellAvg", "SellVal"], background_color=SELL_BG),
+        ui.TableFormat(cols=["BuyQty", "SellQty", "BuyVal", "SellVal", "Realised", "M2M"], value="#,##0"),
+        ui.TableFormat(cols=["BuyAvg", "SellAvg", "Ltp"], value="#,##0.00"),
+        ui.TableFormat(cols="NetQty", value="+#,##0;-#,##0;0"),
+        ui.TableFormat(cols="NetQty", if_="NetQty > 0", color=BLUE),
+        ui.TableFormat(cols="NetQty", if_="NetQty < 0", color=ORANGE),
+        ui.TableFormat(cols="Realised", if_="Realised > 0", color=GREEN),
+        ui.TableFormat(cols="M2M", if_="M2M > 0", color=GREEN),
+        ui.TableFormat(cols="M2M", if_="M2M < 0", color=RED),
+        ui.TableFormat(cols="Realised", if_="Realised < 0", color=RED),
+        ui.TableFormat(cols="State", if_="State == `PAUSED`", background_color=AMBER, color="#ffffff"),
+        ui.TableFormat(cols="State", if_="State == `SQUARED`", background_color=RED, color="#ffffff"),
+        ui.TableFormat(cols="State", if_="State == `RUNNING`", background_color=GREEN, color="#ffffff"),
+    ]
     return ui.panel(
         ui.flex(
             ui.flex(
                 ui.toggle_button("Hide flat", is_selected=hide_flat, on_change=set_hide_flat),
-                ui.flex(kind_button("All", "ALL"), kind_button("Futures", "FUT"), kind_button("Options", "OPT"),
-                        kind_button("Equity", "EQ"), gap="size-100", wrap=True),
-                gap="size-200", wrap=True, align_items="center",
-                UNSAFE_style={"flex": "0 0 auto"},          # keep the button row its own height; the rows get the rest
+                ui.flex(kind_button("All", "ALL"), kind_button("Futures", "FUT"), kind_button("Options", "OPT"), kind_button("Equity", "EQ"), gap="size-100", wrap=True),
+                gap="size-200", wrap=True, align_items="center", UNSAFE_style={"flex": "0 0 auto"},
             ),
-            positions_grid(shown, ctx),
+            fast_toolbar(ctx, pick),
+            ui.table(tbl, density="spacious", show_search=True, format_=formats, on_row_press=pressed,
+                     always_fetch_columns=["token", "Symbol", "NetQty"], frozen_columns=["Symbol"], hidden_columns=["token", "User", "Subscribed", "Paused", "Kind", "Fills"],
+                     column_display_names={"BuyQty": "BUY QTY", "BuyAvg": "BUY AVG", "BuyVal": "BUY VALUE", "SellQty": "SELL QTY", "SellAvg": "SELL AVG", "SellVal": "SELL VALUE",
+                                           "NetQty": "NET", "Ltp": "LTP", "Realised": "REALISED", "M2M": "M2M"}),
             direction="column", gap="size-100", height="100%",
         ),
         title="Net positions",
@@ -733,14 +724,14 @@ def build_dashboard(base: Ctx):
             ui.column(
                 ui.row(
                     ui.column(summary_window(net_tbl, book_tbl, ctx.logo_src, cfg.logo_height, filters_bar, title,
-                                             limit_boxes(ctx) if strategy and ctx.limits is not None else None), width=72),
+                                             (limit_boxes(ctx) if strategy else limits_overview(ctx)) if ctx.limits_table is not None else None), width=72),
                     ui.column(control_panel(ctx), width=28),
                     height=30,
                 ),
                 ui.row(
                     message_window(msgs, hide_strategy=bool(strategy)),
                     ui.column(ui.row(order_book(book_tbl, cfg.order_time), height=30),
-                              ui.row(net_positions(net_tbl, ctx), height=70)),
+                              ui.row(fast_positions(net_tbl, ctx), height=70)),
                 ),
             )
         )
@@ -782,6 +773,8 @@ class Console(Plugin):
                         messages=q.tag(q.messages(events, cfg.event_cols, mk.tz), "Pf", smap),
                         book_all=q.order_book(acks, fills, symbols, mk.price_div, cfg.order_time, mk.tz),
                         limits=limits_of(app.shared, f"{app.paths.state}/limits.json"), guard=guard_of(app, f"{app.paths.state}/limits.json"))
+        self._limits_table(smap, trades, feed, symbols)
+        self._states_table(smap)
         app.publish("operator_console", build_dashboard(self.base))
         self.opened = set()
         for name in strategies.names():
@@ -789,7 +782,7 @@ class Console(Plugin):
         self.log.info("published `operator_console` and a window for each of: %s", ", ".join(strategies.names()) or "(no strategy yet)")
 
     def open(self, strategy: str) -> bool:
-        """Publish `console_<strategy>`: this strategy's own summary, net positions, messages and order book. Does nothing if it is there
+        """Publish `<strategy>`: this strategy's own summary, net positions, messages and order book. Does nothing if it is there
         already. Called by `algo_start` for a new strategy, and by `console_open(name)`."""
         if self.base is None or strategy in self.opened:
             return False
@@ -797,29 +790,71 @@ class Console(Plugin):
             self.log.warning("no window for strategy %r: its name may only hold letters, digits, _ . -", strategy)
             return False
         ctx = replace(self.base, strategy=strategy, filters=self.app.shared.setdefault(("console_filters", strategy), Filters()))
-        self.app.publish(f"console_{strategy}".replace("-", "_").replace(".", "_"), build_dashboard(ctx))
+        slug = strategy.replace("-", "_").replace(".", "_")
+        self.app.publish(slug, build_dashboard(ctx))                       # the window is named after the strategy itself
         self.base.strategies.add(strategy)
         self.opened.add(strategy)
-        self._watch_limits(strategy)
         return True
 
-    def _watch_limits(self, strategy: str) -> None:
-        """Feed the strategy's whole-day turnover (₹) and gross M2M to the guard on every change. This runs on the server, whether or not a browser is open."""
+    def _states_table(self, smap) -> None:
+        """Publish `portfolio_states_log` (one row per confirmed command on a portfolio) and `pf_by_option` (the portfolio that trades each option, with its state and strategy).
+        This is algo.core.pfstate as a live table, so the native positions table can show Running / Paused / Squared without a Python redraw."""
+        from deephaven import DynamicTableWriter, dtypes as dht
+        from deephaven.constants import NULL_LONG
+        app, base = self.app, self.base
+        writer = DynamicTableWriter({"User": dht.int64, "PF": dht.int64, "Option": dht.int64, "Subscribed": dht.bool_, "Paused": dht.bool_, "Squared": dht.bool_,
+                                     "By": dht.string, "Cmd": dht.string, "AtN": dht.int64})
+
+        def record(user, pf, st) -> None:
+            writer.write_row(int(user), int(pf), NULL_LONG if st.option is None else int(st.option), bool(st.subscribed), bool(st.paused), bool(st.squared),
+                             str(st.by), str(st.cmd), int(st.at * 1000))
+
+        for user, pf, st in base.states.items():                        # what is known before this start
+            record(user, pf, st)
+        self._undo.append(base.states.on_change(record))
+        table = q.pf_by_option(writer.table, smap, self.cfg.pf_per_user)
+        app.publish("portfolio_states_log", writer.table)
+        app.publish("pf_by_option", table)
+        self.base.pf_table = table
+        self._keep_states = (writer, table)                              # keep the tables alive
+
+    def _limits_table(self, smap, trades, feed, symbols) -> None:
+        """Publish `strategy_limits` (one live row per strategy: its limits, where it stands, breached or not) and feed the guard.
+        The limits are written to `strategy_limits_log` whenever one changes; `strategy_limits` is the latest row of each strategy joined with the live
+        turnover and M2M, so the windows show what the table holds. The guard is fed from the same live totals, on the server, whether or not a browser is open."""
+        from deephaven import DynamicTableWriter, dtypes as dht, merge
+        from deephaven.constants import NULL_DOUBLE
         from deephaven.table_listener import listen
-        base, mk = self.base, self.app.market
-        tot = (q.net_positions(base.trades.where(strategy_cond(strategy)), base.feed, base.symbols, mk.price_div)
-               .agg_by([agg.sum_(["BuyVal", "SellVal", "M2M"])]).view(["Turnover = BuyVal + SellVal", "M2M"]))
-        guard = base.guard
+        app, base, mk = self.app, self.base, self.app.market
+        limits, guard = base.limits, base.guard
+        writer = DynamicTableWriter({"Strategy": dht.string, "TurnoverLimit": dht.double, "M2MLimit": dht.double,
+                                     "TurnoverHit": dht.bool_, "M2MHit": dht.bool_, "Changed": dht.string})
+
+        def record(strategy: str) -> None:
+            r = limits.get(strategy)
+            writer.write_row(strategy, float(r["turnover"]) if r["turnover"] else NULL_DOUBLE, float(r["m2m"]) if r["m2m"] else NULL_DOUBLE,
+                             bool(r["turnover_hit"]), bool(r["m2m_hit"]), datetime.now(mk.zone).strftime("%H:%M:%S"))
+
+        for name in limits.names():                                     # what was saved before this start
+            record(name)
+        self._undo.append(limits.on_change(record))
+        log_tbl = writer.table
+        totals = q.strategy_totals(base.trades, base.feed, mk.price_div)
+        strategies = merge([smap.view("Strategy"), log_tbl.view("Strategy")]).select_distinct("Strategy")
+        table = q.limits_view(strategies, log_tbl.last_by("Strategy"), totals)
+        app.publish("strategy_limits_log", log_tbl)
+        app.publish("strategy_limits", table)
+        self.base.limits_table = table
 
         def changed(update, is_replay):
             for rows in (update.added(), update.modified()):
-                if rows and len(rows.get("Turnover", ())):
-                    guard.on_values(strategy, rows["Turnover"][-1], rows["M2M"][-1])
-                    return
+                if rows and len(rows.get("Strategy", ())):
+                    for strategy, turnover, m2m in zip(rows["Strategy"], rows["Turnover"], rows["M2M"]):
+                        guard.on_values(str(strategy), turnover, m2m)
 
-        handle = listen(tot, changed, do_replay=True)
+        handle = listen(totals, changed, do_replay=True)
         self._undo.append(handle.stop)
-        self._totals = getattr(self, "_totals", []) + [tot]            # keep the table alive
+        self._keep = (writer, totals, strategies)                       # keep the tables alive
 
     def _logo(self) -> str | None:
         path = f"{self.app.paths.market_data}/{self.cfg.logo_file}"

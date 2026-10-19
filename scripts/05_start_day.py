@@ -3,7 +3,7 @@
 #   candles    1-minute candles from the live feed
 #   registry   portfolio numbers, unique per user
 #   nats       the one NATS service, for users 3 and 4 (the master switch is ON; every strategy starts OFF and switches itself on)
-#   console    operator_console and one console_<strategy> window per strategy (needs strategy_events, orders_trade, orders_ack and the feed from init.py)
+#   console    operator_console and one <strategy> window per strategy (needs strategy_events, orders_trade, orders_ack and the feed from init.py)
 # The Postgres login is the container's own AUTOMATION_DATABASE_URL and the driver is the volume's psycopg (run.md section 1). The host's init.py runs these same lines at every start.
 import algo
 

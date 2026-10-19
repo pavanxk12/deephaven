@@ -73,9 +73,9 @@ class PfStates:
             if st is None:
                 st = self._d[key] = PfState()
             if cmd == "subscribe":
-                st.option, st.subscribed, st.squared = _int(payload.get("T1"), st.option), True, False
+                st.option, st.subscribed, st.squared = _contract(payload, st.option), True, False
             elif cmd == "unsubscribe":
-                st.subscribed, st.option = False, _int(payload.get("T1"), st.option)
+                st.subscribed, st.option = False, _contract(payload, st.option)
             elif cmd == "pause_unpause":
                 st.paused = payload.get("Action") == "Pause"
             elif cmd == "squareup":
@@ -126,6 +126,12 @@ class PfStates:
             except Exception:
                 import logging
                 logging.getLogger("algo.pfstate").exception("a pf-state listener failed")
+
+
+def _contract(payload: dict, default):
+    """The contract a command names: `T1` (churning), or `TOKEN` (the single-order strategy's own field), else what was known."""
+    t1 = _int(payload.get("T1"), None)
+    return t1 if t1 is not None else _int(payload.get("TOKEN"), default)
 
 
 def _int(x, default):

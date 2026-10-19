@@ -5,7 +5,7 @@ Type **`algo_help()`** in the Deephaven terminal at any time: it lists every fun
 
 Written for: you, using the master, candles, portfolio and NATS services directly from the terminal.
 
-## 0. Once a day (one person, or the end of init.py)
+## 0. Once a day (one person, or the end of init.py; on the India host init.py already does it at every container start, see run.md section 0)
 
 ```python
 import algo; algo.install(globals(), "NSE")        # "US" for the US feed

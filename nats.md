@@ -66,7 +66,7 @@ All three use the same calls. They only differ in how they look at the answer.
 | caller | how | how it learns the outcome |
 |---|---|---|
 | **a script of yours** (`pf_activate`) | `bridge.submit(bridge.swap(...))` → runs *retire old PF → subscribe → pause → apply → unpause* | each step is checked; the first that is not `ok` stops the sequence, leaves the portfolio paused, rolls the book back, waits `fail_cooldown_s` before retrying that stock, and writes a `swap failed` row to `nats_events` |
-| **the console buttons** | the tick box, Pause / Resume and Square up of a row, and the Controls panel, call `svc.subscribe / unsubscribe / pause / unpause / squareup(pf, user=...)` with no client name (an operator) | the call returns a `Future`; a failure is written under the buttons (`pause PF 1005: sending is OFF ...`), in `nats_events` and in the log |
+| **the console buttons** | the toolbar of the positions table (Subscribe / Unsubscribe, Pause / Resume and Square up of the clicked row) and the Controls panel call `svc.subscribe / unsubscribe / pause / unpause / squareup(pf, user=...)` with no client name (an operator) | the call returns a `Future`; a failure is written under the buttons (`pause PF 1005: sending is OFF ...`), in `nats_events` and in the log |
 | **you in the console** | `pf_pause(1913)`, `pf_apply(1913, ival=1.1, ...)` ... | prints `PF 1913 pause: ok - ok` or `NOT ok - timeout` |
 | **other code** | `svc = app["nats"]`, `svc.pause(pf)` | `.result(5)` gives a `Reply` |
 
@@ -102,7 +102,7 @@ service the others are using. The same goes for `registry_start` / `registry_con
 | **each strategy** | `nats_send(True, client="nifty_sma")` (the name given to `algo_start`) | **OFF**, until it says so | stops or starts only that strategy; a name that is not a running strategy is refused |
 
 A command goes out only when the master switch AND its own algo's switch are both on, so one algo stopping never stops another. A typed
-command (`pf_pause(...)`) has no algo behind it and only needs the master switch. A strategy's client name is its strategy name. The console is not a client: its row buttons and Controls panel send as an operator and need only the master switch. The Controls panel's
+command (`pf_pause(...)`) has no algo behind it and only needs the master switch. A strategy's client name is its strategy name. The console is not a client: its toolbar and Controls panel send as an operator and need only the master switch. The Controls panel's
 ON / OFF button flips the master switch in the all-strategies window and only that strategy's switch in a strategy's own window.
 A strategy's turnover or M2M limit (console, `run.md` 6b) switches its own switch OFF when breached, and `nats_send(True, client=...)` or the ON button is refused until the limit is changed to a value the strategy is no longer past.
 When the service is restarted every algo is OFF again and has to say `send` again. A refused command is answered `off` with the reason in
@@ -112,19 +112,19 @@ only logs `[DRY] ...`, answering `dry`.
 ### One state for the algos and the console: `portfolio_state_log`
 
 Every command that the bridge answers `ok` is also recorded in one shared place (`algo/core/pfstate.py`, `app.shared["pf_states"]`), **whoever sent it**.
-Per (user, portfolio) it keeps: the option, `subscribed` (the tick box), `paused` (the Pause / Resume button), `squared` (a square up went through and
+Per (user, portfolio) it keeps: the option, `subscribed` (the State column, the Subscribe / Unsubscribe button), `paused` (the Pause / Resume button), `squared` (a square up went through and
 nothing has been applied since), who did it last (`by`: an algo's name, or `operator` for the console and typed commands) and when. A refused or failed
 command changes nothing. Each change is also a row in the table **`portfolio_state_log`** (`portfolio_state_log.last_by(["User","PF"])` is the picture now).
 
 | it happens | the console | the algo |
 |---|---|---|
-| the algo subscribes, pauses, squares up, unsubscribes | the row's tick box / button changes at once | (it did it) |
+| the algo subscribes, pauses, squares up, unsubscribes | the row's State changes at once | (it did it) |
 | you click **Pause** / **Resume** | the button flips | its book follows: `algo_portfolios()` shows `paused`. When it next sends an order for that portfolio it applies the parameters but **does not unpause**: a pause by someone else stands until you resume it |
 | you click **Square up** | | `pf_leg(...)` becomes `None`: the slot may start again on the next signal |
-| you **untick** the box (unsubscribe) | | the slot is **blocked**: `pf_allowed(...)` is False and `pf_assign(...)` returns `None`, so no portfolio number and no order, until you tick it again (that subscribes it again) |
+| you press **Unsubscribe** for the row | | the slot is **blocked**: `pf_allowed(...)` is False and `pf_assign(...)` returns `None`, so no portfolio number and no order, until you press Subscribe for it again |
 
 The console ties a row to its portfolio by the option the portfolio is subscribed to (within the strategy's own window, only that strategy's portfolios). Rules kept from before: Square up only while paused (two clicks), and
-an untick only when the net position is 0. After a Deephaven restart the states start empty; each algo's book re-adopts the portfolios it had subscribed.
+an Unsubscribe only when the net position is 0. A portfolio is linked to its contract by the subscribe's `T1` (churning) or `TOKEN` (the single-order strategy). After a Deephaven restart the states start empty; each algo's book re-adopts the portfolios it had subscribed.
 The Controls panel's ON / OFF button is the service's master switch in the all-strategies window and that one strategy's own switch in a strategy's window (a strategy
 switched on while the master is off waits for the master, and the window says so); neither follows a change made elsewhere until something redraws it.
 

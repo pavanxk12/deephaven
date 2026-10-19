@@ -26,7 +26,7 @@ scripts (algos) are plain Python pasted into the same session and call plain fun
         pf_assign()  = BOOK picks the portfolio number (REGISTRY keeps it, unique per user)
         pf_activate()= BRIDGE queues: [retire old] subscribe, pause, apply, unpause  ──► NATS SERVICE ──► NATS server ──► order bridge (C++/other)
                                                                                          │ (one service for everybody)
-   console (UI) ── tick box / Pause / Square up ──────────────────────────────────────────┘
+   console (UI) ── click a row, then Pause / Square up / Subscribe ───────────────────────┘
                                                                                          │ every confirmed command
                                                                                          ▼
                                                                   SHARED PORTFOLIO STATE (algo.core.pfstate)  ──► read by algos AND the console
@@ -55,7 +55,7 @@ Three rules hold the design together:
 | **eod** | saves whole tables to Parquet once a day | `eod_auto()` (or `eod_save()` now) | one thread `algo-eod` | files, `candles_hist`... on load |
 | **registry** | the portfolio registry: (user, number) -> strategy, name, owner | `registry_start()` | caller's (a small file append) | `portfolio_registry`, `portfolio_registry_log` |
 | **nats** | the ONE command service | `nats_start(ip, port, users=[...])` | one asyncio loop thread `algo-nats` | `cmd_queue_automated`, `nats_events`, `portfolio_state_log` |
-| **console** | the operator dashboards | `app.run(algo.Console())` | Deephaven UI render threads | `operator_console`, `console_<strategy>` |
+| **console** | the operator dashboards | `app.run(algo.Console())` | Deephaven UI render threads | `operator_console`, `<strategy>` |
 | **per algo**: `<name>_book`, `<name>_bridge`, `<name>` | what `algo_start` creates for one automation | your script | none of their own (the bridge uses the NATS loop) | - |
 
 Plain functions (not plugins) read the master and candles: `contract`, `strikes`, `nearest_strikes`, `last_price`, `last_candles` (`algo/lookup.py`).
@@ -63,6 +63,12 @@ Plain functions (not plugins) read the master and candles: `contract`, `strikes`
 `algo_status()` lists what is running; `algo_help()` lists every function by service.
 
 ---
+
+### Start-up at container start
+
+The India host's `init.py` ends with a guarded block that runs the start-up sequence (install, master from Postgres or the file, candles, registry, NATS, console) each time the Deephaven
+container starts; see `run.md` section 0 for what that means for the day. The single-order strategy (`07_basket_rsi_crossorder.py`) is started by one `subscribe` per trade on a new
+portfolio with `"strategyname": "single"` and closed with `squareup`: the engine's plugin reads its parameters once per portfolio.
 
 ## 3. The plugin framework (`algo/core`)
 
@@ -193,14 +199,14 @@ After every command the bridge answers `ok`, the service records it in one share
 `option, subscribed, paused, squared, by, cmd, at`. A failed command changes nothing. Each change is a row in `portfolio_state_log`. Listeners are told.
 
 ```
- algo command  ──►  NATS service ──ok──►  PfStates  ──►  console redraws (tick box, Pause/Resume, Square up)
+ algo command  ──►  NATS service ──ok──►  PfStates  ──►  console (State column of the positions table, toolbar)
  console click ──►  NATS service ──ok──►  PfStates  ──►  the algo's bridge hears it and updates its book:
                                                             pause / resume   -> book.paused; the algo's next order APPLIES but does not unpause (their pause stands)
                                                             square up        -> pf_leg() = None: the slot may start again
-                                                            untick (unsub)   -> slot blocked: pf_allowed() False, pf_assign() None, until ticked again
+                                                            Unsubscribe      -> slot blocked: pf_allowed() False, pf_assign() None, until subscribed again
 ```
 
-An algo's *own* unsubscribe (retiring a portfolio) never blocks its slot; only the operator's tick box does. After a Deephaven restart the states start
+An algo's *own* unsubscribe (retiring a portfolio) never blocks its slot; only the operator's Unsubscribe does. After a Deephaven restart the states start
 empty and each book re-adopts what it had subscribed.
 
 ---
@@ -210,18 +216,26 @@ empty and each book re-adopts what it had subscribed.
 * Inputs: `strategy_events`, `orders_trade`, `orders_ack` (from your order bridge, via Kafka) and the live feed table; the registry and the shared state.
 * **Strategy mapping**: trade/ack/message rows carry `PF = user * 10000 + portfolio number`; they are tagged with a `Strategy` column joined live from
   `portfolio_registry` (`PfKey = User*10000 + PF` -> `Algo`). Unknown portfolio -> null strategy (visible only on the all-strategies window).
-* **Windows**: `operator_console` (all strategies, strategy picker, time window) and `console_<strategy>`: **its own** summary, net positions, message window,
+* **Windows**: `operator_console` (all strategies, strategy picker, time window) and `<strategy>`: **its own** summary, net positions, message window,
   order book, controls. A new `algo_start` opens its window; `console_open("name")` by hand. Names may only hold letters, digits, `_ . -`.
-* **Net positions** per row: tick box = subscribe/unsubscribe, Pause/Resume, Square up (two clicks, only while paused), all from the shared state (5.5). Rules kept:
-  Square up needs Pause first; untick only at net 0. Commands go through the NATS service with no client name (operator). Failures are written under the buttons.
+* **Net positions** are a **native table** (the browser draws it; the engine streams only the cells that changed, so a price tick costs no Python redraw). Click a row and a toolbar
+  above it acts on that row's portfolio: Pause / Resume, Square up (two clicks, only while paused), Subscribe / Unsubscribe. A State column shows RUNNING / PAUSED / SQUARED /
+  UNSUBSCRIBED. Rules kept: Square up needs Pause first; no Unsubscribe while the net position is open. Commands go through the NATS service with no client name (operator);
+  failures are written beside the buttons. The state is read from two live tables the console publishes: `portfolio_states_log` (one row per confirmed command, the table form of
+  `PfStates`) and `pf_by_option` (for every contract, the portfolio that trades it, a subscribed one first, with its strategy). A portfolio is linked to its contract by the
+  subscribe's `T1` (churning) or `TOKEN` (the single-order strategy). Rows are bigger (`density="spacious"`). Code: `fast_positions`, `fast_toolbar` in `algo/ui/console.py`.
 * **ON / OFF button** (Controls panel, `algo/ui/controls.py`): in `operator_console` it flips the service's master switch for everyone; in a strategy's own window it flips only that
   strategy's switch (the same as `nats_send(..., client="name")`) and shows ON only when the master is on too. Pause all / Resume all / Square off all act on that strategy's portfolios only.
+* **Limits** are also a live table: `strategy_limits` (one row per strategy: both limits, turnover and M2M now, breached or not; `strategy_limits_log` keeps every change), built in `Console._limits_table` from `Limits`, the registry and `q.strategy_totals`; the strategy window shows its row, `operator_console` shows the table. One table listener feeds the guard for every strategy.
 * **Limits** (`algo/core/limits.py` numbers and latches, `algo/strategy/guard.py` the action): a strategy window has a **turnover limit (₹)** and an **M2M limit (₹)** box in its Summary,
   changeable any time (0 = none). The console feeds the guard the strategy's whole-day turnover and gross M2M from a server-side table listener on every change, so it works with no browser open.
   Turnover at/above its limit: that strategy's sending switch goes OFF. M2M at/below its limit (the number as typed, -5000 means -5000): its subscribed portfolios (registry algo = the strategy, each under its own user) are paused and squared up
   as operator commands, then its switch goes OFF. Either way a row goes to `nats_events` (`cmd = limit`), the window shows LIMIT BREACHED and the ON / OFF button flips to OFF. The breach is **latched**: ON (the button,
   or `nats_send(True, client=...)`) is refused until the limit is set to a value the strategy is no longer past; changing it does not switch ON by itself. State: `<work>/state/limits.json`.
 * Memory/CPU: every table is a lazy chain; per-row text is joined, not stored; the whole-day net table per strategy is created when its window renders.
+* **Redraws.** A panel is a Python function; Deephaven re-runs it (in the one Python thread) when its state or a table it reads changes, and sends the difference to the browser.
+  `use_redraw` asks for a redraw on every portfolio-state change. Heavy panels therefore wait behind the candle work; the native positions table avoids that for price ticks.
+  Known noise: `KeyError: 'Key N not initialized'` from deephaven.ui when a state-change listener fires for a page that was closed or reloaded; it is dropped and harmless.
 
 ---
 
@@ -235,7 +249,8 @@ empty and each book re-adopts what it had subscribed.
 | `/data/deephaven/fo_market_data/` or your `eod_dir` | `candles_<day>.parquet`, `straddle_<day>.parquet` (+ `.meta.json`) |
 
 Published tables (Deephaven IDE variables): `candles`, `straddle_series`, `portfolio_registry`, `portfolio_registry_log`, `cmd_queue_automated`, `nats_events`,
-`portfolio_state_log`, `operator_console`, `console_<strategy>`; after `eod_load`: `candles_<day>`, `candles_hist`, ...
+`portfolio_state_log` (the NATS service's), `strategy_limits`, `strategy_limits_log`, `portfolio_states_log`, `pf_by_option` (the console's), and the windows `operator_console` and one
+per strategy, named after it (`basket_rsi`, `nifty_rsi`, ...); after `eod_load`: `candles_<day>`, `candles_hist`, ...
 
 ---
 
@@ -245,6 +260,10 @@ Published tables (Deephaven IDE variables): `candles`, `straddle_series`, `portf
 * Master ~17 MB; registry a few hundred bytes per portfolio (3,000 portfolios load in under a second); shared portfolio state ~100 B each.
 * NATS: one thread; queued commands are tiny; bounded by `max_queued`.
 * No extra threads for candles (Deephaven's listener thread); straddle and EOD one thread each; NATS one. Measurements are external; the code has no instrumentation.
+* **The ceiling is one Python thread.** All Python in the Deephaven process (the candle builder, every strategy's listener, every console callback) shares one lock, so it can use one
+  core. Measured on the India host (16 cores, 2026-10-19, all 85,957 instruments): the container used about 110% CPU (one core), the Python thread averaged ~70% and peaked at 100%,
+  memory was flat at ~2.9 GiB of a 16 GiB limit, and candle batches took a median of 0.4 to 0.9 s against a 250 ms limit. Cutting the candle instruments (`expiries=1`, `kind="FUT"`)
+  is the lever; adding strategies or panels only adds to that thread. Docker's memory figure is the whole process; the Deephaven UI's is only the Java heap in use.
 
 ---
 
@@ -272,7 +291,8 @@ algo/comms/     nats_service.py
 algo/strategy/  registry.py book.py bridge.py config.py guard.py
 algo/ui/        console.py tables.py filters.py
 algo/           api.py (functions you type)  automation.py (functions an algo script uses)  lookup.py (contract/price lookups)
-examples/       00_services.py .. 06_nifty_rsi_churning.py   (plain scripts; 03/04/06 compute their own RSI and sizing)
+examples/       00_services.py .. 07_basket_rsi_crossorder.py   (plain scripts; 03/04/06/07 compute their own RSI and sizing; 07 keeps all its names inside one function)
+scripts/        00_install .. 05_start_day.py   (the lines you paste; 05 is the whole start-up, which the India host's init.py also runs at every container start)
 tests/          pytest, no Deephaven needed
 ```
 Allowed imports (test-enforced): `core` knows nothing; `data` uses core; `series` core+data; `comms` and the registry core only; `strategy` core+comms+data; `ui` anything.
@@ -303,5 +323,9 @@ shared state both ways, the example scripts end to end, Wilder RSI against textb
 replies, real feed row shapes, the join of the integer `PF` column with the registry (cast to long on both sides), and real memory/CPU numbers (the sizes above are
 arithmetic from row sizes). The wheel built from this tree has not been deployed to the dev host.
 
-Open items: the subscribe payload is service-wide (not per automation); one NATS server per service; `candles_start`/`master_build` are not yet start-once; a "blocked until RSI
-leaves its zone" rule is not in example 04; the trades-event mapping (contracts, qty, M2M per portfolio) is the next piece.
+Since then, on the live India Deephaven (2026-10-19): start-up from `init.py`, the Postgres master, the limits table and its guard, the native positions table with its toolbar,
+and orders from `07_basket_rsi_crossorder.py` to the engine have been run. What is still only reasoned about: the toolbar's Unsubscribe for a single-order portfolio (it sends `T1`,
+the single-order strategy names its contract `TOKEN`), and the live read of `relative()` for a whole basket under load.
+
+Open items: the subscribe payload defaults are service-wide (a strategy adds its own fields with `algo_start(..., subscribe={...})`); one NATS server per service; the candle
+builder is a Python loop (the main CPU cost); `candles_start`/`master_build` are not start-once; the trades-event mapping (contracts, qty, M2M per portfolio) is the next piece.

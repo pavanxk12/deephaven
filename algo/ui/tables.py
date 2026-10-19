@@ -72,6 +72,62 @@ def net_positions(trades, feed, symbols, price_div: float):
     )
 
 
+def strategy_totals(trades, feed, price_div: float):
+    """One row per strategy: `Turnover` (rupees, buys + sells) and gross `M2M` of its whole day, live with the trades and the feed.
+    The same sums as the net positions, taken per (Strategy, token) and then per Strategy."""
+    from deephaven import agg
+    per_token = (
+        trades
+        .where("fill_quantity > 0 && !isNull(Strategy)")
+        .update_view([
+            "BuyQty = buy_sell == 1 ? fill_quantity : 0L",
+            "SellQty = buy_sell == 2 ? fill_quantity : 0L",
+            f"BuyVal = buy_sell == 1 ? fill_quantity * fill_price / {price_div} : 0.0",
+            f"SellVal = buy_sell == 2 ? fill_quantity * fill_price / {price_div} : 0.0",
+        ])
+        .agg_by([agg.sum_(["BuyQty", "SellQty", "BuyVal", "SellVal"])], by=["Strategy", "token"])
+        .update_view("TokenL = (long) token")
+        .natural_join(feed.view(["TokenL = (long) token", "ltp"]), on="TokenL", joins="LtpRaw = ltp")
+        .update_view([
+            "NetQty = BuyQty - SellQty",
+            f"M2M = isNull(LtpRaw) ? NULL_DOUBLE : SellVal - BuyVal + NetQty * (LtpRaw / {price_div})",
+        ])
+    )
+    return per_token.agg_by([agg.sum_(["BuyVal", "SellVal", "M2M"])], by="Strategy").view(["Strategy", "Turnover = BuyVal + SellVal", "M2M"])
+
+
+def limits_view(strategies, limits_last, totals):
+    """The table `strategy_limits`: one row per strategy with its two limits, where it stands and whether a limit is breached. Live."""
+    return (
+        strategies
+        .natural_join(limits_last, on="Strategy", joins="TurnoverLimit, M2MLimit, TurnoverHit, M2MHit")
+        .natural_join(totals, on="Strategy", joins="Turnover, M2M")
+        .update_view([
+            "TurnoverUsedPct = (isNull(TurnoverLimit) || TurnoverLimit == 0 || isNull(Turnover)) ? NULL_DOUBLE : 100.0 * Turnover / TurnoverLimit",
+            "Status = ((TurnoverHit != null && TurnoverHit) || (M2MHit != null && M2MHit)) ? `BREACHED`"
+            " : (isNull(TurnoverLimit) && isNull(M2MLimit)) ? `no limit` : `ok`",
+        ])
+        .view(["Strategy", "Status", "TurnoverLimit", "Turnover", "TurnoverUsedPct", "M2MLimit", "M2M", "TurnoverHit", "M2MHit"])
+        .sort("Strategy")
+    )
+
+
+def pf_by_option(states_log, smap, per_user: int):
+    """`pf_by_option`: for every option token, the portfolio that trades it (a subscribed one first, then the latest change) with its state, tagged with its strategy.
+    `states_log` has one row per confirmed change (User, PF, Option, Subscribed, Paused, Squared, By, Cmd, AtN); it is the table version of algo.core.pfstate."""
+    from deephaven import agg
+    latest = (
+        states_log.last_by(["User", "PF"])
+        .where("!isNull(Option)")
+        .update_view([f"PfKey = (long) (User * {per_user} + PF)", "Rank = (Subscribed ? 1000000000000000L : 0L) + AtN"])
+        .natural_join(smap, on="PfKey", joins="Strategy")
+    )
+    best = latest.agg_by([agg.max_("MaxRank = Rank")], by="Option")
+    return (latest.natural_join(best, on="Option", joins="MaxRank").where("Rank == MaxRank")
+            .last_by("Option")                                         # one row per option even if two portfolios tie
+            .view(["Strategy", "Option", "User", "PF", "Subscribed", "Paused", "Squared", "By"]))
+
+
 def fills_per_order(trades):
     """Fills per order over the WHOLE day, so Remaining is right whatever the time window is."""
     from deephaven import agg

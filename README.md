@@ -20,7 +20,7 @@ algo/
                bridge.py     the command sequence of a portfolio (retire, subscribe, pause, apply, unpause)
                config.py     the bridge's settings
                guard.py      a turnover / M2M breach: switch the strategy off (and square up its portfolios for M2M)
-  ui/          console.py    operator console, one window per strategy (same pause / squareup / tick state as the algos)  -> operator_console, console_<strategy>
+  ui/          console.py    operator console, one window per strategy (same pause / squareup / tick state as the algos)  -> operator_console, <strategy>
   lookup.py    plain lookups: contract, strikes, nearest_strikes, last_price ...
   automation.py  plain functions for a script: algo_start, pf_assign, pf_activate ...
   api.py       the functions you type in the console (algo_help() lists them)
@@ -39,7 +39,7 @@ History and comparisons: how saved days, `absolute()` (now against the same minu
 
 ## A day
 
-Once per session (or the last line of `init.py`): `import algo; algo.install(globals(), "NSE")`. That puts plain
+Once per session (or the last line of `init.py`, which on the India host already starts everything at every container start: `run.md` section 0, `scripts/05_start_day.py`): `import algo; algo.install(globals(), "NSE")`. That puts plain
 functions in the session, so the day is a few calls (`scripts/01_day.py`):
 
 ```python
@@ -164,6 +164,7 @@ read-only mount:
 | eod.py / bod.py | `eod_save()` / `eod_auto()` / `eod_load()` (`algo.Eod`, `algo.History`) |
 | automation_rsi.py | a plain script on the services: `examples/03_algo_template.py` is the shape; the stocks logic (baskets, mid filter) is yours to write in it |
 | niftyrsi.py | `examples/06_nifty_rsi_churning.py` (5-minute RSI, your settings and `blocked` slots) or `examples/04_nifty_multistrike.py` (1-minute RSI) |
+| (new) basket strategy | `examples/07_basket_rsi_crossorder.py` (baskets ranked by % from open and VWAP, 1-minute RSI, own target/stop, the single-order strategy) |
 | dashboard_blackbox.py | `algo.Console` |
 
 The numbers that sat in the USER INPUT blocks stay as constants at the top of your script; the connection, the users and the subscribe payload

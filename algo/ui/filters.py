@@ -23,6 +23,41 @@ def strategy_cond(name: str | None) -> list[str]:
     return [f"Strategy == `{name}`"]
 
 
+def plain(x) -> str:
+    """A limit as the text of its box: no thousands separators, no trailing zeros; nothing for no limit."""
+    return "" if x is None or x == 0 else (f"{x:.2f}".rstrip("0").rstrip("."))
+
+
+def number_of(text):
+    """What was typed in a limit box -> a number, or None for an empty box. Commas, spaces and ₹ are ignored. Raises ValueError for anything else."""
+    t = str(text if text is not None else "").replace(",", "").replace("₹", "").replace(" ", "").strip()
+    return None if t == "" else float(t)
+
+
+def row_value(row, name, default=None):
+    """One value of a clicked row of a ui.table. The row maps column -> the value, or column -> {"value": ..., "text": ...}; both are read."""
+    if not isinstance(row, dict) or name not in row:
+        return default
+    x = row[name]
+    for _ in range(4):                                             # a cell may be wrapped more than once: {"value": {"value": 5, "text": "5"}}
+        if not isinstance(x, dict):
+            break
+        x = x.get("value", x.get("text", default))
+    if isinstance(x, dict):
+        return default
+    return default if x is None or (isinstance(x, float) and x != x) else x
+
+
+def as_int(x, default: int = 0) -> int:
+    """A number out of whatever a table cell handed over (an int, a float, a string such as '+1,200' or a cell dict); `default` when it is none of those. Never raises."""
+    if isinstance(x, dict):
+        x = x.get("value", x.get("text"))
+    try:
+        return int(float(str(x).replace(",", "").replace("+", "").strip()))
+    except (TypeError, ValueError):
+        return default
+
+
 def time_conds(column: str, window: tuple[int | None, int | None]) -> list[str]:
     a, b = window
     return ([f"{column} >= {a}"] if a is not None else []) + ([f"{column} <= {b}"] if b is not None else [])

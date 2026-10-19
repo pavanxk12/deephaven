@@ -24,7 +24,7 @@ def _num(x):
         v = float(x)
     except (TypeError, ValueError):
         return None
-    return v if v == v else None                          # NaN -> None
+    return v if v == v and abs(v) < 1.0e300 else None     # NaN and the null of a Deephaven double (about -1.8e308) -> None: a missing value must never breach a limit
 
 
 class Limits:
@@ -41,6 +41,11 @@ class Limits:
         """{'turnover': limit or None, 'm2m': limit or None, 'turnover_hit': bool, 'm2m_hit': bool}"""
         with self._lock:
             return dict(self._rec(strategy))
+
+    def names(self) -> list[str]:
+        """The strategies that have a limit (or had one) on record."""
+        with self._lock:
+            return sorted(self._d)
 
     def seen(self, strategy: str) -> tuple:
         """(turnover in ₹, M2M in ₹) as last reported, None where nothing was reported."""

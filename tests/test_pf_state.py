@@ -280,3 +280,15 @@ def test_algo_start_asks_a_running_console_for_the_strategys_window_and_a_failin
 def test_console_open_says_so_when_there_is_no_console(console, capsys):
     from algo.api import console_open
     assert console_open("stocks") is False and "not running" in capsys.readouterr().out
+
+
+def test_a_subscribe_that_names_its_contract_as_token_is_linked_to_that_contract():
+    s = PfStates()
+    s.record(4, 1030, "subscribe", {"strategyname": "single", "TOKEN": 49013, "SIDE": 1, "QTY": 1}, "basket_rsi")        # the single-order strategy has no T1
+    st = s.get(4, 1030)
+    assert (st.option, st.subscribed) == (49013, True)
+    assert s.by_option()[49013][:2] == (4, 1030)                                                                         # so the positions table and the toolbar find it
+    s.record(4, 1031, "subscribe", {"T1": 55, "TOKEN": 99}, "mine")
+    assert s.get(4, 1031).option == 55                                                                                   # T1 wins when both are there
+    s.record(4, 1030, "unsubscribe", {"T1": 49013}, None)
+    assert s.get(4, 1030).subscribed is False and s.get(4, 1030).option == 49013

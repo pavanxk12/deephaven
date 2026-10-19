@@ -22,6 +22,12 @@ Each step needs the one before it; calling them out of order gives a message tha
 ```
 then `docker compose up -d deephaven` (this restarts the container, so do it outside market hours).
 
+**On the India server this is already done at every container start.** The end of the host's `init.py` runs: `algo.install(globals(), "NSE")`, `master_build("NSE", source="auto")`
+(today's contracts from the Postgres table `resultset_<today>`, else the `.db3`), `candles_start("1min")`, `registry_start()`, `nats_start(... users=[3, 4])`, the console, `algo_status()`; each step
+is guarded, so one failing is printed as `[algo] start-up step '...' failed` and the rest carry on. It runs once, when the container starts, with no clock logic: candles are built only from that
+moment (start the container before 09:15 for a whole day), a container left up across days keeps yesterday's master and candles (restart it each morning), and on a holiday the master step fails.
+`scripts/05_start_day.py` is the same sequence to paste by hand. Strategies are pasted afterwards and need none of it again. A restart empties the session and every strategy is OFF again.
+
 **In the console, once per session** (or as the last line of `init.py`):
 
 ```python
@@ -304,7 +310,9 @@ for each portfolio it uses. The same number under two different users is fine. T
 
 ## 6b. Turnover and M2M limits per strategy (the strategy's own console window)
 
-In `console_<strategy>`, under the Summary tiles, there are two boxes: **Turnover limit (₹)** and **M2M limit (₹)**, both in plain rupees. Type a number and press **Set**; 0 or empty means no limit. They can be changed at any time. The box keeps the value, and a line under it says what is set and where the strategy stands ("limit 5,000,000, now 3,200,000 (64%)"). The M2M limit is the number as you type it, sign included: -5000 is -5000 and 50000 is 50000.
+In `<strategy>`, under the Summary tiles, there are two boxes: **Turnover limit (₹)** and **M2M limit (₹)**, both in plain rupees. Type a number in the box (commas are fine, a minus sign counts) and press **Set** or Enter: it is written to the table at that moment, and nothing is saved before; 0 or empty means no limit. They can be changed at any time. The box keeps the value, and a line under it says what is set and where the strategy stands ("limit 5,000,000, now 3,200,000 (64%)"). The M2M limit is the number as you type it, sign included: -5000 is -5000 and 50000 is 50000.
+
+**The limits are a table.** `strategy_limits` has one live row per strategy: `Strategy, Status (ok / BREACHED / no limit), TurnoverLimit, Turnover, TurnoverUsedPct, M2MLimit, M2M, TurnoverHit, M2MHit`. The boxes write to it (every change is also a row of `strategy_limits_log`), and what the windows show is read from it: a strategy's window shows its own row to the right of the boxes, and `operator_console` (all strategies) shows the whole table. You can open `strategy_limits` in the IDE too.
 
 - **Turnover limit reached** (the strategy's whole-day turnover in rupees, buys plus sells, is at or above the limit): a red LIMIT BREACHED line is shown, a row goes to `nats_events` (`cmd = limit`) and the log, and **that strategy's sending is switched OFF** (other strategies and the master are untouched).
 - **M2M limit reached** (the strategy's live gross M2M is **at or below the limit**): every subscribed portfolio of the strategy is **paused and squared up**, then its sending is switched OFF. For a loss limit type a negative number: -5000 breaches at -5000 and lower. A positive limit works the same way, so 50000 breaches whenever M2M is at or below +50,000, which includes right now unless the strategy is already above it.
@@ -319,9 +327,11 @@ send the commands; it starts OFF (`nats_send(True, client="my_algo")` switches i
 `examples/03_algo_template.py`.
 
 **Several strategies at once.** Run as many as you like, each from its own script with its own `STRATEGY` name (`nifty_sma`, `banknifty_sma` ...). Each gets its
-own book, bridge, send switch (`nats_send(True/False, client="name")`), candle listener and console window (`console_<name>`); portfolio numbers never clash and
+own book, bridge, send switch (`nats_send(True/False, client="name")`), candle listener and console window (named `<name>`); portfolio numbers never clash and
 stopping or re-pasting one does not touch the others. One catch: all scripts are pasted into the same terminal, so top-level variables with the same name
-(`closes`, `ltp`, `state`, `future`, `candle_listener`, and so on) are shared and the later script overwrites the earlier one's. Give each script its own names (a prefix such as `bn_`).
+(`closes`, `ltp`, `state`, `future`, `candle_listener`, and so on) are shared and the later script overwrites the earlier one's, and a running listener then reads the other script's values.
+Give each script its own names (a prefix such as `bn_`), or put the whole script inside one function as `examples/07_basket_rsi_crossorder.py` does (its function is `run_basket_rsi`,
+not named like the strategy, because the strategy's console window is published under the strategy's name).
 
 **Pasting a script again is safe.** `watch("candles", on_candle, owner=STRATEGY)` ties the listener to the strategy, so a re-paste (or `algo_stop("name")`) replaces the
 old listener instead of adding a second. Without `owner=` every paste adds another listener and your function runs once per paste. A re-paste also restarts
@@ -354,7 +364,7 @@ master_build("NSE", source="postgres")     # the contracts from Postgres; source
 candles_start("1min")
 registry_start()
 nats_start("192.168.1.130", 4222, users=[3, 4])
-app.run(algo.Console())                    # operator_console + one console_<strategy> window per strategy
+app.run(algo.Console())                    # operator_console + one <strategy> window per strategy
 straddle_start(1)                          # optional
 eod_auto()                                 # optional
 algo_status()
