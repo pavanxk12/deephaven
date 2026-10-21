@@ -30,3 +30,15 @@ def kind_table(master):
     from deephaven.pandas import to_table
     kinds = kind_of_tokens(master)
     return to_table(pd.DataFrame({"token": pd.Series(list(kinds), dtype="int64"), "Kind": pd.Series(list(kinds.values()), dtype="object")}))
+
+
+def divisors_of_tokens(master) -> dict:
+    """token -> the contract file's own Divisor (US equities 100, US options 10000, NSE 100): how many raw price units make one currency unit."""
+    return {int(t): float(d) for t, d in master.divisor_of.items() if d}
+
+
+def divisor_table(master):
+    """Static table (token, Divisor) so the console divides every price by ITS contract's divisor, not one number for the whole market."""
+    from deephaven.pandas import to_table
+    d = divisors_of_tokens(master)
+    return to_table(pd.DataFrame({"token": pd.Series(list(d), dtype="int64"), "Divisor": pd.Series(list(d.values()), dtype="float64")}))

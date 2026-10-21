@@ -167,3 +167,19 @@ def test_listeners_are_told_after_the_strategy_was_switched_off(console):
     seen.clear()
     g.on_values("a", 2, 0)
     assert seen and seen[-1] is False                                      # the last call comes after send_off
+
+
+def test_an_m2m_breach_also_unsubscribes_a_portfolio_the_script_subscribed_by_itself(console):
+    app, svc, wire = console
+    algo_start(3, "a", pf_start=1001, squareup_settle_s=0)
+    on("a")
+    pf = pf_assign("a", 1, 1)["pf"]
+    svc.subscribe(pf, 1, {"strategyname": "CrossOrder", "TOKEN": 1, "SIDE": 1, "QTY": 1}, user=3, client="a")
+    assert wait_for(lambda: svc.pf_state(pf, 3) is not None and svc.pf_state(pf, 3).subscribed)
+    wire.sent.clear()
+    g = Guard(app, app.shared.setdefault("limits", Limits()))
+    g.set_limit("a", "m2m", -10000)
+    g.on_values("a", 1.0, -10000)
+    assert wait_for(lambda: len(wire.sent) == 3)
+    assert [lab for _, lab, _ in wire.sent] == ["pause_unpause:Pause", "squareup", "unsubscribe"]
+    assert not svc.allowed("a")

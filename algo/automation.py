@@ -302,11 +302,11 @@ def algo_sending(strategy: str) -> bool:
     return isinstance(run, _AlgoRun) and run.nats.sending
 
 
-def algo_stop(strategy: str, unsubscribe: bool = True, wait_s: float = 30.0) -> None:
+def algo_stop(strategy: str, unsubscribe: bool = True, wait_s: float = 10.0) -> None:
     """Stop an automation: first close it down on the trading side, then stop it.
 
-    By default it does what algo_exit does (pauses and squares up every portfolio) AND unsubscribes every current portfolio, waits for those commands to finish
-    (up to `wait_s` seconds), and only then stops the automation (its book, bridge and candle listeners; the portfolio numbers and files are kept).
+    By default it does what algo_exit does (pauses and squares up every portfolio) AND unsubscribes every current portfolio, waits for those commands (up to `wait_s` seconds; the
+    unsubscribe itself follows `squareup_settle_s` = a minute after the squareup, so that a plugin can close its position first, and finishes in the background), and only then stops the automation (its book, bridge and candle listeners; the portfolio numbers and files are kept).
     If the portfolios cannot be unsubscribed because sending is OFF (a switched-off strategy, a breached limit) or the NATS service is down, NOTHING is stopped and it says
     so: switch the strategy ON and call it again, or algo_stop(name, unsubscribe=False) to stop it as it is (its portfolios stay subscribed, positions open).
     A dry run, or an automation with no portfolios, just stops. It waits, so call it from the terminal, not from a listener."""
@@ -322,7 +322,8 @@ def algo_stop(strategy: str, unsubscribe: bool = True, wait_s: float = 30.0) -> 
             from concurrent.futures import wait
             _, pending = wait(futures, timeout=wait_s)
             if pending:
-                print(f"{strategy}: {len(pending)} of {len(futures)} portfolio(s) were still being unsubscribed after {wait_s:g} s; stopping now, watch the log")
+                print(f"{strategy}: {len(pending)} of {len(futures)} portfolio(s) are closing: the squareup is sent and the unsubscribe follows after the settle time "
+                      f"(squareup_settle_s, a minute) in the background; stopping the automation now, watch the log")
     current().stop(strategy)
 
 

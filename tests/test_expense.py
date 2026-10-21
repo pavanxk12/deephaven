@@ -35,3 +35,11 @@ def test_the_kind_of_every_token_comes_from_the_masters_own_lists():
     assert kind_of_tokens(master) == {5: "EQ", 6: "EQ", 1: "FUT", 10: "OPT", 11: "OPT"}
     empty = types.SimpleNamespace(opt=pd.DataFrame(), futs=None, eqs=pd.DataFrame({"eq_token": [7]}))
     assert kind_of_tokens(empty) == {7: "EQ"}                                  # a missing list is just empty
+
+
+def test_the_divisor_of_every_token_comes_from_the_master_so_a_us_stock_and_a_us_option_differ():
+    import types
+
+    from algo.data.symbols import divisors_of_tokens
+    master = types.SimpleNamespace(divisor_of={1: 100, 3426: 10000, 5: 0, 6: None})            # AAPL stock 100, an AAPL option 10000; a missing or zero divisor is left out
+    assert divisors_of_tokens(master) == {1: 100.0, 3426: 10000.0}

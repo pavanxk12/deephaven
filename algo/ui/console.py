@@ -88,6 +88,7 @@ class Ctx:
     pf_table: object = None      # the live table `pf_by_option`: the state of the portfolio that trades each option (the native positions table reads it)
     guard: object = None         # Guard: changes a limit and acts when one is breached
     kinds: object = None         # the master's table (token, Kind = OPT / FUT / EQ): the expense rate and the Futures / Options / Equity filter use it
+    divisors: object = None      # the master's table (token, Divisor): every price is divided by its own contract's divisor (US stocks 100, US options 10000)
 
 
 class TimeTools:
@@ -242,19 +243,21 @@ def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, ti
         x = val(d, key)
         return default if x is None else format(x, spec)
 
+    dec_spec = ".0f" if currency == "₹" else ".2f"                  # rupee amounts are whole; dollar amounts keep their cents
+
     def pnl_color(key):
         x = val(v, key)
         return GREEN if x is None or x >= 0 else RED
 
     tiles = ui.flex(
-        tile(f"TURNOVER ({currency})", num(v, "Turnover", ",.0f", "0"), ORANGE),
+        tile(f"TURNOVER ({currency})", num(v, "Turnover", "," + dec_spec, "0"), ORANGE),
         tile("FILLS", num(v, "Fills", ",.0f", "0"), "#000000"),
         tile("OPEN ORDERS", num(o, "OpenOrders", ",.0f", "0"), "#000000"),
-        tile(f"REALISED ({currency})", num(v, "RealisedPnl", "+,.0f", "0"), pnl_color("RealisedPnl")),
-        tile(f"UNREALISED ({currency})", num(v, "Unrealised", "+,.0f"), pnl_color("Unrealised")),
-        tile(f"GROSS M2M ({currency})", num(v, "GrossM2M", "+,.0f"), pnl_color("GrossM2M")),
-        *([tile(f"EXPENSE ({currency})", num(v, "Expense", ",.0f", "0"), ORANGE),
-           tile(f"NET M2M ({currency})", num(v, "NetM2M", "+,.0f"), pnl_color("NetM2M"))] if with_expense else []),
+        tile(f"REALISED ({currency})", num(v, "RealisedPnl", "+," + dec_spec, "0"), pnl_color("RealisedPnl")),
+        tile(f"UNREALISED ({currency})", num(v, "Unrealised", "+," + dec_spec), pnl_color("Unrealised")),
+        tile(f"GROSS M2M ({currency})", num(v, "GrossM2M", "+," + dec_spec), pnl_color("GrossM2M")),
+        *([tile(f"EXPENSE ({currency})", num(v, "Expense", "," + dec_spec, "0"), ORANGE),
+           tile(f"NET M2M ({currency})", num(v, "NetM2M", "+," + dec_spec), pnl_color("NetM2M"))] if with_expense else []),
         wrap=True, align_items="center",
         UNSAFE_style={"flex": "1", "minHeight": "0"},
     )
@@ -488,10 +491,12 @@ def fast_positions(net_tbl, ctx: Ctx):
     def kind_button(label, value):
         return ui.toggle_button(label, is_selected=kind == value, on_change=lambda _: set_kind(value))
 
+    money_dec = 0 if ctx.market.currency == "₹" else 2                         # rupee amounts are whole; dollar amounts keep their cents
     formats = [
         ui.TableFormat(cols=["BuyQty", "BuyAvg", "BuyVal"], background_color=BUY_BG),
         ui.TableFormat(cols=["SellQty", "SellAvg", "SellVal"], background_color=SELL_BG),
-        ui.TableFormat(cols=["BuyQty", "SellQty", "BuyVal", "SellVal", "Realised", "M2M", "Expense", "NetM2M"], value="#,##0"),
+        ui.TableFormat(cols=["BuyQty", "SellQty"], value="#,##0"),
+        ui.TableFormat(cols=["BuyVal", "SellVal", "Realised", "M2M", "Expense", "NetM2M"], value="#,##0" if money_dec == 0 else "#,##0." + "0" * money_dec),
         ui.TableFormat(cols=["BuyAvg", "SellAvg", "Ltp"], value="#,##0.00"),
         ui.TableFormat(cols="NetQty", value="+#,##0;-#,##0;0"),
         ui.TableFormat(cols="NetQty", if_="NetQty > 0", color=BLUE),
@@ -705,14 +710,14 @@ def build_dashboard(base: Ctx):
         strat = strategy_cond(strategy)
 
         def net_all_fn():                              # the whole day of this strategy: what the per-position rules use
-            return q.net_positions(base.trades.where(strat), base.feed, base.symbols, mk.price_div, mk.expense_per_crore, base.kinds) if strat else base.net_all
+            return q.net_positions(base.trades.where(strat), base.feed, base.symbols, mk.price_div, mk.expense_per_crore, base.kinds, base.divisors) if strat else base.net_all
 
         net_all = ui.use_memo(net_all_fn, [strategy])
         ctx = ui.use_memo(lambda: replace(base, strategy=strategy, net_all=net_all), [strategy, net_all])
 
         def net_fn():
             conds = time_conds(cfg.trade_time, window) + strat
-            return q.net_positions(base.trades.where(conds), base.feed, base.symbols, mk.price_div, mk.expense_per_crore, base.kinds) if time_conds(cfg.trade_time, window) else net_all
+            return q.net_positions(base.trades.where(conds), base.feed, base.symbols, mk.price_div, mk.expense_per_crore, base.kinds, base.divisors) if time_conds(cfg.trade_time, window) else net_all
 
         def msg_fn():
             conds = ([f"Ts >= epochSecondsToInstant({a}L)"] if a is not None else []) + (
@@ -721,7 +726,7 @@ def build_dashboard(base: Ctx):
 
         def book_fn():
             conds = time_conds(cfg.order_time, window) + strat
-            return q.order_book(base.acks, base.fills, base.symbols, mk.price_div, cfg.order_time, mk.tz, conds) if conds else base.book_all
+            return q.order_book(base.acks, base.fills, base.symbols, mk.price_div, cfg.order_time, mk.tz, conds, base.divisors) if conds else base.book_all
 
         net_tbl = ui.use_memo(net_fn, [a, b, strategy, net_all])
         msgs = ui.use_memo(msg_fn, [a, b, strategy])
@@ -764,10 +769,12 @@ class Console(Plugin):
         events, trades, acks = app.table(cfg.events), app.table(cfg.trades), app.table(cfg.acks)
         feed = app.table(mk.feed)
         smap = q.strategy_map(app.table("portfolio_registry"), cfg.pf_per_user)       # PF -> strategy, live from the registry
+        trades = q.dedup_fills(trades)                                                # a fill the engine published twice counts once
         trades, acks = q.tag(trades, "PF", smap), q.tag(acks, "PF", smap)             # every row now carries its Strategy
         symbol_of = app.master.symbol_of
         symbols = q.symbol_table(symbol_of)
         kinds = q.kind_table(app.master)                                              # each instrument's kind straight from the contract master
+        divisors = q.divisor_table(app.master)                                        # ... and its own price divisor
         fills = q.fills_per_order(trades)
         registry = app["registry"].state
         strategies = Strategies()
@@ -778,11 +785,11 @@ class Console(Plugin):
 
         self.base = Ctx(cfg=cfg, market=mk, app=app, states=pf_states(app.shared), registry=registry, strategies=strategies, strategy=None,
                         symbol_of=lambda t: symbol_of.get(int(t), str(t)), filters=app.shared.setdefault(("console_filters", None), Filters()),
-                        net_all=q.net_positions(trades, feed, symbols, mk.price_div, mk.expense_per_crore, kinds),
+                        net_all=q.net_positions(trades, feed, symbols, mk.price_div, mk.expense_per_crore, kinds, divisors),
                         tz_label="IST" if mk.code == "NSE" else mk.tz, logo_src=self._logo(), time=TimeTools(mk.tz),
-                        trades=trades, acks=acks, feed=feed, symbols=symbols, kinds=kinds, fills=fills,
+                        trades=trades, acks=acks, feed=feed, symbols=symbols, kinds=kinds, divisors=divisors, fills=fills,
                         messages=q.tag(q.messages(events, cfg.event_cols, mk.tz), "Pf", smap),
-                        book_all=q.order_book(acks, fills, symbols, mk.price_div, cfg.order_time, mk.tz),
+                        book_all=q.order_book(acks, fills, symbols, mk.price_div, cfg.order_time, mk.tz, None, divisors),
                         limits=limits_of(app.shared, f"{app.paths.state}/limits.json"), guard=guard_of(app, f"{app.paths.state}/limits.json"))
         self._limits_table(smap, trades, feed, symbols)
         self._states_table(smap)
@@ -850,7 +857,7 @@ class Console(Plugin):
             record(name)
         self._undo.append(limits.on_change(record))
         log_tbl = writer.table
-        totals = q.strategy_totals(base.trades, base.feed, mk.price_div)
+        totals = q.strategy_totals(base.trades, base.feed, mk.price_div, base.divisors)
         strategies = merge([smap.view("Strategy"), log_tbl.view("Strategy")]).select_distinct("Strategy")
         table = q.limits_view(strategies, log_tbl.last_by("Strategy"), totals)
         app.publish("strategy_limits_log", log_tbl)

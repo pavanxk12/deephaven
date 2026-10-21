@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-from algo.data.symbols import kind_table, symbol_table  # noqa: F401,E402  (token -> Symbol and token -> Kind lookup tables)
+from algo.data.symbols import divisor_table, kind_table, symbol_table  # noqa: F401,E402  (token -> Symbol, token -> Kind and token -> Divisor lookup tables)
 
 
 def strategy_map(registry, per_user: int):
@@ -50,21 +50,21 @@ def expense_formula(rates) -> str:
     return out
 
 
-def net_positions(trades, feed, symbols, price_div: float, expense=None, kinds=None):
+def net_positions(trades, feed, symbols, price_div: float, expense=None, kinds=None, divisors=None):
     """One row per traded token with live LTP from the feed (one row per token, columns token and ltp).
     M2M is the gross result (realised + unrealised). `expense` ({"FUT": (buy, sell) ...} rupees per crore) adds Expense and NetM2M = M2M - Expense.
-    `kinds` is the contract master's table (token, Kind = OPT / FUT / EQ): the kind of each row is taken from it. A token the master does not know (or no table at all) falls back to the symbol text."""
+    `kinds` is the contract master's table (token, Kind = OPT / FUT / EQ): the kind of each row is taken from it. A token the master does not know (or no table at all) falls back to the symbol text.
+    `divisors` is the master's table (token, Divisor): every price is divided by ITS contract's divisor (US stocks 100, US options 10000); a token it does not know uses `price_div`."""
     from deephaven import agg
     t = (
-        trades
-        .where("fill_quantity > 0")
+        with_divisor(trades.where("fill_quantity > 0"), divisors, price_div)
         .update_view([
             "BuyQty = buy_sell == 1 ? fill_quantity : 0L",
             "SellQty = buy_sell == 2 ? fill_quantity : 0L",
-            f"BuyVal = buy_sell == 1 ? fill_quantity * fill_price / {price_div} : 0.0",
-            f"SellVal = buy_sell == 2 ? fill_quantity * fill_price / {price_div} : 0.0",
+            "BuyVal = buy_sell == 1 ? fill_quantity * fill_price / Div : 0.0",
+            "SellVal = buy_sell == 2 ? fill_quantity * fill_price / Div : 0.0",
         ])
-        .agg_by([agg.sum_(["BuyQty", "SellQty", "BuyVal", "SellVal"]), agg.count_("Fills")], by=["token"])
+        .agg_by([agg.sum_(["BuyQty", "SellQty", "BuyVal", "SellVal"]), agg.count_("Fills"), agg.first("Div")], by=["token"])
         .update_view("TokenL = (long) token")                       # the tables disagree on int / long; a join needs the same type on both sides
         .natural_join(feed.view(["TokenL = (long) token", "ltp"]), on="TokenL", joins="LtpRaw = ltp")
         .natural_join(symbols, on="TokenL = token", joins="SymbolRaw = Symbol")
@@ -74,7 +74,7 @@ def net_positions(trades, feed, symbols, price_div: float, expense=None, kinds=N
         t
         .update([
             "Symbol = isNull(SymbolRaw) ? String.valueOf(token) : SymbolRaw",
-            f"Ltp = LtpRaw / {price_div}",
+            "Ltp = LtpRaw / Div",
             "BuyAvg = BuyQty > 0 ? BuyVal / BuyQty : 0.0",
             "SellAvg = SellQty > 0 ? SellVal / SellQty : 0.0",
             "NetQty = BuyQty - SellQty",
@@ -91,25 +91,24 @@ def net_positions(trades, feed, symbols, price_div: float, expense=None, kinds=N
     )
 
 
-def strategy_totals(trades, feed, price_div: float):
+def strategy_totals(trades, feed, price_div: float, divisors=None):
     """One row per strategy: `Turnover` (rupees, buys + sells) and gross `M2M` of its whole day, live with the trades and the feed.
     The same sums as the net positions, taken per (Strategy, token) and then per Strategy."""
     from deephaven import agg
     per_token = (
-        trades
-        .where("fill_quantity > 0 && !isNull(Strategy)")
+        with_divisor(trades.where("fill_quantity > 0 && !isNull(Strategy)"), divisors, price_div)
         .update_view([
             "BuyQty = buy_sell == 1 ? fill_quantity : 0L",
             "SellQty = buy_sell == 2 ? fill_quantity : 0L",
-            f"BuyVal = buy_sell == 1 ? fill_quantity * fill_price / {price_div} : 0.0",
-            f"SellVal = buy_sell == 2 ? fill_quantity * fill_price / {price_div} : 0.0",
+            "BuyVal = buy_sell == 1 ? fill_quantity * fill_price / Div : 0.0",
+            "SellVal = buy_sell == 2 ? fill_quantity * fill_price / Div : 0.0",
         ])
-        .agg_by([agg.sum_(["BuyQty", "SellQty", "BuyVal", "SellVal"])], by=["Strategy", "token"])
+        .agg_by([agg.sum_(["BuyQty", "SellQty", "BuyVal", "SellVal"]), agg.first("Div")], by=["Strategy", "token"])
         .update_view("TokenL = (long) token")
         .natural_join(feed.view(["TokenL = (long) token", "ltp"]), on="TokenL", joins="LtpRaw = ltp")
         .update_view([
             "NetQty = BuyQty - SellQty",
-            f"M2M = isNull(LtpRaw) ? NULL_DOUBLE : SellVal - BuyVal + NetQty * (LtpRaw / {price_div})",
+            "M2M = isNull(LtpRaw) ? NULL_DOUBLE : SellVal - BuyVal + NetQty * (LtpRaw / Div)",
         ])
     )
     return per_token.agg_by([agg.sum_(["BuyVal", "SellVal", "M2M"])], by="Strategy").view(["Strategy", "Turnover = BuyVal + SellVal", "M2M"])
@@ -147,6 +146,19 @@ def pf_by_option(states_log, smap, per_user: int):
             .view(["Strategy", "Option", "User", "PF", "Subscribed", "Paused", "Squared", "By"]))
 
 
+def dedup_fills(trades):
+    """One row per fill. The engine publishes some fills (the CrossOrder plugin's) twice, in two batches, and every sum over the trades would count them twice. A fill is
+    identified by its portfolio, its order number and its fill number."""
+    return trades.last_by(["pf", "response_order_number", "fill_number"])
+
+
+def with_divisor(t, divisors, price_div: float, token_col: str = "token"):
+    """Add `Div`: the divisor of each row's contract from the master's table, or the market's `price_div` for a token the master does not know (or no table)."""
+    t = (t.update_view(f"TokJ = (long) {token_col}")
+         .natural_join(divisors, on="TokJ = token", joins="DivRaw = Divisor") if divisors is not None else t.update_view("DivRaw = NULL_DOUBLE"))
+    return t.update_view(f"Div = isNull(DivRaw) ? {float(price_div)} : DivRaw")
+
+
 def fills_per_order(trades):
     """Fills per order over the WHOLE day, so Remaining is right whatever the time window is."""
     from deephaven import agg
@@ -154,7 +166,7 @@ def fills_per_order(trades):
             .view(["OrderId = (long) response_order_number", "FilledQty"]))
 
 
-def order_book(acks, fills, symbols, price_div: float, order_time: str, tz: str, conds=None):
+def order_book(acks, fills, symbols, price_div: float, order_time: str, tz: str, conds=None, divisors=None):
     """Latest ack per order, not cancelled (tcode 20075), still has quantity left after the fills."""
     t = (acks
          .view(["OrderId = (long) order_number", "PF", "Strategy", "tcode", "token_no", "TokenL = (long) token_no", "buy_sell", "volume", "price", order_time])
@@ -162,7 +174,7 @@ def order_book(acks, fills, symbols, price_div: float, order_time: str, tz: str,
     if conds:
         t = t.where(conds)
     return (
-        t
+        with_divisor(t, divisors, price_div, "token_no")
         .natural_join(fills, on="OrderId", joins="FilledQty")
         .natural_join(symbols, on="TokenL = token", joins="SymbolRaw = Symbol")
         .update_view("Rem = volume - (isNull(FilledQty) ? 0L : FilledQty)")
@@ -170,7 +182,7 @@ def order_book(acks, fills, symbols, price_div: float, order_time: str, tz: str,
         .update([
             "Symbol = isNull(SymbolRaw) ? String.valueOf(token_no) : SymbolRaw",
             "Side = buy_sell == 1 ? `BUY` : `SELL`",
-            f"Px = price / {price_div}",
+            "Px = price / Div",
             "Status = Rem < volume ? `PART` : `OPEN`",
             f"Time = formatDateTime(epochSecondsToInstant({order_time}), timeZone(`{tz}`)).substring(11, 19)",
         ])

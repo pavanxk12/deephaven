@@ -62,7 +62,7 @@ class Guard:
         run = self.app.get(strategy)
         bridge = getattr(getattr(run, "nats", None), "bridge", None)
         book = getattr(bridge, "book", None)
-        if bridge is not None and book is not None and book.subscribed.get(pf) is not None:
+        if bridge is not None and book is not None and bridge.subscribed_option(pf) is not None:
             return bridge._unsubscribe_job(pf), "m2m_unsubscribe"
 
         async def job(call):

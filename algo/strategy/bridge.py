@@ -8,6 +8,7 @@ are on; with either off, signals are still computed but no command is sent.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from concurrent.futures import Future
 from typing import Awaitable, Callable
@@ -92,7 +93,8 @@ class Bridge(Plugin):
     def _on_pf(self, user: int, pf: int, st: PfState) -> None:
         """A confirmed command on some portfolio. If it is ours, bring the book in line, so this algo knows what the console did:
         a pause or resume, a square up (the slot may start again on the next signal), or a tick / untick of the checkbox, which
-        allows / blocks the slot (an unticked slot gets no new portfolio and no order until it is ticked again)."""
+        allows / blocks the slot (an unticked slot gets no new portfolio and no order until it is ticked again).
+        A confirmed subscribe of one of our portfolios is also written into the book (`subscribed`), whoever sent it. The entry stays after an unsubscribe: a retired portfolio keeps its option."""
         book = self.book
         if book is None or (self.user is not None and user != self.user):
             return
@@ -100,6 +102,9 @@ class Bridge(Plugin):
         if key is None and pf not in book.subscribed:
             return                                        # not one of ours
         try:
+            if st.cmd == "subscribe" and st.subscribed and st.option is not None and book.subscribed.get(pf) != int(st.option):
+                book.subscribe(pf, int(st.option))        # whoever sent it (a script that subscribes by itself, the console, a typed command): the book records it, and Postgres
+                                                          # (algo_pf_sub) keeps it, so algo_stop and an M2M breach can unsubscribe the portfolio, even after a restart
             if st.cmd == "pause_unpause":
                 book.set_paused(pf, st.paused)
             elif st.cmd == "squareup" and key is not None:
@@ -247,9 +252,18 @@ class Bridge(Plugin):
             await call("squareup", None)
         return job
 
+    def subscribed_option(self, pf: int) -> "int | None":
+        """The contract this portfolio is subscribed to. First the book (a portfolio started through pf_activate); if the book has nothing, the NATS service's own record of the
+        confirmed subscribe, which covers a script that sent its own subscribe (CrossOrder scripts such as 08 and 10). None when neither knows of a subscription."""
+        opt = self.book.subscribed.get(pf)
+        if opt is not None:
+            return opt
+        st = self.nats.pf_state(pf, self.user)
+        return int(st.option) if st is not None and st.subscribed and st.option is not None else None
+
     def _unsubscribe_job(self, pf: int):
         async def job(call: Call) -> None:
-            opt = self.book.subscribed.get(pf)
+            opt = self.subscribed_option(pf)
             if opt is None:
                 return
             steps = (("pause_unpause", lambda: self._pause(call, pf, "Pause")),
@@ -260,6 +274,8 @@ class Bridge(Plugin):
                 if not reply.ok:
                     self.log.warning("PF %s %s not ok, stopped for this PF: %s", pf, cmd, reply.status)
                     return
+                if cmd == "squareup" and self.cfg.squareup_settle_s > 0:
+                    await asyncio.sleep(self.cfg.squareup_settle_s)        # let the strategy send and fill its closing order before the unsubscribe destroys it
         return job
 
     # ---- operator actions (used by the console and by hand) ------------------------------------

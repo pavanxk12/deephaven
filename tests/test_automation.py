@@ -375,7 +375,7 @@ def test_a_strategy_sends_its_own_strategyname_on_subscribe_and_unsubscribe(cons
 # ---- algo_stop closes the automation down, then stops it ---------------------------------------------------------------------
 def test_algo_stop_pauses_squares_up_and_unsubscribes_every_portfolio_then_stops(console):
     app, svc, wire = console
-    algo_start(4, "mine", pf_start=2000)
+    algo_start(4, "mine", pf_start=2000, squareup_settle_s=0)
     on("mine")
     a = pf_assign("mine", 1, 55)
     b = pf_assign("mine", 2, 66)
@@ -412,3 +412,63 @@ def test_algo_stop_of_an_automation_with_no_portfolios_just_stops(console):
     algo_stop("mine")
     assert "mine" not in app.plugins and wire.sent == []
     algo_stop("ghost")                                                                                     # an unknown name is not an error
+
+
+def test_algo_stop_also_closes_a_portfolio_the_script_subscribed_by_itself(console):
+    """A CrossOrder script (08, 10) sends its own subscribe: the book is not told, the NATS service is. algo_stop must still pause, square up and unsubscribe it."""
+    app, svc, wire = console
+    algo_start(4, "mine", pf_start=2000, squareup_settle_s=0)
+    on("mine")
+    a = pf_assign("mine", 1, 1)
+    svc.subscribe(a["pf"], 1, {"strategyname": "CrossOrder", "TOKEN": 1, "SIDE": 1, "QTY": 1}, user=4, client="mine")
+    assert wait_for(lambda: svc.pf_state(a["pf"], 4) is not None and svc.pf_state(a["pf"], 4).subscribed)
+    assert wait_for(lambda: dict(app["mine"].book.state.subscribed) == {a["pf"]: 1})              # the book learned it from the confirmed subscribe, though the script sent it itself
+    import json, os
+    sub_file = app["mine"].book.state.sub_file
+    assert wait_for(lambda: os.path.exists(sub_file) and json.load(open(sub_file)) == {str(a["pf"]): 1})                                           # and wrote it down (Postgres' algo_pf_sub when that store is on)
+    wire.sent.clear()
+    algo_stop("mine")
+    assert labels(wire, a["pf"]) == ["pause_unpause:Pause", "squareup", "unsubscribe"], labels(wire, a["pf"])
+    assert "mine" not in app.plugins
+
+
+def test_a_portfolio_nobody_subscribed_is_still_left_alone_by_algo_stop(console):
+    app, svc, wire = console
+    algo_start(4, "mine", pf_start=2000)
+    on("mine")
+    a = pf_assign("mine", 1, 1)                                                                     # a number from the book, never subscribed
+    wire.sent.clear()
+    algo_stop("mine")
+    assert labels(wire, a["pf"]) == [] and "mine" not in app.plugins
+
+
+def test_the_book_also_learns_a_subscribe_typed_on_the_console_and_ignores_other_users_and_strategies(console):
+    app, svc, wire = console
+    algo_start(4, "mine", pf_start=2000)
+    on("mine")
+    a = pf_assign("mine", 1, 1)
+    svc.subscribe(a["pf"], 1, {"strategyname": "CrossOrder"}, user=4)                                # no client name: an operator's typed command
+    assert wait_for(lambda: dict(app["mine"].book.state.subscribed) == {a["pf"]: 1})
+    svc.subscribe(777, 5, {"strategyname": "CrossOrder"}, user=4)                                    # a portfolio that is not this strategy's
+    assert wait_for(lambda: svc.pf_state(777, 4) is not None and svc.pf_state(777, 4).subscribed)
+    assert dict(app["mine"].book.state.subscribed) == {a["pf"]: 1}
+    svc.unsubscribe(a["pf"], 1, user=4)                                                              # an unsubscribe does not erase what the book remembers (a retired portfolio keeps its option)
+    assert wait_for(lambda: not svc.pf_state(a["pf"], 4).subscribed)
+    assert dict(app["mine"].book.state.subscribed) == {a["pf"]: 1}
+
+
+def test_the_unsubscribe_waits_for_the_closing_order_after_the_squareup(console):
+    """The unsubscribe destroys a plugin portfolio: it must come only after the settle time, so the plugin can send and work its closing order."""
+    app, svc, wire = console
+    algo_start(4, "mine", pf_start=2000, squareup_settle_s=0.5)
+    on("mine")
+    a = pf_assign("mine", 1, 1)
+    svc.subscribe(a["pf"], 1, {"strategyname": "CrossOrder", "TOKEN": 1, "SIDE": 1, "QTY": 1}, user=4, client="mine")
+    assert wait_for(lambda: svc.pf_state(a["pf"], 4) is not None and svc.pf_state(a["pf"], 4).subscribed)
+    wire.sent.clear()
+    app["mine"].nats.bridge.unsubscribe_all()
+    assert wait_for(lambda: "squareup" in labels(wire, a["pf"]))
+    time.sleep(0.2)
+    assert "unsubscribe" not in labels(wire, a["pf"])                                                # still waiting: the plugin is closing
+    assert wait_for(lambda: labels(wire, a["pf"])[-1:] == ["unsubscribe"])                          # then it goes
+    assert labels(wire, a["pf"]) == ["pause_unpause:Pause", "squareup", "unsubscribe"]

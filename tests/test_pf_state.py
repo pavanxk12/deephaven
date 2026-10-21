@@ -17,7 +17,7 @@ PARAMS = {"ival": 0.2, "target": 100}
 
 def started(app, svc, wire, user=3, name="mine", instrument=1, option=55):
     """An automation with one portfolio running: subscribed, applied, unpaused."""
-    algo_start(user, name, pf_start=1001)
+    algo_start(user, name, pf_start=1001, squareup_settle_s=0)
     pf_track(name, [instrument])
     on(name)
     a = pf_assign(name, instrument, option, name="NIFTY")
