@@ -9,6 +9,8 @@
 #                     come first, then today's candles. So the RSI at 09:35 is computed through yesterday's prices, overnight gap included. No files = it says so and starts from today.
 #   The exit          the script's own target and stop-loss on the price: +TARGET_PCT in its favour, or -STOP_PCT against it (checked on every 1-minute close).
 #                     The engine's CrossOrder has no target or stop and reads its parameters ONCE per portfolio, so an exit is the portfolio's `squareup` command.
+#   The time exit     EXIT_AT (15:55 New York time, 5 minutes before the 16:00 close): every open position is squared up, and no entry is made from then on. It is checked on every
+#                     batch of 1-minute candles, so it goes out within a minute of EXIT_AT. A position still "entering" at that time is closed as soon as its order is confirmed.
 #   The order         a NEW portfolio for every trade: ONE `subscribe` that carries the fields, as for 07 (the engine knows the strategy as "CrossOrder"; SIDE 1 = buy, 2 = sell):
 #                     {"strategyname": "CrossOrder", "TOKEN": <contract>, "SIDE": 1|2, "QTY": n lots, "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}
 #                     The NATS service adds USERIDENTIFIER and user_id. The book gives the portfolio numbers; each stock may use up to 100 a day.
@@ -16,7 +18,7 @@
 #
 # EVERYTHING is inside the function run_us_basket_rsi() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of
 # names shared by every script you paste, so top-level `rsi` or `closes` would overwrite another running script's. The only names left in the terminal start with us_basket_rsi:
-#   us_basket_rsi_status()   us_basket_rsi_exit_all()   us_basket_rsi_stop()   (stop does NOT close positions: run exit_all first)
+#   us_basket_rsi_status()   us_basket_rsi_exit_all()   us_basket_rsi_stop()   (stop pauses, squares up and unsubscribes every portfolio, then stops; it refuses while sending is OFF)
 # Positions are kept in the script only: if you stop it or Deephaven restarts while a position is open, it no longer knows about it (square it up from the console).
 
 
@@ -55,11 +57,13 @@ def run_us_basket_rsi():
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
     ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
     WINDOW = (dtime(10, 0), dtime(15, 45))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
+    EXIT_AT = dtime(15, 55)                  # time exit (New York time): 5 minutes before the 16:00 close, everything open is squared up and no entry is made after it
     FAIL_COOLDOWN_S = 30
     # ==========================================================================
     if not (0 <= MID_ZONE[0] < MID_ZONE[1] <= 100 and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
-            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and 0 <= ABS_ZONE[0] < ABS_ZONE[1] <= 100):
-        raise ValueError("MID_ZONE and ABS_ZONE must be inside 0 to 100, TARGET_PCT and STOP_PCT above 0, QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, and every basket needs at least 3 symbols")
+            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and 0 <= ABS_ZONE[0] < ABS_ZONE[1] <= 100 and WINDOW[0] < EXIT_AT):
+        raise ValueError("MID_ZONE and ABS_ZONE must be inside 0 to 100, TARGET_PCT and STOP_PCT above 0, QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, "
+                         "and every basket needs at least 3 symbols")
     BAR_S = parse_timeframe(RSI_BAR)                               # 300; refuses a size that does not line up with the clock
     basket_of = {}                                                 # symbol -> the name of its basket
     for name, members in BASKETS.items():
@@ -223,7 +227,11 @@ def run_us_basket_rsi():
 
     # ---- the orders ------------------------------------------------------------------------------------------------------------------
     def in_window():
-        return WINDOW[0] <= datetime.now(ZoneInfo("America/New_York")).time() <= WINDOW[1]
+        now = datetime.now(ZoneInfo("America/New_York")).time()
+        return WINDOW[0] <= now <= WINDOW[1] and now < EXIT_AT         # no entry once the time exit has come, whatever WINDOW says
+
+    def past_exit():
+        return datetime.now(ZoneInfo("America/New_York")).time() >= EXIT_AT
 
     def cross_order(token, side, qty):
         return {**ENGINE, "TOKEN": int(token), "SIDE": int(side), "QTY": int(qty)}
@@ -319,6 +327,9 @@ def run_us_basket_rsi():
                 add_close(tok, minute, close)
                 last_px[tok] = float(close)
                 step(tok)
+        if past_exit():                                            # the time exit: every open position, whichever stock the candles in this batch belong to
+            for token in list(position):
+                leave(token, f"time exit {EXIT_AT:%H:%M}")
 
     # ---- by hand ---------------------------------------------------------------------------------------------------------------------
     def exit_all():
@@ -337,7 +348,7 @@ def run_us_basket_rsi():
 
     def stop():
         listener.stop()
-        algo_stop(STRATEGY)                                        # open positions are NOT closed by this: us_basket_rsi_exit_all() first
+        algo_stop(STRATEGY)                                        # pause + square up + unsubscribe every portfolio, wait for it, then stop (refuses while sending is OFF)
 
     shared = globals()
     shared["us_basket_rsi_status"], shared["us_basket_rsi_exit_all"], shared["us_basket_rsi_stop"] = status, exit_all, stop

@@ -26,7 +26,16 @@ then `docker compose up -d deephaven` (this restarts the container, so do it out
 (today's contracts from the Postgres table `resultset_<today>`, else the `.db3`), `candles_start("1min")`, `registry_start()`, `nats_start(... users=[3, 4])`, the console, `algo_status()`; each step
 is guarded, so one failing is printed as `[algo] start-up step '...' failed` and the rest carry on. It runs once, when the container starts, with no clock logic: candles are built only from that
 moment (start the container before 09:15 for a whole day), a container left up across days keeps yesterday's master and candles (restart it each morning), and on a holiday the master step fails.
-`scripts/05_start_day.py` is the same sequence to paste by hand. Strategies are pasted afterwards and need none of it again. A restart empties the session and every strategy is OFF again.
+**State in Postgres.** With `ALGO_STATE_STORE: "postgres"` under the Deephaven service's `environment:` in docker-compose.yml, the portfolio registry, the books' PF maps and the limits are kept in Postgres (tables `algo_portfolios`, `algo_pf_map`, `algo_pf_sub`, `algo_limits`)
+as well as in the JSON files in `/data/deephaven/state/`: Postgres is the main store (the old files are imported the first time) and the files are kept up to date as a backup copy, rewritten from the tables at every start. Needs the Postgres login the master already uses (`AUTOMATION_DATABASE_URL`, or `ALGO_PG_PASSWORD`); if Postgres is down at start, the registry says so and does not start (`day_auto` tries again every minute). tech.md "State in Postgres" has the details.
+
+**On a timer instead (`day_auto()`):** `day_auto()` does the same sequence by itself every trading day, at times of the exchange's clock. NSE: the master at **09:00:00**, the candles at **09:14:30**
+with the registry, NATS and the console right after them, and the end of the day at **15:30:00**: the candles and straddle tables are SAVED (`eod_save`), then the straddle and the candles are stopped
+(the save comes first, so the files hold the whole day; a straddle that is not running is skipped; a straddle started late is saved with what it has; a failed save is retried and stops nothing).
+A step whose time has passed when it is called runs at once (a container started at 10:00 runs everything at once), except the candles after 15:30; a failing step (Postgres not ready) is tried again every 60 s, 10 times; Saturdays
+and Sundays are skipped. Your own times: `day_auto("08:45", "09:10", "09:10:30", "15:35")` (master, candles, services, close), `day_auto(close=False)` leaves the end of the day out, `day_auto(stop=True)` switches it off.
+US (New York time): the master at 09:15:00, the candles with the registry, NATS and the console at 09:29:30, the close at 16:00:00. `scripts/05_start_day.py` is `install` plus `day_auto()` to paste by hand; the host's `init.py` still runs the immediate sequence above until it is changed to call `day_auto()`.
+The immediate sequence above is also what you get by pasting the `init.py` lines by hand. Strategies are pasted afterwards and need none of it again. A restart empties the session and every strategy is OFF again.
 
 **In the console, once per session** (or as the last line of `init.py`):
 
@@ -315,7 +324,7 @@ In `<strategy>`, under the Summary tiles, there are two boxes: **Turnover limit 
 **The limits are a table.** `strategy_limits` has one live row per strategy: `Strategy, Status (ok / BREACHED / no limit), TurnoverLimit, Turnover, TurnoverUsedPct, M2MLimit, M2M, TurnoverHit, M2MHit`. The boxes write to it (every change is also a row of `strategy_limits_log`), and what the windows show is read from it: a strategy's window shows its own row to the right of the boxes, and `operator_console` (all strategies) shows the whole table. You can open `strategy_limits` in the IDE too.
 
 - **Turnover limit reached** (the strategy's whole-day turnover in rupees, buys plus sells, is at or above the limit): a red LIMIT BREACHED line is shown, a row goes to `nats_events` (`cmd = limit`) and the log, and **that strategy's sending is switched OFF** (other strategies and the master are untouched).
-- **M2M limit reached** (the strategy's live gross M2M is **at or below the limit**): every subscribed portfolio of the strategy is **paused and squared up**, then its sending is switched OFF. For a loss limit type a negative number: -5000 breaches at -5000 and lower. A positive limit works the same way, so 50000 breaches whenever M2M is at or below +50,000, which includes right now unless the strategy is already above it.
+- **M2M limit reached** (the strategy's live gross M2M is **at or below the limit**): every subscribed portfolio of the strategy is **paused, squared up and unsubscribed**, then its sending is switched OFF. For a loss limit type a negative number: -5000 breaches at -5000 and lower. A positive limit works the same way, so 50000 breaches whenever M2M is at or below +50,000, which includes right now unless the strategy is already above it.
 - The breach is **latched**: the ON button (and `nats_send(True, client=...)`) is refused until the limit is changed to a value the strategy is no longer past. Changing it does not switch the strategy ON by itself: press ON.
 - A turnover limit set below the current turnover, or an M2M limit set at or above the current M2M, breaches at once. The checks run on the server on every change of the trades, so they work with no browser open. Limits and latches are kept in `<work>/state/limits.json`.
 - The square up goes out as an operator command, so it needs the master switch ON. With the master OFF nothing can be sent, and only the log line says so.
@@ -339,7 +348,8 @@ the automation OFF; its last line switches it on again.
 
 **After a new wheel is deployed (one time per deploy).** The session keeps running the code it loaded. Either restart Deephaven, or (market closed, nothing running) reload:
 ```python
-algo_stop("name")                       # for each automation first: the reloaded code would not recognise a running one
+algo_stop("name")                       # for each automation first: the reloaded code would not recognise a running one. It pauses, squares up and unsubscribes
+                                         # every portfolio of the automation, waits for that, then stops it (it refuses while its sending is OFF: switch it ON, or algo_stop("name", unsubscribe=False))
 app = algo.connect(globals(), market="NSE")
 for cb in list(app._publish_cbs.get("candles", [])):         # drop candle listeners left by pastes made before owner= existed
     w = getattr(cb, "__self__", None)

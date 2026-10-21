@@ -1,7 +1,7 @@
 """Enforces the turnover and M2M limits of a strategy (the numbers and the latches are in algo.core.limits).
 
     turnover limit breached   the strategy's sending is switched OFF (its own switch; other strategies and the master are untouched)
-    M2M limit breached        every subscribed portfolio of the strategy is paused and squared up, then its sending is switched OFF
+    M2M limit breached        every subscribed portfolio of the strategy is paused, squared up and UNSUBSCRIBED, then its sending is switched OFF
 
 Both put a line in the nats_events table and in the log. The live values come from `Guard.on_values` (the console feeds it from the strategy's trades,
 so it works with no browser open); `Guard.set_limit` changes a limit and acts at once if the strategy is already past the new one.
@@ -42,7 +42,7 @@ class Guard:
         if kind == "turnover":
             text = f"{strategy}: TURNOVER limit {limit:,.0f} reached ({turnover:,.0f}): sending switched OFF until the limit is changed"
         else:
-            text = f"{strategy}: M2M limit {limit:+,.0f} reached ({m2m:+,.0f}): squaring up all portfolios, sending switched OFF until the limit is changed"
+            text = f"{strategy}: M2M limit {limit:+,.0f} reached ({m2m:+,.0f}): squaring up and unsubscribing all portfolios, sending switched OFF until the limit is changed"
         log.warning(text)
         svc = self.app.get("nats")
         run = self.app.get(strategy)
@@ -56,8 +56,22 @@ class Guard:
             svc.note(0, "limit", f"{kind}_breached", text, user)
         self.limits.notify(strategy)                                 # screens redraw now: the ON / OFF button reads the switch that was just turned off
 
+    def _job_for(self, strategy: str, pf: int):
+        """What is sent to one portfolio: pause, square up, UNSUBSCRIBE (the bridge's own sequence, which knows the option the portfolio is subscribed to). A portfolio the
+        strategy's book does not know (the strategy is not running) is only paused and squared up."""
+        run = self.app.get(strategy)
+        bridge = getattr(getattr(run, "nats", None), "bridge", None)
+        book = getattr(bridge, "book", None)
+        if bridge is not None and book is not None and book.subscribed.get(pf) is not None:
+            return bridge._unsubscribe_job(pf), "m2m_unsubscribe"
+
+        async def job(call):
+            await call("pause_unpause", {"Action": "Pause"})
+            return await call("squareup", None)
+        return job, "m2m_squareup"
+
     def _square_all(self, strategy: str, svc) -> dict:
-        """Pause and square up the subscribed portfolios of the strategy, as an operator command (the strategy's own switch is already off)."""
+        """Pause, square up and unsubscribe the subscribed portfolios of the strategy, as an operator command (the strategy's own switch is already off)."""
         reg = self.app["registry"].state if self.app.get("registry") is not None else None
         sent: dict = {}
         for user, pf, st in svc.states.items():
@@ -65,11 +79,8 @@ class Guard:
             if not st.subscribed or not rec or rec.get("algo") != strategy:
                 continue
 
-            async def job(call):
-                await call("pause_unpause", {"Action": "Pause"})
-                return await call("squareup", None)
-
-            fut = svc.submit(pf, job, user=user, label="m2m_squareup")
+            job, label = self._job_for(strategy, pf)
+            fut = svc.submit(pf, job, user=user, label=label)
             sent[user] = sent.get(user, 0) + 1
 
             def done(f, pf=pf):

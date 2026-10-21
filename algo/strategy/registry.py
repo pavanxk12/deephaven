@@ -19,6 +19,8 @@ What is remembered for each portfolio:
 Numbers are never reused: a portfolio that is retired keeps its number, because it may still hold a position or an order history.
 Every change is appended to one file (one JSON line per change, written before the caller is answered), so a restart, or a second
 strategy started later, still sees every number that was ever handed out, and a change costs the same however many portfolios there are.
+With ALGO_STATE_STORE=postgres (algo.core.statedb) the numbers live in the table `algo_portfolios`, written first and before the caller is answered (a failure is raised and the number is not kept);
+the same line is then also appended to the file as a BACKUP COPY (a failure there is only logged, it never stops anything). The file is read only once: when the table is empty it is imported.
 
 The registry knows only the portfolios that were registered with it. A portfolio created some other way (by hand in the trading system)
 is unknown to it until it is registered with `register`.
@@ -80,8 +82,9 @@ def _text(x) -> str:
 class Registry:
     """The numbers themselves. Safe to call from any thread."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, db=None):
         self.path = path
+        self.db = db                                             # a StateDB: the numbers live in Postgres (the file is only imported once)
         self.zone = None
         self._lock = threading.RLock()
         self._data: dict[int, dict[int, dict]] = {}            # user -> portfolio -> {owner, name, algo, created, note}
@@ -100,7 +103,26 @@ class Registry:
         return {"owner": sys.intern(str(rec["owner"])), **{k: sys.intern(str(rec.get(k, ""))) for k in ("name", "algo")},
                 "created": str(rec.get("created", "")), "note": str(rec.get("note", ""))}
 
-    def _load(self) -> None:
+    def _load_db(self) -> None:
+        rows = self.db.load_portfolios()
+        for u, p, owner, name, algo, created, note in rows:
+            self._data.setdefault(int(u), {})[int(p)] = self._record({"owner": owner, "name": name or "", "algo": algo or "", "created": created or "", "note": note or ""})
+        if not rows and os.path.exists(self.path):
+            self._load(rewrite=False)                            # an empty table and an old file: import the file, once
+            if self._data:
+                self.db.save_portfolios(self.portfolios())
+                from algo.core import log
+                log.get("registry").info("imported %d portfolios from %s into the table algo_portfolios", self.count()[1], self.path)
+        if self._data:
+            try:
+                self._compact()                                  # the backup file now says exactly what the table says (one line per portfolio)
+            except Exception as e:
+                from algo.core import log
+                log.get("registry").warning("the backup file %s could not be written (%r)", self.path, e)
+
+    def _load(self, rewrite: bool = True) -> None:
+        if self.db is not None and rewrite:
+            return self._load_db()
         try:
             with open(self.path, encoding="utf-8", newline="") as f:
                 text = f.read()
@@ -111,19 +133,20 @@ class Registry:
         if not text.strip():
             return
         try:
-            self._parse(text)
+            self._parse(text, rewrite)
         except (ValueError, KeyError, TypeError, AttributeError) as e:
             self._data = {}
             raise self._damaged(e) from None
 
-    def _parse(self, text: str) -> None:
+    def _parse(self, text: str, rewrite: bool = True) -> None:
         try:
             whole = json.loads(text)
         except ValueError:
             whole = None
         if isinstance(whole, dict) and "u" not in whole:           # the first version of the file: one nested object
             self._data = {int(u): {int(p): self._record(r) for p, r in pfs.items()} for u, pfs in whole.items()}
-            self._compact()                                         # ...rewritten once as lines
+            if rewrite:
+                self._compact()                                     # ...rewritten once as lines
             return
         lines = [(i, ln.strip()) for i, ln in enumerate(text.split("\n")) if ln.strip()]
         records, cut = 0, False
@@ -139,7 +162,7 @@ class Registry:
                 raise
             self._data.setdefault(int(rec["u"]), {})[int(rec["p"])] = self._record(rec)
             records += 1
-        if cut or not text.endswith("\n") or records > 2 * self.count()[1] + 100:
+        if rewrite and (cut or not text.endswith("\n") or records > 2 * self.count()[1] + 100):
             self._compact()                                         # drop the cut line, or the superseded lines of updates
 
     @staticmethod
@@ -158,6 +181,17 @@ class Registry:
 
     def _save(self, user: int, pf: int, rec: dict) -> None:
         """Append one line. If the write fails part-way the file is cut back to what it was, so a half line never stays."""
+        if self.db is not None:
+            self.db.save_portfolio(user, pf, rec)                   # one upsert, committed before the caller is answered; a failure is raised and _put undoes the change
+            try:
+                self._append(user, pf, rec)                         # ... and the backup copy: the same line in the file. Its failure is not the caller's problem
+            except Exception as e:
+                from algo.core import log
+                log.get("registry").warning("the backup file %s could not be written (%r); the number is safe in Postgres", self.path, e)
+            return
+        self._append(user, pf, rec)
+
+    def _append(self, user: int, pf: int, rec: dict) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         data = self._line(user, pf, rec)
         with open(self.path, "ab") as f:
@@ -287,12 +321,13 @@ class PortfolioRegistry(Plugin):
 
     def start(self) -> None:
         from deephaven import DynamicTableWriter, dtypes as dht
+        from algo.core.statedb import state_db
 
         path = self.file or os.path.join(self.app.paths.state, "portfolio_registry.json")
         key = ("registry", path)
         self.state = self.app.shared.get(key)
         if self.state is None:                                # one Registry per file, kept when this plugin restarts
-            self.state = self.app.shared[key] = Registry(path)
+            self.state = self.app.shared[key] = Registry(path, db=state_db(self.app.shared))
         self.state.zone = self.app.market.zone
         wkey = ("registry_rows", path)
         if wkey not in self.app.shared:
@@ -306,7 +341,7 @@ class PortfolioRegistry(Plugin):
         self.rows = self.app.shared[wkey]
         self._undo.append(self.state.on_change(self._row))
         users, pfs = self.state.count()
-        self.log.info("%s: %d portfolios across %d users", path, pfs, users)
+        self.log.info("%s: %d portfolios across %d users", "Postgres table algo_portfolios" if self.state.db is not None else path, pfs, users)
 
     def _row(self, user: int, pf: int, rec: dict) -> None:
         if self.rows is not None:

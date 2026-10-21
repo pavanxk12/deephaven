@@ -2,10 +2,10 @@
 
     turnover limit    breached when the strategy's turnover reaches it            -> sending is switched OFF for the strategy
     M2M limit         breached when the strategy's live gross M2M is AT OR BELOW the limit, the number as typed: -5000 breaches at -5000 and lower,
-                      50000 breaches at 50000 and lower (so a positive limit is breached at once unless M2M is above it)  -> its portfolios are squared up and sending is switched OFF
+                      50000 breaches at 50000 and lower (so a positive limit is breached at once unless M2M is above it)  -> its portfolios are paused, squared up and unsubscribed, and sending is switched OFF
 
 A breach is LATCHED: the strategy stays blocked (it cannot be switched ON) until that limit is changed to a value the strategy is no longer past.
-The sign of an M2M limit counts. A limit of 0 or None (an empty box) means no limit. Limits can be changed at any time; they are kept in a small JSON file so a restart keeps them and the latches.
+The sign of an M2M limit counts. A limit of 0 or None (an empty box) means no limit. Limits can be changed at any time; they are kept in a small JSON file (or, with ALGO_STATE_STORE=postgres, the table algo_limits, with the file written as well as a backup copy) so a restart keeps them and the latches.
 
 This module holds the numbers only (no Deephaven, no NATS): algo.strategy.guard feeds it the live values and acts on a breach.
 """
@@ -28,8 +28,9 @@ def _num(x):
 
 
 class Limits:
-    def __init__(self, path: str | None = None):
+    def __init__(self, path: str | None = None, db=None):
         self.path = path
+        self.db = db                                           # a StateDB: the limits live in Postgres (the file is only imported once)
         self._d: dict[str, dict] = {}
         self._seen: dict[str, tuple] = {}
         self._cbs: list[Callable[[str], None]] = []
@@ -143,6 +144,21 @@ class Limits:
                     logging.getLogger("algo.limits").exception("a limits listener failed")
 
     def _load(self) -> None:
+        if self.db is None:
+            return self._load_file()
+        rows = self.db.load_limits()
+        for name, turnover, m2m, t_hit, m_hit in rows:
+            self._d[name] = {"turnover": _num(turnover), "m2m": _num(m2m), "turnover_hit": bool(t_hit), "m2m_hit": bool(m_hit)}
+        if not rows:
+            self._load_file()                                   # an empty table and an old file: import the file, once
+            if self._d:
+                self.db.save_limits(self._d)
+                import logging
+                logging.getLogger("algo.limits").info("imported the limits of %d strategies from %s into the table algo_limits", len(self._d), self.path)
+        if self._d:
+            self._save_file()                                   # the backup file now says exactly what the table says
+
+    def _load_file(self) -> None:
         if not self.path or not os.path.exists(self.path):
             return
         try:
@@ -156,6 +172,17 @@ class Limits:
             logging.getLogger("algo.limits").exception("%s could not be read: starting with no limits", self.path)
 
     def _save(self) -> None:
+        if self.db is not None:
+            with self._lock:
+                snapshot = {k: dict(v) for k, v in self._d.items()}
+            try:
+                self.db.save_limits(snapshot)                   # Postgres first; then the backup copy in the file below
+            except Exception:
+                import logging
+                logging.getLogger("algo.limits").exception("the limits could not be written to Postgres")
+        self._save_file()
+
+    def _save_file(self) -> None:
         if not self.path:
             return
         with self._lock:
@@ -175,5 +202,6 @@ def limits_of(shared: dict, path: str | None = None) -> Limits:
     """The one Limits of an app (in `app.shared`, so it survives a restart of the console)."""
     hub = shared.get("limits")
     if hub is None:
-        hub = shared["limits"] = Limits(path)
+        from algo.core.statedb import state_db
+        hub = shared["limits"] = Limits(path, db=state_db(shared))
     return hub

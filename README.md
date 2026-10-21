@@ -81,6 +81,8 @@ anywhere downstream, so there is one place where the scale can be wrong. Volume 
 eod_save()                       # today: candles_2026-10-15.parquet, straddle_2026-10-15.parquet (+ .meta.json each)
 eod_save(tables=["candles"])                                              # choose which tables
 eod_save(day="2026-10-14", folder="/data/eod")                           # another day / another folder
+# console summary: REALISED, UNREALISED, GROSS M2M, EXPENSE (NSE rates per crore), NET M2M, all as the actual amounts (turnover too, not in crores); dollars for the US. See tech.md "Expense, net M2M and currency"
+day_auto()                       # the whole day on a timer (NSE: master 09:00, candles + registry + NATS + console 09:14:30, 15:30 save of candles + straddle, then stop)
 eod_auto()                       # saves by itself every day, 5 minutes after the session ends (NSE 15:35, US 16:05)
 eod_auto("15:40")                # or at a time you choose;  eod_auto(stop=True) switches it off
 eod_load("2026-10-15")           # -> tables candles_20261015, straddle_20261015
@@ -145,9 +147,9 @@ read-only mount:
 
 | what | where |
 |---|---|
-| portfolio state (`pf_map.json`, `pf_sub.json`) | `/data/deephaven/state/` |
+| portfolio state (registry, `pf_map`, `pf_sub`, limits) | Postgres tables `algo_portfolios`, `algo_pf_map`, `algo_pf_sub`, `algo_limits` when `ALGO_STATE_STORE=postgres` (the servers' compose files set it); the JSON files in `/data/deephaven/state/` are then kept up to date too, as a backup copy |
 | master cache | `/data/deephaven/cache/` |
-| end-of-day files (`candles_<day>.parquet`, `straddle_<day>.parquet`) | `/data/deephaven/fo_market_data/` by default, or any folder you choose (below) |
+| end-of-day files (`candles_<day>.parquet`, `straddle_<day>.parquet`) | `/data/fo_market_data/` (the market-data folder itself, so the host mount must be writable, not `:ro`) by default, or any folder you choose (below) |
 | contract `.db3`, `stocks.txt`, `logo.png`, history to load | `/data/fo_market_data/` (read-only) |
 
 **Before the first run copy the old state files** (`/data/stocks_pf.json`, `/data/stocks_pf_sub.json`) to

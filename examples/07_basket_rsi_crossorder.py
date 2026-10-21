@@ -16,7 +16,7 @@
 #
 # EVERYTHING is inside the function run_basket_rsi() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of names shared by every script you paste, so a script that defines `rsi`, `closes` or `on_candle`
 # at the top level would overwrite the same names of another script that is still running. The only names left in the terminal all start with basket_rsi:
-#   basket_rsi_status()   basket_rsi_exit_all()   basket_rsi_stop()   (stop does NOT close positions: run exit_all first)
+#   basket_rsi_status()   basket_rsi_exit_all()   basket_rsi_stop()   (stop pauses, squares up and unsubscribes every portfolio, then stops; it refuses while sending is OFF)
 # Positions are kept in the script only: if you stop it or Deephaven restarts while a position is open, it no longer knows about it (square it up from the console).
 
 
@@ -238,7 +238,7 @@ def run_basket_rsi():
 
     def stop():
         listener.stop()
-        algo_stop(STRATEGY)                                        # open positions are NOT closed by this: basket_rsi_exit_all() first
+        algo_stop(STRATEGY)                                        # pause + square up + unsubscribe every portfolio, wait for it, then stop (refuses while sending is OFF)
 
     shared = globals()
     shared["basket_rsi_status"], shared["basket_rsi_exit_all"], shared["basket_rsi_stop"] = status, exit_all, stop

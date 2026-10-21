@@ -290,6 +290,75 @@ def eod_auto(at: str | None = None, folder: str | None = None, stop: bool = Fals
     _run(Eod(DEFAULT_TABLES, auto_at=when, folder=folder))
 
 
+def _clock(text, what: str):
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(str(text).strip(), fmt).time()
+        except ValueError:
+            pass
+    raise ValueError(f'{what} must look like "09:00" or "09:14:30" (exchange time), got {text!r}')
+
+
+def _close_day() -> None:
+    """The end of the day: save the candles and straddle tables first, then stop the straddle and the candles. A failed save raises (it is tried again) and stops nothing."""
+    app = _app()
+    results = save_tables(app, DEFAULT_TABLES)
+    for r in results:
+        print(f"  {r['table']:<17} {r['status']:<8} {r['rows']:>12,} rows  {r['path'] or ''}")
+    failed = [r["table"] for r in results if r["status"] == "failed"]
+    if failed:
+        raise RuntimeError(f"saving {', '.join(failed)} failed")
+    app.stop("straddle")
+    app.stop("candles")
+
+
+def day_auto(master: str | None = None, candles: str | None = None, services: str | None = None, close: str | None = None, *, users=(3, 4), nats_ip: str | None = None,
+             nats_port: int | None = None, timeframe: str = "1min", source: str = "auto", console: bool = True, weekdays_only: bool = True,
+             retries: int = 10, retry_s: float = 60.0, stop: bool = False) -> None:
+    """Start the day by itself, every trading day, at times of the exchange's clock (NSE: Asia/Kolkata, US: America/New_York):
+        master    the contract master (master_build) at `master`                                      default NSE 09:00:00
+        candles   candles_start(timeframe) at `candles`                                               default NSE 09:14:30
+        services  registry_start(), nats_start(...) and the console, right after the candles          default: the candles' time
+        close     the end of the day at `close`: the candles and straddle tables are SAVED (eod_save), then the     default NSE 15:30
+                  straddle and the candles are stopped. The save comes first, so the files hold the whole day; a straddle that is not running is
+                  skipped (it says so), and one started late is saved with what it has (stopping and starting it again would empty its table).
+                  close=False leaves the end of the day out (eod_auto() can still save). If the save fails it is tried again and nothing is stopped.
+    day_auto()                                  the defaults above
+    day_auto("08:45", "09:10", "09:10:05", "15:35")   your own times ("HH:MM" or "HH:MM:SS");  day_auto(stop=True) switches it off (what is already running keeps running)
+    A container started after the close does not start the candles (they would build nothing); the master, registry, NATS and console still start.
+    At one time the steps run in this order: master, candles, registry, NATS, console. A step already due when you call it (the container came up late) runs at once;
+    one that fails (Postgres not ready, the feed not up yet) is tried again every `retry_s` seconds, `retries` times. `source` is master_build's: "auto" = Postgres,
+    then the .db3 file. `users`, `nats_ip` (default ALGO_NATS_IP) and `nats_port` are nats_start's; `console=False` leaves the console out.
+    Saturdays and Sundays are skipped unless weekdays_only=False. It does not stop anything at the close: eod_auto() saves the day,
+    and a restart of the container starts the next one."""
+    app = _app()
+    if stop:
+        app.stop("schedule")
+        return
+    from algo.schedule import DaySchedule, Step
+    market = app.market
+    at_master = market.start_master if master is None else _clock(master, "master")
+    at_candles = market.start_candles if candles is None else _clock(candles, "candles")
+    at_services = at_candles if services is None else _clock(services, "services")
+    at_close = None if close is False else market.close_at if close is None else _clock(close, "close")
+    if at_candles < at_master:
+        raise ValueError(f"the candles ({at_candles}) cannot start before the master ({at_master}): they are built from its contracts")
+    if at_close is not None and at_close <= at_candles:
+        raise ValueError(f"the close ({at_close}) must come after the candles start ({at_candles})")
+    steps = [Step("master", at_master, lambda: master_build(source=source)),
+             Step("candles", at_candles, lambda: candles_start(timeframe), until=at_close),
+             Step("registry", at_services, lambda: registry_start()),
+             Step("nats", at_services, lambda: nats_start(nats_ip, nats_port, users=users))]
+    if console:
+        def open_console():
+            from algo.ui.console import Console
+            _app().run(Console())
+        steps.append(Step("console", at_services, open_console))
+    if at_close is not None:
+        steps.append(Step("close", at_close, _close_day))
+    _run(DaySchedule(steps, weekdays_only=weekdays_only, retries=retries, retry_s=retry_s))
+
+
 def _users(users) -> tuple:
     items = [users] if isinstance(users, (int, str)) else list(users)
     out = []
@@ -623,6 +692,7 @@ GROUPS = {
                                          "algo_sending", "watch", "algo_portfolios", "algo_pause", "algo_unpause", "algo_exit", "algo_unsubscribe"),
     "ABSOLUTE / RELATIVE (now vs before, now vs a basket)": ("absolute", "relative", "basket", "absolute_warm", "absolute_settings"),
     "CONSOLE (one window per strategy)": ("console_open",),
+    "START THE DAY BY ITSELF": ("day_auto",),
     "WHAT IS RUNNING": ("algo_status", "algo_help"),
 }
 
@@ -644,7 +714,7 @@ def algo_help(name: str | None = None) -> None:
 
 FUNCTIONS = (master_build, contract, contracts, expiries, strikes, nearest_strikes, last_price, last_candles,
              candles_start, candles_stop,
-             straddle_start, straddle_stop, eod_save, eod_load, eod_auto, nats_start, nats_restart, nats_connect, nats_add_user, nats_stop, nats_send,
+             straddle_start, straddle_stop, eod_save, eod_load, eod_auto, day_auto, nats_start, nats_restart, nats_connect, nats_add_user, nats_stop, nats_send,
              pf_subscribe, pf_pause, pf_unpause, pf_squareup, pf_unsubscribe, pf_apply, nats_block, nats_unblock,
              registry_start, registry_connect, registry_stop, pf_create, pf_register, pf_list, algo_start, algo_stop, pf_track,
              pf_assign, pf_activate, pf_leg, pf_mark, pf_cooling, pf_allowed, algo_sending, watch, algo_portfolios, algo_pause, algo_unpause, algo_exit,

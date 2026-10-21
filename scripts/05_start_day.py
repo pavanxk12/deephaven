@@ -1,16 +1,12 @@
-# The whole morning in one paste: data, the shared services and the console. Run it ONCE per Deephaven session; strategy scripts are pasted after it.
-#   master     the contracts of today, read from Postgres (resultset_<today>); source="auto" would fall back to the .db3 file when Postgres cannot answer
-#   candles    1-minute candles from the live feed
-#   registry   portfolio numbers, unique per user
-#   nats       the one NATS service, for users 3 and 4 (the master switch is ON; every strategy starts OFF and switches itself on)
-#   console    operator_console and one <strategy> window per strategy (needs strategy_events, orders_trade, orders_ack and the feed from init.py)
-# The Postgres login is the container's own AUTOMATION_DATABASE_URL and the driver is the volume's psycopg (run.md section 1). The host's init.py runs these same lines at every start.
+# The whole day on a timer (India): paste ONCE per Deephaven session; strategy scripts are pasted after it.
+#   09:00:00  master    the contracts of today, from Postgres (resultset_<today>), else the .db3 file
+#   09:14:30  candles   1-minute candles from the live feed, and right after them: the registry, the NATS service (users 3 and 4; the master switch is ON,
+#                       every strategy starts OFF and switches itself on) and the console (operator_console and one window per strategy)
+#   15:30:00  close     the candles and straddle tables are SAVED (candles_<day>.parquet, straddle_<day>.parquet), then the straddle and the candles are stopped
+# A step whose time has already passed when you paste this runs at once (a candle builder is not started after 15:30); a step that fails is tried again every minute.
+# Saturdays and Sundays are skipped. Other times: day_auto("08:45", "09:10", "09:10:30", "15:35");  day_auto(stop=True) switches it off. See run.md section 0.
+# The Postgres login is the container's own AUTOMATION_DATABASE_URL and the driver is the volume's psycopg (run.md section 1).
 import algo
 
 app = algo.install(globals(), "NSE")
-master_build("NSE", source="postgres")           # (a second positional argument would be the DAY, so the source is named)
-candles_start("1min")
-registry_start()
-nats_start("192.168.1.130", 4222, users=[3, 4])
-app.run(algo.Console())
-algo_status()
+day_auto()

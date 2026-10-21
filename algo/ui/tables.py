@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-from algo.data.symbols import symbol_table  # noqa: F401,E402  (token -> Symbol lookup table, shared with the candles)
+from algo.data.symbols import kind_table, symbol_table  # noqa: F401,E402  (token -> Symbol and token -> Kind lookup tables)
 
 
 def strategy_map(registry, per_user: int):
@@ -39,10 +39,23 @@ def messages(events, cols: dict, tz: str):
     )
 
 
-def net_positions(trades, feed, symbols, price_div: float):
-    """One row per traded token with live LTP from the feed (one row per token, columns token and ltp)."""
+def expense_formula(rates) -> str:
+    """A Deephaven formula for the expense of a position row from its Kind, BuyVal and SellVal. `rates` is {"FUT": (buy, sell), ...} in rupees per crore (1.0E7) of the
+    value bought / sold; a kind without a rate, or no rates at all, costs nothing."""
+    if not rates:
+        return "0.0"
+    out = "0.0"
+    for kind, (buy, sell) in reversed(list(rates.items())):
+        out = f"Kind == `{kind}` ? BuyVal * {float(buy) / 1.0e7:.12f} + SellVal * {float(sell) / 1.0e7:.12f} : {out}"
+    return out
+
+
+def net_positions(trades, feed, symbols, price_div: float, expense=None, kinds=None):
+    """One row per traded token with live LTP from the feed (one row per token, columns token and ltp).
+    M2M is the gross result (realised + unrealised). `expense` ({"FUT": (buy, sell) ...} rupees per crore) adds Expense and NetM2M = M2M - Expense.
+    `kinds` is the contract master's table (token, Kind = OPT / FUT / EQ): the kind of each row is taken from it. A token the master does not know (or no table at all) falls back to the symbol text."""
     from deephaven import agg
-    return (
+    t = (
         trades
         .where("fill_quantity > 0")
         .update_view([
@@ -55,6 +68,10 @@ def net_positions(trades, feed, symbols, price_div: float):
         .update_view("TokenL = (long) token")                       # the tables disagree on int / long; a join needs the same type on both sides
         .natural_join(feed.view(["TokenL = (long) token", "ltp"]), on="TokenL", joins="LtpRaw = ltp")
         .natural_join(symbols, on="TokenL = token", joins="SymbolRaw = Symbol")
+    )
+    t = t.natural_join(kinds, on="TokenL = token", joins="MasterKind = Kind") if kinds is not None else t.update_view("MasterKind = (String) null")
+    return (
+        t
         .update([
             "Symbol = isNull(SymbolRaw) ? String.valueOf(token) : SymbolRaw",
             f"Ltp = LtpRaw / {price_div}",
@@ -63,11 +80,13 @@ def net_positions(trades, feed, symbols, price_div: float):
             "NetQty = BuyQty - SellQty",
             "Realised = Math.min(BuyQty, SellQty) * (SellAvg - BuyAvg)",
             "M2M = isNull(LtpRaw) ? NULL_DOUBLE : SellVal - BuyVal + NetQty * Ltp",
-            # instrument kind from the symbol text: ...CE / ...PE = option, contains FUT = future, else equity
-            "Kind = (Symbol.endsWith(`CE`) || Symbol.endsWith(`PE`)) ? `OPT` : Symbol.contains(`FUT`) ? `FUT` : `EQ`",
+            # the kind comes from the contract master; only a token the master does not know is read from the symbol text ("... CE" / "... PE" = option, "... FUT" = future,
+            # else equity; the SPACE matters: RELIANCE ends in CE and is a stock)
+            "Kind = !isNull(MasterKind) ? MasterKind : (Symbol.endsWith(` CE`) || Symbol.endsWith(` PE`)) ? `OPT` : Symbol.endsWith(` FUT`) ? `FUT` : `EQ`",
         ])
+        .update_view(["Expense = " + expense_formula(expense), "NetM2M = isNull(M2M) ? NULL_DOUBLE : M2M - Expense"])
         .view(["token", "Symbol", "BuyQty", "BuyAvg", "BuyVal", "SellQty", "SellAvg", "SellVal",
-               "NetQty", "Ltp", "Realised", "M2M", "Fills", "Kind"])
+               "NetQty", "Ltp", "Realised", "M2M", "Expense", "NetM2M", "Fills", "Kind"])
         .sort("Symbol")
     )
 

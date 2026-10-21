@@ -332,17 +332,18 @@ class Bridge(Plugin):
         for t in list(self.book.tracked):
             self.book.set_live(t, None)
 
-    def unsubscribe_all(self) -> None:
-        """Stop signals, then pause + square up + unsubscribe every current portfolio."""
+    def unsubscribe_all(self) -> "list | None":
+        """Stop signals, then pause + square up + unsubscribe every current portfolio. Returns the futures of the jobs (so a caller can wait for them to finish), or None
+        when nothing was sent because the service is down, sending is OFF or this is a dry run."""
         if self.dry_run or not self.sending:
             self.log.warning("the NATS service is not running (nats_start())" if self.nats is NO_SERVICE
                              else "sending is OFF or dry run: call send_on() first (dry_run must be False)")
-            return
+            return None
         for cb in list(self._halt_cbs):
             cb()
         pfs = self.book.current_pfs()
-        for pf in pfs:
-            self.nats.submit(pf, self._unsubscribe_job(pf), user=self.user, client=self.client, label="unsubscribe")
+        futures = [self.nats.submit(pf, self._unsubscribe_job(pf), user=self.user, client=self.client, label="unsubscribe") for pf in pfs]
         for t in list(self.book.tracked):
             self.book.set_live(t, None)
         self.log.info("unsubscribing %d portfolio(s), watch the log", len(pfs))
+        return [f for f in futures if f is not None]

@@ -87,6 +87,7 @@ class Ctx:
     limits_table: object = None  # the live table `strategy_limits`: what the windows show of the limits
     pf_table: object = None      # the live table `pf_by_option`: the state of the portfolio that trades each option (the native positions table reads it)
     guard: object = None         # Guard: changes a limit and acts when one is breached
+    kinds: object = None         # the master's table (token, Kind = OPT / FUT / EQ): the expense rate and the Futures / Options / Equity filter use it
 
 
 class TimeTools:
@@ -215,14 +216,16 @@ def use_redraw(ctx: Ctx):
 # panels
 # =================================================================================================
 @ui.component
-def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, title="Summary", limit_ctl=None):
+def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, title="Summary", limit_ctl=None, with_expense=False, currency="₹"):
     totals = ui.use_memo(
-        lambda: net_tbl.agg_by([agg.sum_(["BuyVal", "SellVal", "Realised", "M2M", "Fills"])]).view([
-            "Turnover = (BuyVal + SellVal) / 1.0E7",
+        lambda: net_tbl.agg_by([agg.sum_(["BuyVal", "SellVal", "Realised", "M2M", "Expense", "Fills"])]).view([
+            "Turnover = BuyVal + SellVal",                              # the actual value traded (buys + sells), not in crores
             "Fills",
-            "GrossM2M = M2M",
+            "GrossM2M = M2M",                         # realised + unrealised
             "RealisedPnl = Realised",
             "Unrealised = M2M - Realised",
+            "Expense",
+            "NetM2M = M2M - Expense",                 # after the expense (rates per crore of the market, see Market.expense_per_crore)
         ]),
         [net_tbl],
     )
@@ -244,12 +247,14 @@ def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, ti
         return GREEN if x is None or x >= 0 else RED
 
     tiles = ui.flex(
-        tile("TURNOVER (₹ CR)", num(v, "Turnover", ",.2f", "0.00"), ORANGE),
+        tile(f"TURNOVER ({currency})", num(v, "Turnover", ",.0f", "0"), ORANGE),
         tile("FILLS", num(v, "Fills", ",.0f", "0"), "#000000"),
         tile("OPEN ORDERS", num(o, "OpenOrders", ",.0f", "0"), "#000000"),
-        tile("GROSS M2M (₹)", num(v, "GrossM2M", "+,.0f"), pnl_color("GrossM2M")),
-        tile("REALISED (₹)", num(v, "RealisedPnl", "+,.0f", "0"), pnl_color("RealisedPnl")),
-        tile("UNREALISED (₹)", num(v, "Unrealised", "+,.0f"), pnl_color("Unrealised")),
+        tile(f"REALISED ({currency})", num(v, "RealisedPnl", "+,.0f", "0"), pnl_color("RealisedPnl")),
+        tile(f"UNREALISED ({currency})", num(v, "Unrealised", "+,.0f"), pnl_color("Unrealised")),
+        tile(f"GROSS M2M ({currency})", num(v, "GrossM2M", "+,.0f"), pnl_color("GrossM2M")),
+        *([tile(f"EXPENSE ({currency})", num(v, "Expense", ",.0f", "0"), ORANGE),
+           tile(f"NET M2M ({currency})", num(v, "NetM2M", "+,.0f"), pnl_color("NetM2M"))] if with_expense else []),
         wrap=True, align_items="center",
         UNSAFE_style={"flex": "1", "minHeight": "0"},
     )
@@ -338,8 +343,8 @@ def limit_boxes(ctx: Ctx):
         "" if not cur["m2m"] or m2m is None else f", now {m2m:+,.0f}")
     why = limits.blocked(name)
     return ui.flex(
-        box("Turnover limit (₹)", t_draft, typed("turnover", set_t), "turnover", used_t),
-        box("M2M limit (₹)", m_draft, typed("m2m", set_m), "m2m", used_m),
+        box(f"Turnover limit ({ctx.market.currency})", t_draft, typed("turnover", set_t), "turnover", used_t),
+        box(f"M2M limit ({ctx.market.currency})", m_draft, typed("m2m", set_m), "m2m", used_m),
         *([ui.html.div(f"LIMIT BREACHED: {why}", style={"color": "#ffffff", "background": RED, "fontWeight": "700", "padding": "4px 10px", "borderRadius": "4px"})] if why else []),
         *([ui.html.div(warn, style={"color": GREEN if warn == "limit saved" else RED, "fontSize": "12px", "fontWeight": "600"})] if warn else []),
         gap="size-300", wrap=True, align_items="start", UNSAFE_style={"flex": "0 0 auto", "padding": "2px 16px 8px"},
@@ -464,7 +469,7 @@ def fast_positions(net_tbl, ctx: Ctx):
                 .natural_join(states, on="TokenL = Option", joins="User, PF, Subscribed, Paused, Squared")
                 .update_view("State = isNull(PF) ? `-` : (Squared != null && Squared && Paused != null && Paused) ? `SQUARED` : (Paused != null && Paused) ? `PAUSED`"
                              " : (Subscribed != null && Subscribed) ? `RUNNING` : `UNSUBSCRIBED`")
-                .view(["Symbol", "State", "PF", "BuyQty", "BuyAvg", "BuyVal", "SellQty", "SellAvg", "SellVal", "NetQty", "Ltp", "Realised", "M2M",
+                .view(["Symbol", "State", "PF", "BuyQty", "BuyAvg", "BuyVal", "SellVal", "SellAvg", "SellQty", "NetQty", "Ltp", "Realised", "M2M", "Expense", "NetM2M",
                        "token", "User", "Subscribed", "Paused", "Kind", "Fills"]))
 
     tbl = ui.use_memo(build, [hide_flat, kind, net_tbl, ctx.strategy])
@@ -486,7 +491,7 @@ def fast_positions(net_tbl, ctx: Ctx):
     formats = [
         ui.TableFormat(cols=["BuyQty", "BuyAvg", "BuyVal"], background_color=BUY_BG),
         ui.TableFormat(cols=["SellQty", "SellAvg", "SellVal"], background_color=SELL_BG),
-        ui.TableFormat(cols=["BuyQty", "SellQty", "BuyVal", "SellVal", "Realised", "M2M"], value="#,##0"),
+        ui.TableFormat(cols=["BuyQty", "SellQty", "BuyVal", "SellVal", "Realised", "M2M", "Expense", "NetM2M"], value="#,##0"),
         ui.TableFormat(cols=["BuyAvg", "SellAvg", "Ltp"], value="#,##0.00"),
         ui.TableFormat(cols="NetQty", value="+#,##0;-#,##0;0"),
         ui.TableFormat(cols="NetQty", if_="NetQty > 0", color=BLUE),
@@ -494,6 +499,9 @@ def fast_positions(net_tbl, ctx: Ctx):
         ui.TableFormat(cols="Realised", if_="Realised > 0", color=GREEN),
         ui.TableFormat(cols="M2M", if_="M2M > 0", color=GREEN),
         ui.TableFormat(cols="M2M", if_="M2M < 0", color=RED),
+        ui.TableFormat(cols="Expense", if_="Expense > 0", color=RED),                  # an expense is a cost: always red
+        ui.TableFormat(cols="NetM2M", if_="NetM2M > 0", color=GREEN),
+        ui.TableFormat(cols="NetM2M", if_="NetM2M < 0", color=RED),
         ui.TableFormat(cols="Realised", if_="Realised < 0", color=RED),
         ui.TableFormat(cols="State", if_="State == `PAUSED`", background_color=AMBER, color="#ffffff"),
         ui.TableFormat(cols="State", if_="State == `SQUARED`", background_color=RED, color="#ffffff"),
@@ -508,9 +516,10 @@ def fast_positions(net_tbl, ctx: Ctx):
             ),
             fast_toolbar(ctx, pick),
             ui.table(tbl, density="spacious", show_search=True, format_=formats, on_row_press=pressed,
-                     always_fetch_columns=["token", "Symbol", "NetQty"], frozen_columns=["Symbol"], hidden_columns=["token", "User", "Subscribed", "Paused", "Kind", "Fills"],
+                     always_fetch_columns=["token", "Symbol", "NetQty"], frozen_columns=["Symbol"],
+                     hidden_columns=["token", "User", "Subscribed", "Paused", "Kind", "Fills"] + ([] if ctx.market.expense_per_crore else ["Expense", "NetM2M"]),
                      column_display_names={"BuyQty": "BUY QTY", "BuyAvg": "BUY AVG", "BuyVal": "BUY VALUE", "SellQty": "SELL QTY", "SellAvg": "SELL AVG", "SellVal": "SELL VALUE",
-                                           "NetQty": "NET", "Ltp": "LTP", "Realised": "REALISED", "M2M": "M2M"}),
+                                           "NetQty": "NET", "Ltp": "LTP", "Realised": "REALISED", "M2M": "GROSS M2M", "Expense": "EXPENSE", "NetM2M": "NET M2M"}),
             direction="column", gap="size-100", height="100%",
         ),
         title="Net positions",
@@ -696,14 +705,14 @@ def build_dashboard(base: Ctx):
         strat = strategy_cond(strategy)
 
         def net_all_fn():                              # the whole day of this strategy: what the per-position rules use
-            return q.net_positions(base.trades.where(strat), base.feed, base.symbols, mk.price_div) if strat else base.net_all
+            return q.net_positions(base.trades.where(strat), base.feed, base.symbols, mk.price_div, mk.expense_per_crore, base.kinds) if strat else base.net_all
 
         net_all = ui.use_memo(net_all_fn, [strategy])
         ctx = ui.use_memo(lambda: replace(base, strategy=strategy, net_all=net_all), [strategy, net_all])
 
         def net_fn():
             conds = time_conds(cfg.trade_time, window) + strat
-            return q.net_positions(base.trades.where(conds), base.feed, base.symbols, mk.price_div) if time_conds(cfg.trade_time, window) else net_all
+            return q.net_positions(base.trades.where(conds), base.feed, base.symbols, mk.price_div, mk.expense_per_crore, base.kinds) if time_conds(cfg.trade_time, window) else net_all
 
         def msg_fn():
             conds = ([f"Ts >= epochSecondsToInstant({a}L)"] if a is not None else []) + (
@@ -724,7 +733,8 @@ def build_dashboard(base: Ctx):
             ui.column(
                 ui.row(
                     ui.column(summary_window(net_tbl, book_tbl, ctx.logo_src, cfg.logo_height, filters_bar, title,
-                                             (limit_boxes(ctx) if strategy else limits_overview(ctx)) if ctx.limits_table is not None else None), width=72),
+                                             (limit_boxes(ctx) if strategy else limits_overview(ctx)) if ctx.limits_table is not None else None,
+                                             with_expense=bool(mk.expense_per_crore), currency=mk.currency), width=72),
                     ui.column(control_panel(ctx), width=28),
                     height=30,
                 ),
@@ -757,6 +767,7 @@ class Console(Plugin):
         trades, acks = q.tag(trades, "PF", smap), q.tag(acks, "PF", smap)             # every row now carries its Strategy
         symbol_of = app.master.symbol_of
         symbols = q.symbol_table(symbol_of)
+        kinds = q.kind_table(app.master)                                              # each instrument's kind straight from the contract master
         fills = q.fills_per_order(trades)
         registry = app["registry"].state
         strategies = Strategies()
@@ -767,9 +778,9 @@ class Console(Plugin):
 
         self.base = Ctx(cfg=cfg, market=mk, app=app, states=pf_states(app.shared), registry=registry, strategies=strategies, strategy=None,
                         symbol_of=lambda t: symbol_of.get(int(t), str(t)), filters=app.shared.setdefault(("console_filters", None), Filters()),
-                        net_all=q.net_positions(trades, feed, symbols, mk.price_div),
+                        net_all=q.net_positions(trades, feed, symbols, mk.price_div, mk.expense_per_crore, kinds),
                         tz_label="IST" if mk.code == "NSE" else mk.tz, logo_src=self._logo(), time=TimeTools(mk.tz),
-                        trades=trades, acks=acks, feed=feed, symbols=symbols, fills=fills,
+                        trades=trades, acks=acks, feed=feed, symbols=symbols, kinds=kinds, fills=fills,
                         messages=q.tag(q.messages(events, cfg.event_cols, mk.tz), "Pf", smap),
                         book_all=q.order_book(acks, fills, symbols, mk.price_div, cfg.order_time, mk.tz),
                         limits=limits_of(app.shared, f"{app.paths.state}/limits.json"), guard=guard_of(app, f"{app.paths.state}/limits.json"))

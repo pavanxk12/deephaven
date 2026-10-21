@@ -121,7 +121,7 @@ def test_a_turnover_breach_switches_only_that_strategy_off_and_it_cannot_be_swit
     assert g.set_limit("a", "turnover", 3) == "" and set_sending(app, svc, "a", True) == "" and svc.allowed("a")
 
 
-def test_an_m2m_breach_squares_up_every_portfolio_of_the_strategy_and_switches_it_off(console):
+def test_an_m2m_breach_squares_up_and_unsubscribes_every_portfolio_of_the_strategy_and_switches_it_off(console):
     app, svc, wire = console
     pf = started(app, svc, wire, user=3, name="a", instrument=1, option=55)
     started(app, svc, wire, user=4, name="b", instrument=2, option=66)
@@ -130,12 +130,12 @@ def test_an_m2m_breach_squares_up_every_portfolio_of_the_strategy_and_switches_i
     g = Guard(app, app.shared.setdefault("limits", Limits()))
     g.set_limit("a", "m2m", -10000)
     g.on_values("a", 1.0, -10000)
-    assert wait_for(lambda: len(wire.sent) == 2)
-    assert [(lab, p["user_id"]) for _, lab, p in wire.sent] == [("pause_unpause:Pause", 3), ("squareup", 3)]        # only a's portfolio (user 3), paused first
+    assert wait_for(lambda: len(wire.sent) == 3)
+    assert [(lab, p["user_id"]) for _, lab, p in wire.sent] == [("pause_unpause:Pause", 3), ("squareup", 3), ("unsubscribe", 3)]      # only a's portfolio (user 3): paused, squared up, unsubscribed
     assert not svc.allowed("a") and svc.allowed("b")
     g.on_values("a", 1.0, -12000)
-    assert len(wire.sent) == 2                                            # one square up per breach, not one per tick
-    assert wait_for(lambda: svc.pf_state(pf, 3).squared and svc.pf_state(pf, 3).paused)
+    assert len(wire.sent) == 3                                            # one square up per breach, not one per tick
+    assert wait_for(lambda: svc.pf_state(pf, 3).squared and svc.pf_state(pf, 3).paused and not svc.pf_state(pf, 3).subscribed)
 
 
 def test_the_message_is_in_the_nats_events_table_and_a_stopped_service_does_not_crash(console):

@@ -90,7 +90,7 @@ def test_the_default_folder_is_paths_saved_and_the_day_defaults_to_today(tmp_pat
     app.tables["candles"] = FT(pd.DataFrame({"a": [1]}))
     save_tables(app, ("candles",))
     today = datetime.now(app.market.zone).strftime("%Y-%m-%d")
-    assert (tmp_path / "work" / "fo_market_data" / f"candles_{today}.parquet").exists()
+    assert (tmp_path / "md" / f"candles_{today}.parquet").exists() and not (tmp_path / "work" / "fo_market_data").exists()
 
 
 def test_a_folder_given_to_the_call_wins(session):

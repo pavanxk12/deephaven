@@ -4,6 +4,8 @@ One portfolio (PF) = one option contract for its whole life. A stock's PF is cre
 numbered `highest known + 1`; numbers are never reused. A book that has a `user` takes its numbers from the portfolio registry
 (algo.strategy.registry), so no two strategies, and no screen, can be given the same number for that user. The two JSON files hold what must survive a restart:
     pf_map  : future token -> PF          pf_sub : PF -> option token it is subscribed to
+With ALGO_STATE_STORE=postgres (algo.core.statedb) they are the tables algo_pf_map and algo_pf_sub (keyed by the file's name), written first; the files are then written too, as a backup copy
+(a failure there is only logged). The files are read only once: when a table has no rows for the book they are imported.
 Everything else (caps, paused, live legs, allow switches) lives in memory and survives a plugin restart via `app.shared`.
 """
 from __future__ import annotations
@@ -46,11 +48,12 @@ def _write_json(path: str, obj: dict) -> None:
 
 class Portfolios:
     def __init__(self, map_file: str, sub_file: str, pf_start: int = FIRST_PF, registry=None, user: int | None = None,
-                 owner: str = ""):
+                 owner: str = "", db=None):
         self.map_file, self.sub_file, self.pf_start = map_file, sub_file, pf_start
+        self.db = db                                              # a StateDB: the two maps live in Postgres (the files are only imported once)
         self.registry, self.user, self.owner = registry, user, owner      # set: numbers come from the registry, as `user`
-        self.pf_map: dict[int, int] = _read_ints(map_file)        # future token -> PF   (persisted)
-        self.subscribed: dict[int, int] = _read_ints(sub_file)    # PF -> option token   (persisted)
+        self.pf_map: dict[int, int] = self._load("algo_pf_map", map_file)        # future token -> PF   (persisted)
+        self.subscribed: dict[int, int] = self._load("algo_pf_sub", sub_file)    # PF -> option token   (persisted)
         self.caps: dict[int, int] = {}                            # PF -> cumulative maxqty
         self.paused: set[int] = set()                             # PFs the bridge confirmed as paused
         self.allow: dict[int, bool] = {}                          # future token -> automation may send params
@@ -220,7 +223,7 @@ class Portfolios:
     def subscribe(self, pf: int, option_token: int) -> None:
         with self._lock:
             self.subscribed[pf] = option_token
-            _write_json(self.sub_file, self.subscribed)
+            self._store("algo_pf_sub", self.sub_file, self.subscribed)
         self.changed()
 
     def set_paused(self, pf: int, paused: bool) -> None:
@@ -240,7 +243,38 @@ class Portfolios:
 
     def save_map(self) -> None:
         with self._lock:
-            _write_json(self.map_file, self.pf_map)
+            self._store("algo_pf_map", self.map_file, self.pf_map)
+
+    # ---- where the two maps live: files, or Postgres ----------------------------------------------------------------------------
+    def _load(self, table: str, path: str) -> dict[int, int]:
+        if self.db is None:
+            return _read_ints(path)
+        book = os.path.basename(path)
+        data = self.db.load_ints(table, book)
+        if data is None:
+            data = _read_ints(path)                               # no rows yet: import the old file, once
+            if data:
+                self.db.save_ints(table, book, data)
+                from algo.core import log
+                log.get("book").info("imported %d entries from %s into the table %s", len(data), path, table)
+        if data:
+            try:
+                _write_json(path, data)                           # the backup file now says exactly what the table says
+            except Exception as e:
+                from algo.core import log
+                log.get("book").warning("the backup file %s could not be written (%r)", path, e)
+        return data
+
+    def _store(self, table: str, path: str, data: dict) -> None:
+        if self.db is None:
+            _write_json(path, data)
+            return
+        self.db.save_ints(table, os.path.basename(path), data)       # Postgres first: a failure is raised
+        try:
+            _write_json(path, data)                                   # ... then the backup copy in the file: a failure is only logged
+        except Exception as e:
+            from algo.core import log
+            log.get("book").warning("the backup file %s could not be written (%r); the data is safe in Postgres", path, e)
 
 
 class Book(Plugin):
@@ -256,6 +290,7 @@ class Book(Plugin):
         self.state: Portfolios | None = None
 
     def start(self) -> None:
+        from algo.core.statedb import state_db
         state_dir = self.app.paths.state
         suffix = "" if self.name == "book" else f"_{self.name}"
         map_file = self.map_file or os.path.join(state_dir, f"pf_map{suffix}.json")
@@ -263,13 +298,14 @@ class Book(Plugin):
         key = ("portfolios", map_file, sub_file)
         self.state = self.app.shared.get(key)
         if self.state is None:
-            self.state = self.app.shared[key] = Portfolios(map_file, sub_file, self.pf_start)
+            self.state = self.app.shared[key] = Portfolios(map_file, sub_file, self.pf_start, db=state_db(self.app.shared))
         if self.user is not None:
             self.state.registry, self.state.user, self.state.owner = self.app[self.registry_name].state, self.user, self.name
             clashes = self.state.claim_existing()
             for c in clashes:
                 self.log.error("CLASH: %s. This book still uses it; one of the two must change", c)
-            self.log.info("files %s, %s; user %s; new portfolios come from the registry starting at %s%s", map_file, sub_file,
+            self.log.info("%s; user %s; new portfolios come from the registry starting at %s%s",
+                          "Postgres tables algo_pf_map / algo_pf_sub, book " + os.path.basename(map_file) if self.state.db is not None else f"files {map_file}, {sub_file}",
                           self.user, self.pf_start, f"; {len(clashes)} CLASHES" if clashes else "")
             return
         self.state.registry = self.state.user = None

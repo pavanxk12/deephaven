@@ -370,3 +370,45 @@ def test_a_strategy_sends_its_own_strategyname_on_subscribe_and_unsubscribe(cons
     subs = {p["T1"]: p for _, lab, p in wire.sent if lab == "subscribe"}
     assert subs[55]["strategyname"] == "MyLogic" and "strategyname" not in subs[66]        # the service no longer adds one
     assert subs[55]["gtw"] == 32395                                                       # the rest of the service's defaults are kept
+
+
+# ---- algo_stop closes the automation down, then stops it ---------------------------------------------------------------------
+def test_algo_stop_pauses_squares_up_and_unsubscribes_every_portfolio_then_stops(console):
+    app, svc, wire = console
+    algo_start(4, "mine", pf_start=2000)
+    on("mine")
+    a = pf_assign("mine", 1, 55)
+    b = pf_assign("mine", 2, 66)
+    assert pf_activate(a, "CALL", {}) and pf_activate(b, "PUT", {})
+    assert wait_for(lambda: all(labels(wire, pf)[-1:] == ["pause_unpause:UnPause"] for pf in (a["pf"], b["pf"])))     # both subscribed and running
+    wire.sent.clear()
+    algo_stop("mine")
+    for pf in (a["pf"], b["pf"]):
+        assert labels(wire, pf) == ["pause_unpause:Pause", "squareup", "unsubscribe"], labels(wire, pf)        # in this order, on each portfolio
+    assert not {"mine", "mine_book", "mine_bridge"} & set(app.plugins)                                     # and only then it stopped (it waited for them)
+    assert not svc.is_enabled("mine")
+
+
+def test_algo_stop_does_not_stop_while_the_portfolios_cannot_be_unsubscribed_and_can_be_forced(console, capsys):
+    app, svc, wire = console
+    algo_start(4, "mine", pf_start=2000)
+    on("mine")
+    a = pf_assign("mine", 1, 55)
+    assert pf_activate(a, "CALL", {})
+    assert wait_for(lambda: labels(wire, a["pf"])[-1:] == ["pause_unpause:UnPause"])
+    api.nats_send(False, client="mine")                                                                    # sending is OFF (a breach, or switched off by hand)
+    wire.sent.clear()
+    algo_stop("mine")
+    out = capsys.readouterr().out
+    assert "NOT stopped" in out and "unsubscribe=False" in out and "mine" in app.plugins and wire.sent == []
+    algo_stop("mine", unsubscribe=False)                                                                   # stop it as it is
+    assert "mine" not in app.plugins and wire.sent == []
+
+
+def test_algo_stop_of_an_automation_with_no_portfolios_just_stops(console):
+    app, svc, wire = console
+    algo_start(4, "mine", pf_start=2000)
+    on("mine")
+    algo_stop("mine")
+    assert "mine" not in app.plugins and wire.sent == []
+    algo_stop("ghost")                                                                                     # an unknown name is not an error

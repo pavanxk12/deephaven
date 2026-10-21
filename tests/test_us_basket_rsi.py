@@ -35,7 +35,7 @@ MY_BASKET = '    BASKETS = {"us_stocks": ["NIFTY", "A1", "A2"]}\n'              
 DAY0 = np.datetime64("2026-10-19T14:00")                                                # the first live minute (UTC), after the history days
 
 
-def start(tmp_path, monkeypatch, status="ok", window=ALWAYS_OPEN, basket=MY_BASKET, abs_pct=50.0, abs_idx=11, rsi_live=True, **replace):
+def start(tmp_path, monkeypatch, status="ok", window=ALWAYS_OPEN, basket=MY_BASKET, abs_pct=50.0, abs_idx=11, rsi_live=True, exit_at="dtime(23, 59, 59)", **replace):
     ns, app, svc, wire = console_with_services(tmp_path, monkeypatch, status)
     calls = []
 
@@ -56,6 +56,8 @@ def start(tmp_path, monkeypatch, status="ok", window=ALWAYS_OPEN, basket=MY_BASK
     assert OPEN_WINDOW in SCRIPT and USER_ID in (3, 4)                                                # the test service allows users 3 and 4
     _, b0, b1 = basket_block(SCRIPT)
     src = (SCRIPT[:b0] + basket + SCRIPT[b1:]).replace(OPEN_WINDOW, window)
+    assert "EXIT_AT = dtime(15, 55)" in src, "the time exit input is missing"
+    src = src.replace("EXIT_AT = dtime(15, 55)", f"EXIT_AT = {exit_at}")                              # the tests choose when the time exit comes: late by default, so the real clock never matters
     src = re.sub(r"RSI_LIVE = (True|False)", f"RSI_LIVE = {rsi_live}", src)                            # the owner's choice is an input; each test says which it means
     for old, new in replace.items():
         assert old in src, old
@@ -211,4 +213,41 @@ def test_with_finished_bars_only_the_newest_bar_is_left_out_so_one_more_bar_is_n
     assert wire.sent == []
     feed(fake_dh, [100.0 - 0.25 * i for i in range(50, 55)], first=50)                            # the 11th bar begins: 10 finished bars, RSI 0
     assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][1] == "subscribe"
+    svc.on_stop()
+
+
+def test_the_time_exit_is_five_minutes_before_the_close_by_default():
+    assert "EXIT_AT = dtime(15, 55)" in SCRIPT and "time exit" in SCRIPT
+
+
+def test_no_entry_is_made_once_the_time_exit_has_come_even_inside_the_window(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch, exit_at="dtime(0, 0, 1)")
+    feed(fake_dh, [100.0 - 0.25 * i for i in range(60)])                                           # a falling stock: it would be bought if entries were allowed
+    time.sleep(0.2)
+    assert wire.sent == []
+    svc.on_stop()
+
+
+def test_at_the_time_exit_every_open_position_is_squared_up_on_the_next_candle(tmp_path, fake_dh, monkeypatch):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.hour == 23 and now.minute >= 58:
+        pytest.skip("too close to midnight to place the exit a few seconds ahead")
+    when = (now + timedelta(seconds=5)).time()
+    last = write_history(tmp_path, ["2020-01-14", "2020-01-15"])
+    ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch, exit_at=f"dtime({when.hour}, {when.minute}, {when.second})")
+    entry = last - 0.25
+    feed(fake_dh, [entry])
+    assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][1] == "subscribe"               # the entry, before the exit time
+    time.sleep(1.0)
+    feed(fake_dh, [entry * 1.001], first=1)                                                        # a small move: neither target nor stop
+    time.sleep(0.3)
+    assert len(wire.sent) == 1                                                                     # still open, the exit time has not come
+    end = time.time() + 8
+    while datetime.now(ZoneInfo("America/New_York")).time() < when and time.time() < end:
+        time.sleep(0.1)
+    time.sleep(0.2)
+    feed(fake_dh, [entry * 1.001], first=2)                                                        # the next candle after the exit time
+    assert wait_for(lambda: len(wire.sent) == 2) and wire.sent[1][:2] == ("cmd.hft.1001", "squareup")
     svc.on_stop()

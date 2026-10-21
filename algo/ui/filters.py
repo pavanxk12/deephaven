@@ -29,8 +29,8 @@ def plain(x) -> str:
 
 
 def number_of(text):
-    """What was typed in a limit box -> a number, or None for an empty box. Commas, spaces and ₹ are ignored. Raises ValueError for anything else."""
-    t = str(text if text is not None else "").replace(",", "").replace("₹", "").replace(" ", "").strip()
+    """What was typed in a limit box -> a number, or None for an empty box. Commas, spaces, ₹ and $ are ignored. Raises ValueError for anything else."""
+    t = str(text if text is not None else "").replace(",", "").replace("₹", "").replace("$", "").replace(" ", "").strip()
     return None if t == "" else float(t)
 
 

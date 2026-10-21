@@ -53,6 +53,7 @@ Three rules hold the design together:
 | **candles** | turns the live feed into closed bars | `candles_start("1min", ...)` | Deephaven's listener thread (no own thread) | `candles` |
 | **straddle** | V / D straddle series per underlying and expiry, from candles | `straddle_start(0)` | one sampler thread `algo-straddle` + candle listener | `straddle_series` |
 | **eod** | saves whole tables to Parquet once a day | `eod_auto()` (or `eod_save()` now) | one thread `algo-eod` | files, `candles_hist`... on load |
+| **schedule** | starts the day by itself and closes it: master, candles, registry, NATS, console at set times; at the close saves the candles and straddle tables, then stops the straddle and candles | `day_auto()` | one thread `algo-schedule` | none of its own (it starts the others) |
 | **registry** | the portfolio registry: (user, number) -> strategy, name, owner | `registry_start()` | caller's (a small file append) | `portfolio_registry`, `portfolio_registry_log` |
 | **nats** | the ONE command service | `nats_start(ip, port, users=[...])` | one asyncio loop thread `algo-nats` | `cmd_queue_automated`, `nats_events`, `portfolio_state_log` |
 | **console** | the operator dashboards | `app.run(algo.Console())` | Deephaven UI render threads | `operator_console`, `<strategy>` |
@@ -141,7 +142,7 @@ the algo's own roll-up. The indicator (e.g. Wilder RSI) is computed in the scrip
 
 * A **portfolio** is identified by **(user, number)**. The same number under two users is two portfolios; a user never gets a number twice.
   Numbers start at **1001** (`FIRST_PF`) unless an algo gives `pf_start`.
-* **Registry** (`algo/strategy/registry.py`): append-only JSONL file `portfolio_registry.json` in the state folder. For each (user, number) it
+* **Registry** (`algo/strategy/registry.py`): the Postgres table `algo_portfolios` when `ALGO_STATE_STORE=postgres` (see "State in Postgres" below), else the append-only JSONL file `portfolio_registry.json` in the state folder. For each (user, number) it
   remembers `owner` (the book), `algo` (the strategy), `name` (what it trades), `created`, `note`. `allocate/create` reserve a number *before* returning it.
   Tables `portfolio_registry` (current record) and `portfolio_registry_log` (every change).
 * **Book** (`algo/strategy/book.py`): one per automation (`<name>_book`). It decides *which portfolio an instrument and option map to*:
@@ -229,7 +230,7 @@ empty and each book re-adopts what it had subscribed.
 * **Limits** are also a live table: `strategy_limits` (one row per strategy: both limits, turnover and M2M now, breached or not; `strategy_limits_log` keeps every change), built in `Console._limits_table` from `Limits`, the registry and `q.strategy_totals`; the strategy window shows its row, `operator_console` shows the table. One table listener feeds the guard for every strategy.
 * **Limits** (`algo/core/limits.py` numbers and latches, `algo/strategy/guard.py` the action): a strategy window has a **turnover limit (₹)** and an **M2M limit (₹)** box in its Summary,
   changeable any time (0 = none). The console feeds the guard the strategy's whole-day turnover and gross M2M from a server-side table listener on every change, so it works with no browser open.
-  Turnover at/above its limit: that strategy's sending switch goes OFF. M2M at/below its limit (the number as typed, -5000 means -5000): its subscribed portfolios (registry algo = the strategy, each under its own user) are paused and squared up
+  Turnover at/above its limit: that strategy's sending switch goes OFF. M2M at/below its limit (the number as typed, -5000 means -5000): its subscribed portfolios (registry algo = the strategy, each under its own user) are paused, squared up and unsubscribed
   as operator commands, then its switch goes OFF. Either way a row goes to `nats_events` (`cmd = limit`), the window shows LIMIT BREACHED and the ON / OFF button flips to OFF. The breach is **latched**: ON (the button,
   or `nats_send(True, client=...)`) is refused until the limit is set to a value the strategy is no longer past; changing it does not switch ON by itself. State: `<work>/state/limits.json`.
 * Memory/CPU: every table is a lazy chain; per-row text is joined, not stored; the whole-day net table per strategy is created when its window renders.
@@ -244,9 +245,9 @@ empty and each book re-adopts what it had subscribed.
 | where | what |
 |---|---|
 | `/data/fo_market_data/` (read-only mount) | contract `.db3`, `stocks.txt`, `logo.png`, history to load |
-| `/data/deephaven/state/` | `portfolio_registry.json`, per-algo `pf_map`/`pf_sub` files |
+| `/data/deephaven/state/` | `portfolio_registry.json`, per-algo `pf_map`/`pf_sub` files, `limits.json` (the state itself; with `ALGO_STATE_STORE=postgres` they are a backup copy of what is in Postgres) |
 | `/data/deephaven/cache/` | master pickles |
-| `/data/deephaven/fo_market_data/` or your `eod_dir` | `candles_<day>.parquet`, `straddle_<day>.parquet` (+ `.meta.json`) |
+| `/data/fo_market_data/` (the market-data folder, mounted writable) or your `eod_dir` | `candles_<day>.parquet`, `straddle_<day>.parquet` (+ `.meta.json`) |
 
 Published tables (Deephaven IDE variables): `candles`, `straddle_series`, `portfolio_registry`, `portfolio_registry_log`, `cmd_queue_automated`, `nats_events`,
 `portfolio_state_log` (the NATS service's), `strategy_limits`, `strategy_limits_log`, `portfolio_states_log`, `pf_by_option` (the console's), and the windows `operator_console` and one
@@ -329,3 +330,20 @@ the single-order strategy names its contract `TOKEN`), and the live read of `rel
 
 Open items: the subscribe payload defaults are service-wide (a strategy adds its own fields with `algo_start(..., subscribe={...})`); one NATS server per service; the candle
 builder is a Python loop (the main CPU cost); `candles_start`/`master_build` are not start-once; the trades-event mapping (contracts, qty, M2M per portfolio) is the next piece.
+
+## State in Postgres (`algo/core/statedb.py`)
+
+With `ALGO_STATE_STORE=postgres` in the Deephaven service's environment, the registry, each strategy's book and the limits live in four small tables of the `algofusion` database
+instead of JSON files (created if missing; nothing existing is touched): `algo_portfolios (user_id, pf, owner, name, algo, created, note, updated_at)` primary key (user_id, pf);
+`algo_pf_map (book, token, pf)` and `algo_pf_sub (book, pf, option_token)`, where `book` is the book's file name such as `pf_map_nifty_rsi_book.json`; `algo_limits (strategy, turnover, m2m, turnover_hit, m2m_hit, updated_at)`.
+The login is the one the contract master uses (`AUTOMATION_DATABASE_URL`, or `ALGO_PG_PASSWORD`; host `postgres`). Each write is one upsert (or one transaction for a book's map) committed before the caller is answered, and a failed write is
+raised and undone in memory, so a number is never handed out and then lost. The same change is then also written to the old JSON file as a BACKUP COPY (best effort: a failure there is only logged and never stops a write), and at every start the files are rewritten from the tables, so they always say what Postgres says. A dropped connection is retried once on a new one. If Postgres cannot be reached when the registry, a book or the limits start, they REFUSE to start and say why (starting empty would hand out numbers
+already in use); `day_auto` retries the registry step every minute. The first time a table is empty and the old JSON file exists, the file is imported; after that the table is the only source (a file that was changed by hand is overwritten at the next start).
+Each server has its own Postgres, so each keeps its own numbers. Without the variable nothing changes: the JSON files are used.
+
+## Expense, net M2M and currency (the console summary)
+
+`net_positions` (algo/ui/tables.py) gives every traded instrument `M2M` = the GROSS result (realised + unrealised), `Expense` and `NetM2M = M2M - Expense`. The summary window shows, in this order: REALISED, UNREALISED, GROSS M2M (their sum), EXPENSE,
+NET M2M (gross less expense); the positions table has the same two columns. The expense is rupees per crore (1.0E7) of the value BOUGHT and of the value SOLD, by instrument kind, from `Market.expense_per_crore`:
+NSE futures 600 buy / 5,400 sell, options 5,625 / 20,328, equity 200 / 200 (US: none, so no expense tiles). The kind of each instrument comes from the contract master (`kind_table`: its own option, future and equity lists), and only a token the master
+does not know falls back to the symbol text ("... CE" / "... PE" option, "... FUT" future; the space matters, RELIANCE is a stock). The limits still use the gross M2M. Every money figure, TURNOVER included, is the actual amount (not crores or millions), with `Market.currency` (rupee for NSE, `$` for the US); the per-crore rates are only used to work out the expense. The queries were run in a real Deephaven session against hand-computed values.

@@ -17,9 +17,10 @@
                                                          it follows the table if the service restarts it (candles_start again)
     algo_portfolios("stocks")                            its portfolios, as a table
     algo_pause("stocks"), algo_unpause, algo_exit, algo_unsubscribe      the same command for all of its portfolios
+    algo_stop("stocks")                                  pause + square up + unsubscribe all of them, wait for it, THEN stop the automation (see its description)
 
 Your script reacts to the market with an ordinary function and a listener, like your old scripts did; these functions never wait for the
-network, so they are safe to call from the listener. Nothing here raises because a service is down or sending is off: an unknown name or a
+network, so they are safe to call from the listener (algo_stop is the one exception: it waits for the unsubscribes, so call it from the terminal). Nothing here raises because a service is down or sending is off: an unknown name or a
 service that is not running prints a plain message and the call returns None / False.
 
 An instrument with several portfolios (several strikes of one future) uses `slot=0, 1, 2 ...`.
@@ -301,8 +302,27 @@ def algo_sending(strategy: str) -> bool:
     return isinstance(run, _AlgoRun) and run.nats.sending
 
 
-def algo_stop(strategy: str) -> None:
-    """Stop an automation (its book and bridge; its portfolios and numbers are kept)."""
+def algo_stop(strategy: str, unsubscribe: bool = True, wait_s: float = 30.0) -> None:
+    """Stop an automation: first close it down on the trading side, then stop it.
+
+    By default it does what algo_exit does (pauses and squares up every portfolio) AND unsubscribes every current portfolio, waits for those commands to finish
+    (up to `wait_s` seconds), and only then stops the automation (its book, bridge and candle listeners; the portfolio numbers and files are kept).
+    If the portfolios cannot be unsubscribed because sending is OFF (a switched-off strategy, a breached limit) or the NATS service is down, NOTHING is stopped and it says
+    so: switch the strategy ON and call it again, or algo_stop(name, unsubscribe=False) to stop it as it is (its portfolios stay subscribed, positions open).
+    A dry run, or an automation with no portfolios, just stops. It waits, so call it from the terminal, not from a listener."""
+    run = current().get(strategy) if strategy else None
+    if unsubscribe and isinstance(run, _AlgoRun):
+        bridge = run.nats.bridge
+        if not bridge.dry_run and bridge.book is not None and bridge.book.current_pfs():
+            futures = bridge.unsubscribe_all()
+            if futures is None:
+                print(f"{strategy}: NOT stopped: its portfolios could not be unsubscribed (sending is OFF or the NATS service is down). Switch it ON and call algo_stop again, "
+                      f"or algo_stop({strategy!r}, unsubscribe=False) to stop it as it is, with its portfolios still subscribed")
+                return
+            from concurrent.futures import wait
+            _, pending = wait(futures, timeout=wait_s)
+            if pending:
+                print(f"{strategy}: {len(pending)} of {len(futures)} portfolio(s) were still being unsubscribed after {wait_s:g} s; stopping now, watch the log")
     current().stop(strategy)
 
 

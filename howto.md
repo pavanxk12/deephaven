@@ -15,6 +15,8 @@ registry_start()                                    # the portfolio numbers
 nats_start("192.168.1.130", 4222, users=[3, 4])     # the commands, for every user that will send
 algo_status()
 ```
+By itself, on a timer: `day_auto()` (NSE: master 09:00:00, candles + registry + NATS + console 09:14:30, 15:30 save of the candles and straddle tables then stop of the straddle and candles; `day_auto("08:45", "09:10", "09:10:30", "15:35")`
+for your own times, `day_auto(stop=True)` to switch it off; run.md section 0).
 Calling any of these again does no harm to the NATS service and the registry (they say "already running"). `candles_start` and `master_build`
 start over when called again, so run them once.
 
