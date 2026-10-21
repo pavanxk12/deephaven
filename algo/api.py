@@ -299,9 +299,32 @@ def _clock(text, what: str):
     raise ValueError(f'{what} must look like "09:00" or "09:14:30" (exchange time), got {text!r}')
 
 
-def _close_day() -> None:
-    """The end of the day: save the candles and straddle tables first, then stop the straddle and the candles. A failed save raises (it is tried again) and stops nothing."""
+CLOSE_WAIT_S = 30.0          # after the straddle has been built from the day's candles: let it settle before the tables are saved
+
+
+def _close_day(straddle_n: "int | None" = None) -> None:
+    """The end of the day, in this order:
+        1. the candles are stopped (their table stays, holding the whole day);
+        2. the straddle series is started once: it is built from that table, so it holds the whole day (a straddle that is already running is left as it is, a restart would empty it);
+        3. when that is done, wait CLOSE_WAIT_S (30) seconds;
+        4. the candles and straddle tables are SAVED (eod_save);
+        5. the straddle is stopped.
+    A failed save raises (the step is tried again, the straddle is not started a second time) and the straddle is left running."""
+    import time
     app = _app()
+    app.stop("candles")
+    started = False
+    if straddle_n is not None and app.get("straddle") is None:
+        if app.has("candles"):
+            straddle_start(straddle_n)
+            started = True
+        else:
+            print("straddle: not started, there is no candles table (the candles never ran today)")
+    elif straddle_n is not None:
+        print("straddle: already running, saved as it is")
+    if started:
+        print(f"straddle: built from the day's candles, waiting {CLOSE_WAIT_S:g} s before the save")
+        time.sleep(CLOSE_WAIT_S)
     results = save_tables(app, DEFAULT_TABLES)
     for r in results:
         print(f"  {r['table']:<17} {r['status']:<8} {r['rows']:>12,} rows  {r['path'] or ''}")
@@ -309,22 +332,23 @@ def _close_day() -> None:
     if failed:
         raise RuntimeError(f"saving {', '.join(failed)} failed")
     app.stop("straddle")
-    app.stop("candles")
 
 
 def day_auto(master: str | None = None, candles: str | None = None, services: str | None = None, close: str | None = None, *, users=(3, 4), nats_ip: str | None = None,
              nats_port: int | None = None, timeframe: str = "1min", source: str = "auto", console: bool = True, weekdays_only: bool = True,
-             retries: int = 10, retry_s: float = 60.0, stop: bool = False) -> None:
+             retries: int = 10, retry_s: float = 60.0, straddle: "int | bool | None" = None, stop: bool = False) -> None:
     """Start the day by itself, every trading day, at times of the exchange's clock (NSE: Asia/Kolkata, US: America/New_York):
         master    the contract master (master_build) at `master`                                      default NSE 09:00:00
         candles   candles_start(timeframe) at `candles`                                               default NSE 09:14:30
         services  registry_start(), nats_start(...) and the console, right after the candles          default: the candles' time
-        close     the end of the day at `close`: the candles and straddle tables are SAVED (eod_save), then the     default NSE 15:30
+        close     the end of the day at `close`, in this order: the candles are STOPPED, the straddle series is      default NSE 15:30
+                  STARTED once (built from the whole day's candles), 30 seconds' wait, then the candles and straddle tables are SAVED (eod_save), then the
                   straddle and the candles are stopped. The save comes first, so the files hold the whole day; a straddle that is not running is
                   skipped (it says so), and one started late is saved with what it has (stopping and starting it again would empty its table).
                   close=False leaves the end of the day out (eod_auto() can still save). If the save fails it is tried again and nothing is stopped.
     day_auto()                                  the defaults above
     day_auto("08:45", "09:10", "09:10:05", "15:35")   your own times ("HH:MM" or "HH:MM:SS");  day_auto(stop=True) switches it off (what is already running keeps running)
+    straddle=False leaves the straddle out of the close, straddle=1 starts the two nearest expiries (default: NSE straddle_start(0), the US none); one that is already running is not restarted.
     A container started after the close does not start the candles (they would build nothing); the master, registry, NATS and console still start.
     At one time the steps run in this order: master, candles, registry, NATS, console. A step already due when you call it (the container came up late) runs at once;
     one that fails (Postgres not ready, the feed not up yet) is tried again every `retry_s` seconds, `retries` times. `source` is master_build's: "auto" = Postgres,
@@ -354,8 +378,11 @@ def day_auto(master: str | None = None, candles: str | None = None, services: st
             from algo.ui.console import Console
             _app().run(Console())
         steps.append(Step("console", at_services, open_console))
+    n_straddle = market.straddle_at_close if straddle is None else (None if straddle is False else straddle)
+    if n_straddle is not None and (isinstance(n_straddle, bool) or not isinstance(n_straddle, int) or n_straddle < 0):
+        raise ValueError(f"straddle must be 0, 1, 2, ... (how many expiries beyond the nearest), False or None, got {straddle!r}")
     if at_close is not None:
-        steps.append(Step("close", at_close, _close_day))
+        steps.append(Step("close", at_close, lambda: _close_day(n_straddle)))
     _run(DaySchedule(steps, weekdays_only=weekdays_only, retries=retries, retry_s=retry_s))
 
 

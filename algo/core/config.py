@@ -39,6 +39,7 @@ class Market:
     start_master: dtime = dtime(9, 0)             # day_auto(): when the contract master is built every trading day (exchange tz)
     start_candles: dtime = dtime(9, 14, 30)       # day_auto(): when the candles start forming; the registry, NATS and the console start with them, right after
     close_at: dtime = dtime(15, 30)               # day_auto(): when the candles and straddle tables are saved and the builders stopped
+    straddle_at_close: "int | None" = None        # day_auto(): at the close, start the straddle series (straddle_start(n)) once, built from the whole day's candles, before the save; None = not started
     currency: str = "\u20b9"                      # the symbol the console shows on every money figure (rupee)
     expense_per_crore: Mapping[str, tuple] = field(default_factory=dict)   # the console's EXPENSE: {"FUT": (buy, sell), "OPT": (...), "EQ": (...)} in rupees per crore (1.0E7) of the value bought / sold; none = no expense shown
     contract_columns: Mapping[str, str] = field(default_factory=lambda: dict(CONTRACT_COLUMNS))
@@ -56,6 +57,7 @@ NSE = Market(
     code="NSE", tz="Asia/Kolkata", ltt_tz="Asia/Kolkata", ltt_fmt="%d-%m-%Y %H:%M",
     price_div=100.0, expiry_epoch="1980-01-01", strike_div=100.0, tick_div=100.0,
     session=(dtime(9, 15), dtime(15, 30)), trade_window=(dtime(9, 20), dtime(15, 0)),
+    straddle_at_close=0,                                                                               # straddle_start(0): the nearest option expiry, started at the close, then saved
     expense_per_crore={"FUT": (600.0, 5400.0), "OPT": (5625.0, 20328.0), "EQ": (200.0, 200.0)},       # (rupees per crore bought, per crore sold), given by the owner
 )
 

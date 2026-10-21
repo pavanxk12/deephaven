@@ -292,7 +292,7 @@ algo/comms/     nats_service.py
 algo/strategy/  registry.py book.py bridge.py config.py guard.py
 algo/ui/        console.py tables.py filters.py
 algo/           api.py (functions you type)  automation.py (functions an algo script uses)  lookup.py (contract/price lookups)
-examples/       00_services.py .. 08_us_basket_rsi_crossorder.py   (plain scripts; 03/04/06/07/08 compute their own RSI and sizing; 07 and 08 keep all their names inside one function)
+examples/       00_services.py .. 10_us_zscore_crossorder.py   (plain scripts; 03/04/06/07/08 compute their own RSI and sizing, 10 a z-score; 07, 08 and 10 keep all their names inside one function)
 scripts/        00_install .. 05_start_day.py   (the lines you paste; 05 is the whole start-up, which the India host's init.py also runs at every container start)
 tests/          pytest, no Deephaven needed
 ```

@@ -134,6 +134,7 @@ def session(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(api, "master_build", lambda *a, **k: calls.append(("master", a, k)))
     monkeypatch.setattr(api, "candles_start", lambda *a, **k: calls.append(("candles", a, k)))
+    monkeypatch.setattr(api, "straddle_start", lambda *a, **k: calls.append(("straddle", a, k)))
     monkeypatch.setattr(api, "registry_start", lambda *a, **k: calls.append(("registry", a, k)))
     monkeypatch.setattr(api, "nats_start", lambda *a, **k: calls.append(("nats", a, k)))
     seen = []
@@ -181,17 +182,20 @@ def test_nse_closes_the_day_at_1530():
     assert NSE.close_at == dtime(15, 30)
 
 
-def test_the_close_saves_both_tables_first_then_stops_the_straddle_and_the_candles(session, monkeypatch):
+def test_the_close_stops_the_candles_starts_the_straddle_waits_30_seconds_saves_both_tables_then_stops_the_straddle(session, monkeypatch):
     app, calls, seen = session
     events = []
     monkeypatch.setattr(api, "save_tables", lambda a, tables: events.append(("save", tuple(tables))) or [
         {"table": "candles", "status": "saved", "rows": 10, "path": "c.parquet"}, {"table": "straddle_series", "status": "saved", "rows": 5, "path": "s.parquet"}])
     monkeypatch.setattr(app, "stop", lambda name: events.append(("stop", name)))
+    monkeypatch.setattr(app, "has", lambda name: True)
+    monkeypatch.setattr(api, "straddle_start", lambda n: events.append(("straddle_start", n)))
+    monkeypatch.setattr("time.sleep", lambda s: events.append(("wait", s)))
     api.day_auto()
     close = seen[0].steps[-1]
     assert close.label == "close"
     close.run()
-    assert events == [("save", ("candles", "straddle_series")), ("stop", "straddle"), ("stop", "candles")]       # the whole day is on disk before anything stops
+    assert events == [("stop", "candles"), ("straddle_start", 0), ("wait", 30.0), ("save", ("candles", "straddle_series")), ("stop", "straddle")]
 
 
 def test_a_straddle_that_is_not_running_is_just_skipped_by_the_save(session, monkeypatch):
@@ -200,9 +204,10 @@ def test_a_straddle_that_is_not_running_is_just_skipped_by_the_save(session, mon
     monkeypatch.setattr(api, "save_tables", lambda a, tables: [{"table": "candles", "status": "saved", "rows": 10, "path": "c"},
                                                                 {"table": "straddle_series", "status": "missing", "rows": 0, "path": None}])
     monkeypatch.setattr(app, "stop", lambda name: events.append(name))
+    monkeypatch.setattr("time.sleep", lambda s: None)
     api.day_auto()
     seen[0].steps[-1].run()
-    assert events == ["straddle", "candles"]                                                                      # stopping what is not running is harmless
+    assert events == ["candles", "straddle"]                                                                      # stopping what is not running is harmless
 
 
 def test_a_failed_save_raises_so_it_is_tried_again_and_nothing_is_stopped(session, monkeypatch):
@@ -210,10 +215,11 @@ def test_a_failed_save_raises_so_it_is_tried_again_and_nothing_is_stopped(sessio
     events = []
     monkeypatch.setattr(api, "save_tables", lambda a, tables: [{"table": "candles", "status": "failed", "rows": 0, "path": None}])
     monkeypatch.setattr(app, "stop", lambda name: events.append(name))
+    monkeypatch.setattr("time.sleep", lambda s: None)
     api.day_auto()
     with pytest.raises(RuntimeError, match="saving candles failed"):
         seen[0].steps[-1].run()
-    assert events == []
+    assert events == ["candles"]                                                                                  # the candles were stopped first; the straddle is NOT stopped after a failed save
 
 
 def test_close_can_be_left_out_or_moved_and_must_come_after_the_candles(session):
@@ -239,3 +245,36 @@ def test_a_container_started_after_the_close_does_not_start_the_candles(tmp_path
 def test_the_us_day_has_the_nse_shape_in_new_york_time():
     assert (US.start_master, US.start_candles, US.close_at) == (dtime(9, 15), dtime(9, 29, 30), dtime(16, 0))
     assert US.start_master < US.start_candles < US.session[0] and US.close_at == US.session[1]
+
+
+def test_a_running_straddle_is_not_started_again_and_nothing_starts_without_candles_and_it_can_be_left_out_or_asked_for_more(session, monkeypatch):
+    app, calls, seen = session
+    events = []
+    monkeypatch.setattr(api, "save_tables", lambda a, tables: events.append("save") or [{"table": "candles", "status": "saved", "rows": 1, "path": "c"}])
+    monkeypatch.setattr(api, "straddle_start", lambda n: events.append(("straddle_start", n)))
+    monkeypatch.setattr(app, "stop", lambda name: None)
+    monkeypatch.setattr("time.sleep", lambda s: events.append("wait"))
+    app.plugins["straddle"] = object()                                                                  # already running: left as it is, no wait
+    api.day_auto()
+    seen[-1].steps[-1].run()
+    assert events == ["save"]
+    del app.plugins["straddle"]
+    events.clear()
+    monkeypatch.setattr(app, "has", lambda name: False)                                                 # the candles never ran today: no straddle can be built
+    seen[-1].steps[-1].run()
+    assert events == ["save"]
+    monkeypatch.setattr(app, "has", lambda name: True)
+    events.clear()
+    api.day_auto(straddle=False)                                                                        # left out
+    seen[-1].steps[-1].run()
+    assert events == ["save"]
+    events.clear()
+    api.day_auto(straddle=1)                                                                            # the two nearest expiries
+    seen[-1].steps[-1].run()
+    assert events == [("straddle_start", 1), "wait", "save"]
+    with pytest.raises(ValueError, match="straddle must be"):
+        api.day_auto(straddle=-1)
+
+
+def test_only_the_nse_starts_the_straddle_at_the_close_by_default():
+    assert NSE.straddle_at_close == 0 and US.straddle_at_close is None
