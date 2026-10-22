@@ -279,6 +279,8 @@ per strategy, named after it (`basket_rsi`, `nifty_rsi`, ...); after `eod_load`:
 | **an algo** | the others do not know it exists |
 | **a command times out** | not resent; caller sees `timeout`; look at the bridge before sending again |
 | **a bad feed row** | dropped and counted, never stored |
+| **Deephaven restarted during the day** | scripts pasted into the terminal are gone (positions in them are no longer known: square them up from the console); a stop that was waiting out `squareup_settle_s` loses its unsubscribe, so those portfolios stay subscribed (flat) in the engine; the candles table starts again, so "open" and "VWAP" mean the restart time; `orders_ack` / `orders_trade` / `orders_error` continue from the committed Kafka offset of group `deephaven-hft` and do not show what was consumed before |
+| **the engine's plugin slots are used up** | seen on 130 on 2026-10-22: PFs 31001 to 31032 (32 plugin instances) were created and none after that, while every later `subscribe` was still acknowledged "ok" and nothing reached `orders_ack` / `orders_trade`. The cap is inferred from that pattern, not read from the engine. A portfolio that is squared up but not unsubscribed keeps its slot |
 
 ---
 
@@ -356,3 +358,42 @@ A fill the engine publishes twice (the CrossOrder plugin's) is counted once: `de
 
 **Money display.** Amounts in the console keep two decimals when the market's currency is not the rupee (`$`), and are whole numbers for NSE.
 
+## Contract picker, null symbols and speed (`algo/series/absolute.py`)
+
+`absolute("pct", ..., "SBIN FUT", n)` needs, for each of the n earlier days, the contract that was the nearest unexpired future of SBIN on that day. `ParquetSource._futures_of` finds it in the
+day file's `Symbol` column. Until 2026-10-22 its cache held 64 answers, but a 68-day look-back over 230 stocks needs about 15,000, so every call read the `Symbol` column of 68 files again:
+on 130 that step alone took about 380 ms of the 360 ms a call took; on a PC with the real history, 60 stocks x 68 days: **331 ms per stock before, 0.4 ms after** (first pass 7 ms per stock). Now `_index_of` reads
+each file's `Symbol` column once into `{underlying: [its future names]}` (800 files kept) and the answers are cached up to 200,000 (file, spec). Measured live on 130 with the new wheel: z-scores of 209
+futures in 2.9 s (about 14 ms each; before about 240 to 360 ms each).
+
+A day file can hold a row with a null `Symbol` (130's own end-of-day save of 2026-10-12 had 1,675 of them, tokens the master did not know). `month_contract` used to raise `TypeError` on it, which made
+`absolute_warm` and every later `absolute()` fail; it now skips names that are not text. Scripts 11 and 12 also wrap `month_contract` themselves when they are pasted (once), so they work
+on a wheel that does not have the fix yet.
+
+## India stock-futures scripts (`examples/11_*`, `12_*`)
+
+11 is 08 and 12 is 10 for the NSE. The universe is every stock future in the master that has not expired (index futures NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50 left out; 232 on 2026-10-22),
+dealt one by one into `N_BASKETS = 4` baskets (`fut_1` .. `fut_4`, 58 each). A basket entry is `"SBIN FUT"`: the nearest unexpired future, on each day, so `relative()` ranks today's nearest futures
+against each other and `absolute()` compares a future with the nearest future of each earlier day (open and VWAP are taken from the same contract of that day, so a roll does not add the calendar
+spread). The trade goes to `contract("SBIN")`, the nearest future. 11 seeds its RSI from the last `HIST_DAYS` saved days, picking each day's nearest future by expiry (`future_names`); a stock's RSI can
+show one jump on the morning it rolls. History needs the futures in the saved candle files: on 130 the converted GDFL futures (`history/india_futures_2026` and `..._aug_oct` on the PC,
+2026-01-01 to 2026-10-16, copied into `fo_market_data`) plus the server's own saved days; 2026-07-31, 2026-10-19 and the exchange holidays have no file.
+
+**Time exit.** In 08, 10, 11 and 12 `EXIT_AT` now starts the same stop as `algo_stop` (in its own thread, once): pause and squareup every portfolio, unsubscribe after `squareup_settle_s`, stop the
+listener. It refuses while sending is OFF (it prints that; run `<strategy>_stop()` by hand). Take-profit, stop-loss and the z-exit still only send `squareup` for that portfolio and do not
+unsubscribe it: **known open item**. Each trade uses a new portfolio, and the engine keeps one plugin instance per subscribed portfolio until it is unsubscribed, so (given the engine finding
+in section 9) the slots run out after about 32 trades. The fix (unsubscribe a portfolio a minute after its exit is confirmed, and a `MAX_POSITIONS` limit) is not made yet.
+
+**Entries seen on 2026-10-22.** The z-score script (`Z_ENTRY = 3.0`) made no entry: the largest |z| of 209 futures was 1.74 (99th percentile 1.69), and an entry also needs the future's % from open and from
+VWAP in the middle 50% of its basket, which works against a 3-sigma move. How many entries a setting would give has not been measured over the saved days.
+
+## Console redraws (`algo/ui/redraw.py`)
+
+The console components redraw when the shared portfolio states change (`use_redraw`). A stop of forty portfolios was forty changes, each queuing a redraw in every open window, and a window whose
+browser session had gone could still be called ("Key N not initialized" in the Deephaven log, 114 times on 2026-10-22). `Redraw.soon()` now batches a burst into one redraw per 0.5 s per window and does
+nothing once the window is closed; a click still redraws at once. The cause of the old errors was not reproduced, so this is a mitigation; check the log after the console has been open for a while.
+
+## Compose and servers
+
+`docker-compose.yml` on 130 adds `ALGO_STATE_STORE: "postgres"` and mounts `fo_market_data` writable (no `:ro`) so the end-of-day save can write there. 131 also sets `ALGO_MARKET=US` and `ALGO_NATS_IP`;
+104 sets `ALGO_NATS_IP`. The compose files are not in this repository. The day timer (`day_auto`) is started from `init.py`, not from the compose file; `day_auto(stop=True)` switches it off until the next restart.

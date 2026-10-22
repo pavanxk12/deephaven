@@ -218,3 +218,10 @@ The test suite (594 tests at the last run) covers the clock and the clock change
 * **History of a symbol that did not trade** at the compared minute is carried for at most `max_age` minutes and is NaN beyond that.
 * **Cash and futures candle files are both named `candles_<day>.parquet`**: keep them in separate folders (or rename one kind), because a folder can hold only one of them per day.
 * **Old straddle files** (from before `IV` existed) lack the column; `eod_load` refuses to merge them with newer days.
+
+## Rolling futures, the contract picker and its cache
+
+`"SBIN FUT"` means the nearest unexpired future **on each day**. To find it for a day the picker reads that day file's `Symbol` column once and keeps `{underlying: [its future names]}`
+(`ParquetSource._index_of`, 800 files); the answer for each (file, symbol) is cached (200,000). With the old 64-entry cache a 68-day look-back over 230 stocks missed every time (331 ms a stock, measured
+on real history); now it is 0.4 ms after the first pass. A row with no `Symbol` in a day file is skipped. `absolute_warm` fills these answers as well as the day arrays, so run it (the scripts do) before the
+first signal. History on 130 (2026-10-22): the converted GDFL futures 2026-01-01 to 2026-10-16 plus the server's own saved days; 31 Jul, 19 Oct and the holidays have no file.
