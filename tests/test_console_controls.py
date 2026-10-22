@@ -78,3 +78,30 @@ def test_a_stopped_strategy_reads_off_and_a_restart_begins_off(console):
     assert "not running (algo_start)" in set_sending(app, svc, "a", True)               # and it cannot be switched on from the window
     algo_start(3, "a")
     assert not is_sending(svc, "a")                                                     # started again: OFF until it says so
+
+
+def test_redraw_batches_a_burst_into_one_and_stops_when_the_window_is_closed():
+    import time
+    from algo.ui.redraw import Redraw
+    calls = []
+    r = Redraw(lambda: calls.append(1), gap=0.05)
+    for _ in range(40):                                        # forty portfolio changes in a row (a stop of forty portfolios)
+        r.soon()
+    r()                                                        # a click is redrawn at once, and does not wait for the batch
+    assert calls == [1]
+    time.sleep(0.2)
+    assert calls == [1, 1]                                     # ... and the burst came out as ONE redraw
+    r.soon()
+    time.sleep(0.2)
+    assert len(calls) == 3                                     # the next change is shown again
+    r.soon()
+    r.close()                                                  # the window is closed with a redraw on its way
+    time.sleep(0.2)
+    r.soon()
+    r()
+    time.sleep(0.2)
+    assert len(calls) == 3                                     # nothing reaches a closed window
+    boom = Redraw(lambda: 1 / 0, gap=0.01)
+    boom.soon()
+    time.sleep(0.1)                                            # an error inside a redraw does not kill the timer thread's work for the next one
+    boom.soon()

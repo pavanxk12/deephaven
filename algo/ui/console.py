@@ -35,6 +35,7 @@ from algo.core.pfstate import pf_states
 from algo.core.plugin import Plugin
 from algo.strategy.guard import guard_of
 from algo.ui import tables as q
+from algo.ui.redraw import Redraw
 from algo.ui.controls import is_sending, master_is_off, set_sending
 from algo.ui.filters import PF_PER_USER, Filters, Strategies, as_int, number_of, plain, row_value, safe_strategy, strategy_cond, time_conds
 
@@ -205,11 +206,17 @@ def send(ctx: Ctx, fut, what: str, set_warn=None) -> None:
 def use_redraw(ctx: Ctx):
     """Redraw the calling component whenever a portfolio changes (an algo or this console paused, squared up, subscribed ...)."""
     _, set_version = ui.use_state(0)
+    redraw = ui.use_memo(lambda: Redraw(lambda: set_version(lambda n: n + 1)), [])
 
-    def redraw():
-        set_version(lambda n: n + 1)
+    def listen():
+        undo = ctx.states.on_change(lambda user, pf, st: redraw.soon())
 
-    ui.use_effect(lambda: ctx.states.on_change(lambda user, pf, st: redraw()), [])
+        def leave():                                             # the window is closed: stop listening, and let no queued redraw through
+            undo()
+            redraw.close()
+        return leave
+
+    ui.use_effect(listen, [])
     return redraw
 
 
@@ -537,7 +544,7 @@ def control_panel(ctx: Ctx):
     warn, set_warn = ui.use_state("")
     redraw = use_redraw(ctx)
     if ctx.limits is not None:                           # a limit breach switches the strategy off: redraw so the button follows
-        ui.use_effect(lambda: ctx.limits.on_change(lambda s: s == ctx.strategy and redraw()), [])
+        ui.use_effect(lambda: ctx.limits.on_change(lambda s: s == ctx.strategy and redraw.soon()), [])
 
     svc = service(ctx)
     sending = is_sending(svc, ctx.strategy)                # a strategy window: that strategy's own switch (and the master); the other window: the master
