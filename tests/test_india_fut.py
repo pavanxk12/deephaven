@@ -189,3 +189,36 @@ def test_a_day_file_with_a_null_symbol_no_longer_breaks_the_contract_picker(text
     start(text, name, tmp_path, monkeypatch)                                                       # pasted again: wrapped once, not twice
     assert getattr(absolute_module.month_contract, "skips_null_names", False)
     svc.on_stop()
+
+
+def test_after_a_take_profit_the_portfolio_is_unsubscribed_so_the_engine_slot_is_freed(tmp_path, fake_dh, monkeypatch):
+    last = write_two_contracts(tmp_path, ["2020-01-13", "2020-01-14", "2020-01-15"], "30JAN20", "27FEB20")
+    ns, app, svc, wire, saved, rel, before = start(
+        RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S00", "S01", "S02"],
+        **{"N_BASKETS = 4": "N_BASKETS = 1", "RSI_LIVE = False": "RSI_LIVE = True", "UNSUB_AFTER_S = 60": "UNSUB_AFTER_S = 0.3"})
+    entry = last - 0.25
+    fake_dh[-1].fn(Update(added={"token": [100], "Close": [entry], "Minute": [DAY0]}), False)
+    assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][1] == "subscribe"
+    fake_dh[-1].fn(Update(added={"token": [100], "Close": [entry * 1.03], "Minute": [DAY0 + np.timedelta64(1, "m")]}), False)       # +3%: the target (1.5%)
+    assert wait_for(lambda: [lab for _, lab, _ in wire.sent] == ["subscribe", "squareup", "unsubscribe"])
+    subject, _, payload = wire.sent[2]
+    assert subject == wire.sent[0][0] and payload["T1"] == 100                                       # the same portfolio, and its contract
+    svc.on_stop()
+
+
+def test_no_entry_while_the_script_holds_as_many_portfolios_as_allowed(tmp_path, fake_dh, monkeypatch, capsys):
+    last = write_two_contracts(tmp_path, ["2020-01-13", "2020-01-14", "2020-01-15"], "30JAN20", "27FEB20")
+    ns, app, svc, wire, saved, rel, before = start(
+        RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S00", "S01", "S02"],
+        **{"N_BASKETS = 4": "N_BASKETS = 1", "RSI_LIVE = False": "RSI_LIVE = True", "MAX_PORTFOLIOS = 28": "MAX_PORTFOLIOS = 0"})
+    fake_dh[-1].fn(Update(added={"token": [100], "Close": [last - 0.25], "Minute": [DAY0]}), False)       # oversold: it would buy
+    time.sleep(0.3)
+    assert wire.sent == []
+    assert "MAX_PORTFOLIOS 0" in capsys.readouterr().out
+    svc.on_stop()
+
+
+@pytest.mark.parametrize("text", [RSI, Z, (EXAMPLES / "08_us_basket_rsi_crossorder.py").read_text(encoding="utf-8"), (EXAMPLES / "10_us_zscore_crossorder.py").read_text(encoding="utf-8")])
+def test_all_four_scripts_release_a_closed_portfolio_and_have_the_limit(text):
+    for needle in ("MAX_PORTFOLIOS = 28", "UNSUB_AFTER_S = 60", "def release(pf, token):", "threading.Timer(UNSUB_AFTER_S, release", "if len(live) >= MAX_PORTFOLIOS", "live.add(a[\"pf\"])"):
+        assert needle in text, needle

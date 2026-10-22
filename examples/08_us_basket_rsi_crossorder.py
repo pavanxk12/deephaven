@@ -60,10 +60,14 @@ def run_us_basket_rsi():
     ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
     WINDOW = (dtime(10, 0), dtime(15, 45))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
     EXIT_AT = dtime(15, 55)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
+    MAX_PORTFOLIOS = 28                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
+                                             # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.
+    UNSUB_AFTER_S = 60                       # a closed position's portfolio is unsubscribed this many seconds after its exit (take-profit, stop-loss, z-exit) so the engine frees the slot;
+                                             # the wait lets the plugin send and fill its closing order first. None = never (the slot is then held until the stop at the end of the day)
     FAIL_COOLDOWN_S = 30
     # ==========================================================================
     if not (0 <= MID_ZONE[0] < MID_ZONE[1] <= 100 and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
-            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and 0 <= ABS_ZONE[0] < ABS_ZONE[1] <= 100 and WINDOW[0] < EXIT_AT):
+            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and 0 <= ABS_ZONE[0] < ABS_ZONE[1] <= 100 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
         raise ValueError("MID_ZONE and ABS_ZONE must be inside 0 to 100, TARGET_PCT and STOP_PCT above 0, QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, "
                          "and every basket needs at least 3 symbols")
     BAR_S = parse_timeframe(RSI_BAR)                               # 300; refuses a size that does not line up with the clock
@@ -247,6 +251,18 @@ def run_us_basket_rsi():
         svc = current().get("nats") or NO_SERVICE
         return svc.squareup(pf, user=USER, client=STRATEGY)                              # the plugin's SquareUpEvent closes the position
 
+    live = set()                                                   # portfolios this script holds in the engine: open positions, and closed ones waiting for their unsubscribe
+    at_limit_said = []                                             # the "at the limit" message is printed once until a slot frees
+
+    def release(pf, token):
+        """Unsubscribe a portfolio whose position is closed. It destroys the plugin instance, which frees one of the engine's slots (a squareup alone leaves it there, idle)."""
+        try:
+            svc = current().get("nats") or NO_SERVICE
+            fut = svc.unsubscribe(pf, token, user=USER, client=STRATEGY)
+            fut.add_done_callback(lambda f: (live.discard(pf), at_limit_said.clear()))
+        except Exception as e:
+            print(f"{STRATEGY}: PF {pf} could not be unsubscribed ({e}); it keeps its slot until the stop")
+
     def settled(token, what, future):
         """The bridge answered (called from the NATS thread)."""
         try:
@@ -259,27 +275,41 @@ def run_us_basket_rsi():
             if ok and pos is not None:
                 pos["state"] = "open"
             else:
+                if pos is not None:
+                    live.discard(pos["pf"])
                 position.pop(token, None)
                 last_fail[token] = time.time()
                 print(f"{symbol_of[token]}: entry FAILED ({why}); nothing is open")
         elif ok:
             position.pop(token, None)
+            if pos is not None and UNSUB_AFTER_S is not None:
+                timer = threading.Timer(UNSUB_AFTER_S, release, (pos["pf"], token))        # the slot is freed a little later, not at once: the plugin may still be filling its closing order
+                timer.daemon = True
+                timer.start()
         elif pos is not None:
             pos["state"] = "open"
             last_fail[token] = time.time()
             print(f"{symbol_of[token]}: exit FAILED ({why}); the position is still open, it is tried again")
 
     def enter(token, side):
+        """Send the entry. True when it was sent; False when it was not (the limit, no portfolio number, all 100 of the day used): the caller may try again at the next signal."""
+        if len(live) >= MAX_PORTFOLIOS:
+            if not at_limit_said:
+                at_limit_said.append(True)
+                print(f"{STRATEGY}: {len(live)} portfolios held (MAX_PORTFOLIOS {MAX_PORTFOLIOS}); no new entry until an exit has been unsubscribed")
+            return False
         if next_slot[token] >= 100:
             print(f"{symbol_of[token]}: all 100 portfolios of the day are used, no trade")
-            return
+            return False
         a = pf_assign(STRATEGY, token, token, name=symbol_of[token], slot=next_slot[token])       # the BOOK gives a NEW portfolio number (None while OFF or unticked)
         if not a:
-            return
+            return False
         next_slot[token] += 1
+        live.add(a["pf"])
         position[token] = {"side": side, "entry": last_px[token], "qty": QTY, "pf": a["pf"], "state": "entering"}
         print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {QTY} lot(s) at {last_px[token]:g} on PF {a['pf']}")
         send_entry(a["pf"], token, side, QTY).add_done_callback(lambda f: settled(token, "enter", f))
+        return True
 
     def leave(token, why):
         pos = position.get(token)
@@ -314,9 +344,8 @@ def run_us_basket_rsi():
         except Exception as e:
             print(f"{symbol_of[token]}: the ranking is not available ({e}); no trade")
             return
-        if middle:
+        if middle and enter(token, zone_side[zone]):
             traded_in_zone[token] = zone
-            enter(token, zone_side[zone])
 
     stopping = []                                                  # set once the time exit has started the stop
 

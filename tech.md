@@ -380,9 +380,13 @@ show one jump on the morning it rolls. History needs the futures in the saved ca
 2026-01-01 to 2026-10-16, copied into `fo_market_data`) plus the server's own saved days; 2026-07-31, 2026-10-19 and the exchange holidays have no file.
 
 **Time exit.** In 08, 10, 11 and 12 `EXIT_AT` now starts the same stop as `algo_stop` (in its own thread, once): pause and squareup every portfolio, unsubscribe after `squareup_settle_s`, stop the
-listener. It refuses while sending is OFF (it prints that; run `<strategy>_stop()` by hand). Take-profit, stop-loss and the z-exit still only send `squareup` for that portfolio and do not
-unsubscribe it: **known open item**. Each trade uses a new portfolio, and the engine keeps one plugin instance per subscribed portfolio until it is unsubscribed, so (given the engine finding
-in section 9) the slots run out after about 32 trades. The fix (unsubscribe a portfolio a minute after its exit is confirmed, and a `MAX_POSITIONS` limit) is not made yet.
+listener. It refuses while sending is OFF (it prints that; run `<strategy>_stop()` by hand). Take-profit, stop-loss and the z-exit send `squareup` for that portfolio. Each trade uses a new portfolio and the engine keeps one plugin instance per subscribed portfolio
+until it is unsubscribed, so (given the engine finding in section 9) a squareup alone leaves the slot used and the slots ran out after about 32 trades (seen twice on 130 on 2026-10-22: from the 33rd
+entry on, the script printed trades that never reached the engine). All four scripts (08, 10, 11, 12) now **release** the portfolio: `UNSUB_AFTER_S` (60) seconds after an exit is confirmed they send
+`unsubscribe` for it (the same command `algo_stop` uses), and `MAX_PORTFOLIOS` (28) stops new entries while the script holds that many portfolios (open positions plus closed ones waiting for their
+unsubscribe); a blocked entry is not remembered as "traded in this zone", so the next signal tries again. Two scripts running together share the engine's slots, so their limits must add up to less
+than the cap. A release waiting in its timer is lost if Deephaven restarts (the stop at the end of the day still unsubscribes everything). Not yet run against the live engine; the tests check the
+command sequence (subscribe, squareup, unsubscribe) and the limit.
 
 **Entries seen on 2026-10-22.** The z-score script (`Z_ENTRY = 3.0`) made no entry: the largest |z| of 209 futures was 1.74 (99th percentile 1.69), and an entry also needs the future's % from open and from
 VWAP in the middle 50% of its basket, which works against a 3-sigma move. How many entries a setting would give has not been measured over the saved days.
