@@ -12,7 +12,8 @@
 #   The entry         BUY when z <= -Z_ENTRY (the stock is well BELOW its usual % from the VWAP at this minute), SELL when z >= +Z_ENTRY. One position per symbol at a time, and no second trade
 #                     in the same direction until z has come back inside the band.
 #   The exit          a BUY is closed when z > 0, a SELL when z < 0 (back through its usual value), checked on every 1-minute close.
-#                     And the time exit: EXIT_AT (15:55 New York time, 5 minutes before the 16:00 close) squares up everything still open and stops entries.
+#                     And the time exit: EXIT_AT (15:55 New York time, 5 minutes before the 16:00 close) stops the automation the way algo_stop does it (pause, square up, a minute later
+#                     unsubscribe every portfolio, then the script stops), and no entry is made after it.
 #                     TARGET_PCT / STOP_PCT (a % move in your favour / against you) are OFF (None); give them a number to add them as well.
 #                     The engine's CrossOrder has no target or stop and reads its parameters ONCE per portfolio, so an exit is the portfolio's `squareup` command.
 #   The order         a NEW portfolio for every trade: ONE `subscribe` that carries the fields, as for 07 and 08 (the engine knows the strategy as "CrossOrder"; SIDE 1 = buy, 2 = sell):
@@ -32,6 +33,7 @@ def run_us_zscore():
     import contextlib
     import io
     import math
+    import threading
     import time
     from contextlib import nullcontext
     from datetime import date, datetime, time as dtime
@@ -61,7 +63,7 @@ def run_us_zscore():
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
     ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
     WINDOW = (dtime(10, 0), dtime(15, 45))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
-    EXIT_AT = dtime(15, 55)                  # time exit (New York time): 5 minutes before the 16:00 close, everything open is squared up and no entry is made after it
+    EXIT_AT = dtime(15, 55)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
     FAIL_COOLDOWN_S = 30
     # ==========================================================================
     if not (0 <= MID_ZONE[0] < MID_ZONE[1] <= 100 and (TARGET_PCT is None or TARGET_PCT > 0) and (STOP_PCT is None or STOP_PCT > 0) and QTY >= 1 and BASKETS
@@ -262,6 +264,17 @@ def run_us_zscore():
         traded_in_zone[token] = zone
         enter(token, zone_side[zone])
 
+    stopping = []                                                  # set once the time exit has started the stop
+
+    def time_stop():
+        """The time exit: what stop() does by hand. algo_stop pauses and squares up every portfolio of this strategy, unsubscribes them a minute later (so the plugin can send and
+        fill its closing order first) and stops the automation. It refuses while sending is OFF; it is then said, and stop() can be run by hand."""
+        print(f"{STRATEGY}: time exit {EXIT_AT:%H:%M}: pausing, squaring up and unsubscribing every portfolio, then stopping")
+        try:
+            stop()
+        except Exception as e:
+            print(f"{STRATEGY}: the time exit could not stop the automation ({e}); run {STRATEGY}_stop() by hand")
+
     def on_candle(update, is_replay):
         """Every batch of newly closed 1-minute candles: keep the closes of the traded stocks and run the rules on each."""
         ch = update.added(["token", "Close", "Minute"])
@@ -273,9 +286,9 @@ def run_us_zscore():
                 last_px[tok] = float(close)
                 if Z_BAR_LIVE or (epoch_s(minute) + 60) % BAR_S == 0:  # Z_BAR_LIVE: every minute; else only the 1-minute candle that ends a Z_BAR bar (the bar is finished)
                     step(tok)
-        if past_exit():                                            # the time exit: every open position, whichever stock the candles in this batch belong to
-            for token in list(position):
-                leave(token, f"time exit {EXIT_AT:%H:%M}")
+        if past_exit() and not stopping:                           # the time exit: stop the whole automation, once (in its own thread: the stop waits for its commands)
+            stopping.append(True)
+            threading.Thread(target=time_stop, name=f"{STRATEGY}-time-exit", daemon=True).start()
 
     # ---- by hand ---------------------------------------------------------------------------------------------------------------------
     def exit_all():

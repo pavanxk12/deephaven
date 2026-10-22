@@ -228,7 +228,7 @@ def test_no_entry_is_made_once_the_time_exit_has_come_even_inside_the_window(tmp
     svc.on_stop()
 
 
-def test_at_the_time_exit_every_open_position_is_squared_up_on_the_next_candle(tmp_path, fake_dh, monkeypatch):
+def test_at_the_time_exit_the_automation_is_stopped_like_algo_stop_on_the_next_candle(tmp_path, fake_dh, monkeypatch):
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
     now = datetime.now(ZoneInfo("America/New_York"))
@@ -236,7 +236,8 @@ def test_at_the_time_exit_every_open_position_is_squared_up_on_the_next_candle(t
         pytest.skip("too close to midnight to place the exit a few seconds ahead")
     when = (now + timedelta(seconds=5)).time()
     last = write_history(tmp_path, ["2020-01-14", "2020-01-15"])
-    ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch, exit_at=f"dtime({when.hour}, {when.minute}, {when.second})")
+    ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch, exit_at=f"dtime({when.hour}, {when.minute}, {when.second})",
+                                                    **{"algo_start(USER, STRATEGY)": "algo_start(USER, STRATEGY, squareup_settle_s=0)"})            # no wait between squareup and unsubscribe here
     entry = last - 0.25
     feed(fake_dh, [entry])
     assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][1] == "subscribe"               # the entry, before the exit time
@@ -249,5 +250,8 @@ def test_at_the_time_exit_every_open_position_is_squared_up_on_the_next_candle(t
         time.sleep(0.1)
     time.sleep(0.2)
     feed(fake_dh, [entry * 1.001], first=2)                                                        # the next candle after the exit time
-    assert wait_for(lambda: len(wire.sent) == 2) and wire.sent[1][:2] == ("cmd.hft.1001", "squareup")
+    assert wait_for(lambda: len(wire.sent) == 4)
+    assert [lab for _, lab, _ in wire.sent[1:]] == ["pause_unpause:Pause", "squareup", "unsubscribe"]         # what algo_stop does, in that order, on the entry's portfolio
+    assert {subj for subj, _, _ in wire.sent[1:]} == {"cmd.hft.1001"}
+    assert wait_for(lambda: "us_basket_rsi" not in app.plugins)                                         # and the automation itself is stopped
     svc.on_stop()

@@ -443,3 +443,32 @@ def test_warming_iv_for_many_underlyings(folder):
     s = AbsoluteService(Clock(IST, NSE_SESSION), ParquetSource(Store(str(folder))), now=lambda: epoch(TODAY, 11))
     assert s.warm("iv", "intraday", ["NIFTY", "BANKNIFTY"], 5) == 2 and s.stats()["loads"] == 10
     assert s.absolute("iv", "intraday", "NIFTY", 5, now=2.5)[0].tolist() == pytest.approx([1, 2, 3, 4, 5]) and s.stats()["loads"] == 10
+
+
+def test_the_contract_picker_skips_a_row_with_no_symbol():
+    from algo.series.absolute import month_contract
+    names = ["SBIN 30JAN20 FUT", None, "SBIN 27FEB20 FUT"]                       # a day file can hold a row whose token the master did not know
+    assert month_contract(("fut", "SBIN"), names, "2020-01-13") == "SBIN 30JAN20 FUT"
+    assert month_contract(("fut", "SBIN"), names, "2020-02-01") == "SBIN 27FEB20 FUT"
+    assert month_contract(("fut", "SBIN"), [None], "2020-01-13") is None
+
+
+def test_the_contract_picker_reads_each_day_file_once_and_remembers_every_stock_and_day(folder, monkeypatch):
+    import pyarrow.parquet as pq_module
+    reads = []
+    real = pq_module.read_table
+    monkeypatch.setattr(pq_module, "read_table", lambda path, *a, **k: (reads.append((str(path), tuple(k.get("columns") or ()))), real(path, *a, **k))[1])
+    src = ParquetSource(Store(str(folder)))
+    names = [f"S{i:03d}" for i in range(120)]                                            # more stocks than the old 64-entry cache could keep
+    for day in DAYS:
+        for n in names:
+            src.contract_of(day, ("fut", n))
+        src.contract_of(day, ("fut", "NIFTY"))
+    symbol_reads = [r for r in reads if r[1] == ("Symbol",)]
+    assert len(symbol_reads) == len(DAYS)                                                 # one read of the Symbol column per day file, not one per stock
+    before = len(reads)
+    for day in DAYS:
+        for n in names:
+            src.contract_of(day, ("fut", n))                                              # asked again: nothing is read, nothing was forgotten
+    assert len(reads) == before and len(src._fut_names) >= 120 * len(DAYS)
+    assert src.contract_of(DAYS[0], ("fut", "NIFTY")) == ("exact", "NIFTY 27MAR26 FUT")   # and the answer is still the nearest unexpired future

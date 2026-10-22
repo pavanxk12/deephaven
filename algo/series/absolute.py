@@ -229,7 +229,7 @@ def month_contract(spec, names, day: str) -> "str | None":
     else:
         und, mon, yy = name, None, None
     for nm in names:
-        mm = _FUT.match(nm)
+        mm = _FUT.match(nm) if isinstance(nm, str) else None          # a day file can hold a row with no Symbol (a token the master did not know): not a contract
         if not mm or mm["und"] != und:
             continue
         e = future_expiry(nm)
@@ -925,7 +925,8 @@ class ParquetSource:
 
     def __init__(self, store):
         self.store = store
-        self._fut_names: OrderedDict = OrderedDict()
+        self._fut_names: OrderedDict = OrderedDict()                # (file, spec) -> the contract that spec means in that file (None = there is none)
+        self._file_index: OrderedDict = OrderedDict()               # file -> {underlying: its future names in that file}: the file's Symbol column is read ONCE
 
     @staticmethod
     def _pq():
@@ -942,13 +943,27 @@ class ParquetSource:
     def _path(self, kind: str, day: str) -> "str | None":
         return self.store.find(self.PREFIX[kind], day)
 
+    def _index_of(self, pq, path: str) -> dict:
+        """{underlying: [its future names]} of one day file. The Symbol column is read once per file (a few hundred files at most are kept), not once per symbol asked about."""
+        index = self._file_index.get(path)
+        if index is None:
+            index = {}
+            for nm in pq.read_table(path, columns=["Symbol"])["Symbol"].unique().to_pylist():
+                mm = _FUT.match(nm) if isinstance(nm, str) else None             # (a row with no Symbol is not a contract)
+                if mm:
+                    index.setdefault(mm["und"], []).append(nm)
+            self._file_index[path] = index
+            while len(self._file_index) > 800:
+                self._file_index.popitem(last=False)
+        return index
+
     def _futures_of(self, pq, path: str, day: str, spec) -> "str | None":
-        """The contract a rolling future ("fut") or a month ("month") spec means in this day's file (see month_contract), cached per file."""
+        """The contract a rolling future ("fut") or a month ("month") spec means in this day's file (see month_contract), cached per file and spec. The cache holds every
+        (file, spec) a few hundred stocks over a few hundred days need: a small one is read again on every call (a 68-day look-back of 230 stocks took 0.4 s a call at 64 entries)."""
         key = (path, spec)
         if key not in self._fut_names:
-            names = pq.read_table(path, columns=["Symbol"])["Symbol"].unique().to_pylist()
-            self._fut_names[key] = month_contract(spec, names, day)
-            while len(self._fut_names) > 64:
+            self._fut_names[key] = month_contract(spec, self._index_of(pq, path).get(underlying_of(spec), ()), day)
+            while len(self._fut_names) > 200_000:
                 self._fut_names.popitem(last=False)
         return self._fut_names[key]
 
