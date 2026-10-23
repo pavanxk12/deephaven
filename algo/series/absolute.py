@@ -1032,6 +1032,8 @@ class ParquetSource:
         if path is None:
             return {}
         _, pq = self._pq()
+        if "IV" not in pq.read_schema(path).names:                  # a day saved before the IV column existed: no IV that day
+            return {}
         t = pq.read_table(path, columns=["Symbol", "Time", "Expiry", "IV"], filters=[("Symbol", "in", sorted(set(underlyings)))])
         if t.num_rows == 0:
             return {}
@@ -1052,6 +1054,8 @@ class ParquetSource:
         if path is None:
             return None
         _, pq = self._pq()
+        if "IV" not in pq.read_schema(path).names:
+            return None
         t = pq.read_table(path, columns=["Time", "Expiry", "IV"], filters=[("Symbol", "=", underlying)])
         if t.num_rows == 0:
             return None

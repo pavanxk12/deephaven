@@ -37,7 +37,7 @@ from algo.strategy.guard import guard_of
 from algo.ui import tables as q
 from algo.ui.redraw import Redraw
 from algo.ui.controls import is_sending, master_is_off, set_sending
-from algo.ui.filters import PF_PER_USER, Filters, Strategies, as_int, number_of, plain, row_value, safe_strategy, strategy_cond, time_conds
+from algo.ui.filters import LAKH, PF_PER_USER, Filters, in_lakh, limit_text, limit_value, Strategies, as_int, number_of, plain, row_value, safe_strategy, strategy_cond, time_conds
 
 GREEN, RED, BLUE, ORANGE, AMBER, PURPLE, GREY, INK = (
     "#1a7f37", "#cf222e", "#1f5fbf", "#c2410c", "#b45309", "#8250df", "#6e7781", "#1f2328")
@@ -257,7 +257,8 @@ def summary_window(net_tbl, book_tbl, logo_src, logo_height, filter_ctl=None, ti
         return GREEN if x is None or x >= 0 else RED
 
     tiles = ui.flex(
-        tile(f"TURNOVER ({currency})", num(v, "Turnover", "," + dec_spec, "0"), ORANGE),
+        tile("TURNOVER (₹ lakh)" if currency == "₹" else f"TURNOVER ({currency})",
+             (in_lakh(val(v, "Turnover")) if val(v, "Turnover") is not None else "0.00") if currency == "₹" else num(v, "Turnover", "," + dec_spec, "0"), ORANGE),
         tile("FILLS", num(v, "Fills", ",.0f", "0"), "#000000"),
         tile("OPEN ORDERS", num(o, "OpenOrders", ",.0f", "0"), "#000000"),
         tile(f"REALISED ({currency})", num(v, "RealisedPnl", "+," + dec_spec, "0"), pnl_color("RealisedPnl")),
@@ -286,7 +287,7 @@ def limits_overview(ctx: Ctx):
                           ui.TableFormat(cols=["TurnoverLimit", "Turnover", "M2MLimit", "M2M"], value="#,##0"),
                           ui.TableFormat(cols="TurnoverUsedPct", value="0.0")],
                  hidden_columns=["TurnoverHit", "M2MHit"],
-                 column_display_names={"TurnoverLimit": "TURNOVER LIMIT", "Turnover": "TURNOVER", "TurnoverUsedPct": "USED %", "M2MLimit": "M2M LIMIT", "M2M": "M2M"}),
+                 column_display_names={"TurnoverLimit": "TURNOVER LIMIT", "Turnover": "TURNOVER", "TurnoverUsedPct": "USED %", "M2MLimit": "M2M LIMIT", "M2M": "M2M (NET)" if ctx.market.expense_per_crore else "M2M"}),
         UNSAFE_style={"height": "150px", "flex": "0 0 auto", "padding": "2px 16px 8px"},
     )
 
@@ -297,9 +298,10 @@ def limit_boxes(ctx: Ctx):
     A breach is shown here; the strategy stays OFF until the limit is changed to a value it is no longer past (algo.strategy.guard does the switching, with no browser open)."""
     name, limits, guard = ctx.strategy, ctx.limits, ctx.guard
     cur = limits.get(name)
-    t_draft, set_t = ui.use_state(plain(cur["turnover"]))              # the text in each box
+    unit = {"turnover": LAKH if ctx.market.currency == "₹" else 1, "m2m": 1}      # the turnover box is typed in lakhs on the rupee market; what is stored is always rupees
+    t_draft, set_t = ui.use_state(limit_text(cur["turnover"], unit["turnover"]))              # the text in each box
     m_draft, set_m = ui.use_state(plain(cur["m2m"]))
-    latest = ui.use_ref({"turnover": plain(cur["turnover"]), "m2m": plain(cur["m2m"])})     # what is typed NOW (a text box sends every key, so this is always current)
+    latest = ui.use_ref({"turnover": limit_text(cur["turnover"], unit["turnover"]), "m2m": plain(cur["m2m"])})     # what is typed NOW (a text box sends every key, so this is always current)
     warn, set_warn = ui.use_state("")
     _, bump = ui.use_state(0)
     ui.use_effect(lambda: limits.on_change(lambda s: s == name and bump(lambda n: n + 1)), [])
@@ -319,12 +321,12 @@ def limit_boxes(ctx: Ctx):
         """Set: write what is typed in the box to the limits (and so to the `strategy_limits` table)."""
         text = latest.current[kind]
         try:
-            value = number_of(text)
+            value = limit_value(text, unit[kind])
         except ValueError:
             set_warn(f"{kind}: {text!r} is not a number (empty or 0 = no limit)")
             return
         problem = guard.set_limit(name, kind, value)
-        shown = plain(limits.get(name)[kind])                        # the box shows what was kept
+        shown = limit_text(limits.get(name)[kind], unit[kind])       # the box shows what was kept
         latest.current[kind] = shown
         (set_t if kind == "turnover" else set_m)(shown)
         set_warn(problem or "limit saved")
@@ -347,14 +349,16 @@ def limit_boxes(ctx: Ctx):
             ui.text(status, UNSAFE_style={"fontSize": "13px", "fontWeight": "600", "color": INK, "alignSelf": "end", "paddingBottom": "6px", "whiteSpace": "nowrap"}),
             gap="size-150", align_items="end")
 
-    used_t = ("no limit set" if not cur["turnover"] else f"limit {cur['turnover']:,.0f}") + (
-        "" if not cur["turnover"] or turnover is None else f", now {turnover:,.0f} ({100 * turnover / cur['turnover']:.0f}%)")
+    lakhs = unit["turnover"] == LAKH
+    used_t = ("no limit set" if not cur["turnover"] else (f"limit {in_lakh(cur['turnover'])} lakh" if lakhs else f"limit {cur['turnover']:,.0f}")) + (
+        "" if not cur["turnover"] or turnover is None else
+        (f", now {in_lakh(turnover)} lakh ({100 * turnover / cur['turnover']:.0f}%)" if lakhs else f", now {turnover:,.0f} ({100 * turnover / cur['turnover']:.0f}%)"))
     used_m = ("no limit set" if not cur["m2m"] else f"limit {cur['m2m']:+,.0f}") + (
         "" if not cur["m2m"] or m2m is None else f", now {m2m:+,.0f}")
     why = limits.blocked(name)
     return ui.flex(
-        box(f"Turnover limit ({ctx.market.currency})", t_draft, typed("turnover", set_t), "turnover", used_t),
-        box(f"M2M limit ({ctx.market.currency})", m_draft, typed("m2m", set_m), "m2m", used_m),
+        box("Turnover limit (₹ lakh)" if lakhs else f"Turnover limit ({ctx.market.currency})", t_draft, typed("turnover", set_t), "turnover", used_t),
+        box(f"M2M limit ({ctx.market.currency}, net of expense)" if ctx.market.expense_per_crore else f"M2M limit ({ctx.market.currency})", m_draft, typed("m2m", set_m), "m2m", used_m),
         *([ui.html.div(f"LIMIT BREACHED: {why}", style={"color": "#ffffff", "background": RED, "fontWeight": "700", "padding": "4px 10px", "borderRadius": "4px"})] if why else []),
         *([ui.html.div(warn, style={"color": GREEN if warn == "limit saved" else RED, "fontSize": "12px", "fontWeight": "600"})] if warn else []),
         gap="size-300", wrap=True, align_items="start", UNSAFE_style={"flex": "0 0 auto", "padding": "2px 16px 8px"},
@@ -864,7 +868,7 @@ class Console(Plugin):
             record(name)
         self._undo.append(limits.on_change(record))
         log_tbl = writer.table
-        totals = q.strategy_totals(base.trades, base.feed, mk.price_div, base.divisors)
+        totals = q.strategy_totals(base.trades, base.feed, mk.price_div, base.divisors, mk.expense_per_crore, base.kinds)      # the M2M limit is checked on the NET M2M
         strategies = merge([smap.view("Strategy"), log_tbl.view("Strategy")]).select_distinct("Strategy")
         table = q.limits_view(strategies, log_tbl.last_by("Strategy"), totals)
         app.publish("strategy_limits_log", log_tbl)

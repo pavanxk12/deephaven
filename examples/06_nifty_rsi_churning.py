@@ -25,17 +25,17 @@ from algo import current
 from algo.core.timeframe import parse_timeframe
 
 # =============================== USER INPUT ===============================
-USER = 4                         # USER_ID
+USER = 3                         # USER_ID
 STRATEGY = "nifty_rsi"           # its name: recorded with every portfolio, the name of its sending switch and of its console window
 PF_START = 1933                  # PF_START
 ADD_QTY = 3                      # ADD_QTY
 UNDERLYING = "NIFTY"             # UNDERLYING
 EXPIRY_INDEX = 0                 # OPT_EXPIRY_IDX: 0 = the nearest expiry that has not passed
-N_STRIKES = 3                    # N_STRIKES
+N_STRIKES = 5                    # N_STRIKES
 STRIKE_MODE = "OTM"              # STRIKE_MODE: "OTM" (away from the money), "ITM" (into it) or "BOTH" (0, +1, -1, +2, -2 ...)
 STRIKE_GAP = 1                   # STRIKE_GAP: listed strikes between two slots
-RSI_BAR = "5min"                 # the bar the RSI is computed on
-RSI_N, RSI_HIGH, RSI_LOW = 9, 70, 30
+RSI_BAR = "1min"                 # the bar the RSI is computed on
+RSI_N, RSI_HIGH, RSI_LOW = 3, 60, 40
 RSI_LIVE = True                  # True: the forming bar counts too (acts every minute); False: finished bars only
 FAIL_COOLDOWN_S = 30
 WINDOW = (dtime(9, 20), dtime(15, 20))          # TRADE_START, TRADE_END (India time)

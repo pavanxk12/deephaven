@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from typing import Callable
 
+LAKH = 100_000          # one lakh = 100,000 (the India console shows turnover in lakhs)
+
 PF_PER_USER = 10000      # PF in the order / trade tables = user id * 10000 + portfolio number (31147 = user 3, portfolio 1147)
 
 _SAFE = re.compile(r"^[A-Za-z0-9_.\-]{1,60}$")
@@ -113,3 +115,19 @@ class Filters:
     def _notify(self) -> None:
         for cb in list(self._callbacks):
             cb()
+
+
+def in_lakh(x) -> str:
+    """12345678.9 -> '123.46' (lakhs, two decimals, thousands separated). The rupee amount divided by 100,000; used for display only."""
+    return format(float(x) / LAKH, ",.2f")
+
+
+def limit_text(x, unit=1) -> str:
+    """A limit stored in rupees as the text of its box, in `unit` (LAKH: 5000000 -> '50'). Nothing for no limit."""
+    return plain(None if x is None else x / unit)
+
+
+def limit_value(text, unit=1):
+    """What was typed in a box (in `unit`) -> the limit in rupees (LAKH: '50' -> 5000000.0); None for an empty box. Raises ValueError for anything else."""
+    v = number_of(text)
+    return None if v is None else round(v * unit, 2)

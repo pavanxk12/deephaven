@@ -91,9 +91,10 @@ def net_positions(trades, feed, symbols, price_div: float, expense=None, kinds=N
     )
 
 
-def strategy_totals(trades, feed, price_div: float, divisors=None):
-    """One row per strategy: `Turnover` (rupees, buys + sells) and gross `M2M` of its whole day, live with the trades and the feed.
-    The same sums as the net positions, taken per (Strategy, token) and then per Strategy."""
+def strategy_totals(trades, feed, price_div: float, divisors=None, expense=None, kinds=None):
+    """One row per strategy: `Turnover` (rupees, buys + sells) and `M2M` of its whole day, live with the trades and the feed. `M2M` is NET of the expense when `expense` rates are given
+    (rupees per crore by kind, with `kinds` the master's token -> Kind table), which is the number the M2M limit is checked against; `GrossM2M` and `Expense` are beside it. Without
+    expense rates (the US market) it is the gross figure, and Expense is 0. The same sums as the net positions, taken per (Strategy, token) and then per Strategy."""
     from deephaven import agg
     per_token = (
         with_divisor(trades.where("fill_quantity > 0 && !isNull(Strategy)"), divisors, price_div)
@@ -106,12 +107,16 @@ def strategy_totals(trades, feed, price_div: float, divisors=None):
         .agg_by([agg.sum_(["BuyQty", "SellQty", "BuyVal", "SellVal"]), agg.first("Div")], by=["Strategy", "token"])
         .update_view("TokenL = (long) token")
         .natural_join(feed.view(["TokenL = (long) token", "ltp"]), on="TokenL", joins="LtpRaw = ltp")
-        .update_view([
-            "NetQty = BuyQty - SellQty",
-            "M2M = isNull(LtpRaw) ? NULL_DOUBLE : SellVal - BuyVal + NetQty * (LtpRaw / Div)",
-        ])
     )
-    return per_token.agg_by([agg.sum_(["BuyVal", "SellVal", "M2M"])], by="Strategy").view(["Strategy", "Turnover = BuyVal + SellVal", "M2M"])
+    per_token = per_token.natural_join(kinds, on="TokenL = token", joins="Kind") if (kinds is not None and expense) else per_token.update_view("Kind = (String) null")
+    per_token = per_token.update_view([
+        "NetQty = BuyQty - SellQty",
+        "GrossM2M = isNull(LtpRaw) ? NULL_DOUBLE : SellVal - BuyVal + NetQty * (LtpRaw / Div)",
+        f"Expense = {expense_formula(expense)}",
+        "M2M = isNull(GrossM2M) ? NULL_DOUBLE : GrossM2M - Expense",
+    ])
+    return (per_token.agg_by([agg.sum_(["BuyVal", "SellVal", "M2M", "GrossM2M", "Expense"])], by="Strategy")
+            .view(["Strategy", "Turnover = BuyVal + SellVal", "M2M", "GrossM2M", "Expense"]))
 
 
 def limits_view(strategies, limits_last, totals):

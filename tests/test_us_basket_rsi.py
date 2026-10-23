@@ -35,7 +35,7 @@ MY_BASKET = '    BASKETS = {"us_stocks": ["NIFTY", "A1", "A2"]}\n'              
 DAY0 = np.datetime64("2026-10-19T14:00")                                                # the first live minute (UTC), after the history days
 
 
-def start(tmp_path, monkeypatch, status="ok", window=ALWAYS_OPEN, basket=MY_BASKET, abs_pct=50.0, abs_idx=11, rsi_live=True, exit_at="dtime(23, 59, 59)", **replace):
+def start(tmp_path, monkeypatch, status="ok", window=ALWAYS_OPEN, basket=MY_BASKET, abs_pct=50.0, abs_idx=11, rsi_live=True, exit_at="dtime(23, 59, 59)", act_on_bar_end=False, **replace):
     ns, app, svc, wire = console_with_services(tmp_path, monkeypatch, status)
     calls = []
 
@@ -58,7 +58,9 @@ def start(tmp_path, monkeypatch, status="ok", window=ALWAYS_OPEN, basket=MY_BASK
     src = (SCRIPT[:b0] + basket + SCRIPT[b1:]).replace(OPEN_WINDOW, window)
     assert "EXIT_AT = dtime(15, 55)" in src, "the time exit input is missing"
     src = src.replace("EXIT_AT = dtime(15, 55)", f"EXIT_AT = {exit_at}")                              # the tests choose when the time exit comes: late by default, so the real clock never matters
-    src = re.sub(r"RSI_LIVE = (True|False)", f"RSI_LIVE = {rsi_live}", src)                            # the owner's choice is an input; each test says which it means
+    src = re.sub(r"RSI_LIVE = (True|False)", f"RSI_LIVE = {rsi_live}", src)
+    src = re.sub(r"HIST_DAYS = \d+", "HIST_DAYS = 3", src)                                           # the tests need three history days, whatever the owner has typed
+    src = src.replace("ACT_ON_BAR_END = True", f"ACT_ON_BAR_END = {act_on_bar_end}")                         # the older tests feed any number of candles: they look at every minute                            # the owner's choice is an input; each test says which it means
     for old, new in replace.items():
         assert old in src, old
         src = src.replace(old, new)
@@ -255,3 +257,46 @@ def test_at_the_time_exit_the_automation_is_stopped_like_algo_stop_on_the_next_c
     assert {subj for subj, _, _ in wire.sent[1:]} == {"cmd.hft.1001"}
     assert wait_for(lambda: "us_basket_rsi" not in app.plugins)                                         # and the automation itself is stopped
     svc.on_stop()
+
+
+def test_with_act_on_bar_end_an_entry_is_looked_for_only_on_the_candle_that_ends_a_five_minute_bar(tmp_path, fake_dh, monkeypatch):
+    last = write_history(tmp_path, ["2020-01-13", "2020-01-14", "2020-01-15"])
+    ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch, act_on_bar_end=True)
+    feed(fake_dh, [last - 0.25], first=0)                                                          # minute :00 of a bar: oversold, but not the end of a bar
+    time.sleep(0.3)
+    assert wire.sent == []
+    feed(fake_dh, [last - 0.5, last - 0.75, last - 1.0], first=1)                                 # :01, :02, :03: still inside the bar
+    time.sleep(0.3)
+    assert wire.sent == []
+    feed(fake_dh, [last - 1.25], first=4)                                                          # :04 ends the bar (the candle closes at :05)
+    assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][1] == "subscribe"
+    svc.on_stop()
+
+
+def run_two_oversold_spells(tmp_path, fake_dh, monkeypatch, **replace):
+    """A long fall (oversold, BUY), a 2% jump (the target: squareup), a rise that takes the RSI out of the zone, then another long fall (oversold again). Returns the subscribes sent."""
+    ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch, **replace)
+    closes = [100.0 - 0.25 * i for i in range(60)]
+    feed(fake_dh, closes)
+    assert wait_for(lambda: len(wire.sent) >= 1)
+    time.sleep(1.0)
+    top = closes[-1] * 1.02
+    feed(fake_dh, [top], first=60)                                                                  # +2% for the long: the target
+    assert wait_for(lambda: any(lab == "squareup" for _, lab, _ in wire.sent))
+    time.sleep(0.5)
+    rise = [top + 0.5 * k for k in range(1, 16)]
+    feed(fake_dh, rise, first=61)                                                                   # the RSI leaves the oversold zone
+    again = [rise[-1] - 0.25 * k for k in range(1, 70)]
+    feed(fake_dh, again, first=76)                                                                  # and falls into it again
+    time.sleep(0.5)
+    svc.on_stop()
+    return [(p["SIDE"]) for _, lab, p in wire.sent if lab == "subscribe"]
+
+
+def test_with_one_entry_per_stock_a_stock_is_not_entered_again_after_its_exit(tmp_path, fake_dh, monkeypatch):
+    assert "ONE_ENTRY_PER_STOCK = True" in SCRIPT
+    assert run_two_oversold_spells(tmp_path, fake_dh, monkeypatch) == [1]                            # one BUY; the second oversold spell, and any sell in the rise, are left alone
+    fake_dh.clear()
+    (tmp_path / "b").mkdir()
+    sides = run_two_oversold_spells(tmp_path / "b", fake_dh, monkeypatch, **{"ONE_ENTRY_PER_STOCK = True": "ONE_ENTRY_PER_STOCK = False"})
+    assert sides[0] == 1 and len(sides) >= 2                                                         # with the rule off the same candles enter again

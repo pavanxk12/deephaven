@@ -33,6 +33,7 @@ def run_us_zscore():
     import contextlib
     import io
     import math
+    import queue
     import threading
     import time
     from contextlib import nullcontext
@@ -68,6 +69,9 @@ def run_us_zscore():
                                              # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.
     UNSUB_AFTER_S = 60                       # a closed position's portfolio is unsubscribed this many seconds after its exit (take-profit, stop-loss, z-exit) so the engine frees the slot;
                                              # the wait lets the plugin send and fill its closing order first. None = never (the slot is then held until the stop at the end of the day)
+    TICK_EXITS = True                        # True: target and stop-loss are also checked on every price tick of the live feed (FEED_TABLE) for the open positions only, not just on each 1-minute close.
+                                             # The candle check stays as the backup, and is used alone if the tick listener cannot be set up (it says so). Needs TARGET_PCT or STOP_PCT.
+    FEED_TABLE = "fo_market_data"            # the live feed: columns token and ltp (raw price; the contract's own divisor from the master turns it into the price)
     FAIL_COOLDOWN_S = 30
     # ==========================================================================
     if not (0 <= MID_ZONE[0] < MID_ZONE[1] <= 100 and (TARGET_PCT is None or TARGET_PCT > 0) and (STOP_PCT is None or STOP_PCT > 0) and QTY >= 1 and BASKETS
@@ -204,6 +208,88 @@ def run_us_zscore():
         except Exception as e:
             print(f"{STRATEGY}: PF {pf} could not be unsubscribed ({e}); it keeps its slot until the stop")
 
+    tick_state = []                                                # [the table of open tokens, the tick listener] once the tick exits are on
+
+    def divisor_of(token):
+        """The contract's own divisor from the master (100 for NSE futures and US stocks), else the market's default."""
+        app = current()
+        return app.master.divisor_of.get(int(token)) or app.market.price_div
+
+    def tick_exit(token, pos, px):
+        """Target / stop-loss of an open position on the price `px` (the same rule as on the candle close)."""
+        move = 100.0 * (1 if pos["side"] == 1 else -1) * (px / pos["entry"] - 1.0)                 # % in the position's favour (negative = against it)
+        if TARGET_PCT is not None and move >= TARGET_PCT:
+            last_px[token] = px
+            leave(token, f"target {move:+.2f}% (tick)")
+        elif STOP_PCT is not None and move <= -STOP_PCT:
+            last_px[token] = px
+            leave(token, f"stop-loss {move:+.2f}% (tick)")
+
+    def on_tick(update, is_replay):
+        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python)."""
+        ch = update.added(["token", "ltp"])
+        if ch is None:
+            return
+        for tok, ltp in zip(ch["token"], ch["ltp"]):
+            tok = int(tok)
+            pos = position.get(tok)
+            if pos is None or pos["state"] != "open" or ltp <= 0:
+                continue
+            div = divisor_of(tok)
+            if div:
+                tick_exit(tok, pos, float(ltp) / float(div))
+
+    tick_jobs = queue.Queue()                                      # (token, add?) jobs for the one worker thread: Deephaven refuses an input-table edit made from inside a listener or a callback
+
+    def tick_worker():
+        """Adds / removes the tokens of open positions, one at a time and in order, outside any listener."""
+        while True:
+            item = tick_jobs.get()
+            if item is None:
+                return
+            token, on = item
+            if not tick_state:
+                continue
+            try:
+                from deephaven import new_table
+                from deephaven.column import int_col
+                with exec_ctx:
+                    (tick_state[0].add if on else tick_state[0].delete)(new_table([int_col("token", [token])]))
+            except Exception as e:
+                print(f"{STRATEGY}: tick exits: token {token} could not be {'added' if on else 'removed'} ({e})")
+
+    def tick_track(token, on):
+        """Add / remove a token to the set whose ticks are followed (a position opened / closed). Only queued here: it is done by the worker."""
+        if tick_state:
+            tick_jobs.put((int(token), bool(on)))
+
+    def tick_start():
+        if not TICK_EXITS or (TARGET_PCT is None and STOP_PCT is None):
+            return
+        try:
+            feed = globals().get(FEED_TABLE)
+            if feed is None:
+                raise RuntimeError(f"no table {FEED_TABLE!r} in this session")
+            from deephaven import dtypes, input_table
+            from deephaven.table_listener import listen
+            keys = input_table(col_defs={"token": dtypes.int32}, key_cols="token")
+            ticks = feed.where_in(keys, "token").where("ltp > 0").view(["token", "ltp"])           # in the engine: only the open positions' ticks come through
+            old = current().shared.setdefault("tick_handles", {}).pop(STRATEGY, None)
+            if old is not None:
+                old.stop()                                                                      # pasted again: the old listener goes
+            handle = listen(ticks, on_tick)
+            current().shared["tick_handles"][STRATEGY] = handle
+            old_jobs = current().shared.setdefault("tick_workers", {}).pop(STRATEGY, None)
+            if old_jobs is not None:
+                old_jobs.put(None)                                                              # pasted again: the old worker goes too
+            current().shared["tick_workers"][STRATEGY] = tick_jobs
+            tick_state[:] = [keys, handle]
+            threading.Thread(target=tick_worker, name=f"{STRATEGY}-tick-keys", daemon=True).start()
+            print(f"{STRATEGY}: target and stop-loss are checked on every price tick of {FEED_TABLE} (and on each candle as the backup)")
+        except Exception as e:
+            tick_state.clear()
+            print(f"{STRATEGY}: tick exits not available ({e}); target and stop-loss are checked on each 1-minute candle")
+
     def settled(token, what, future):
         """The bridge answered (called from the NATS thread)."""
         try:
@@ -219,10 +305,12 @@ def run_us_zscore():
                 if pos is not None:
                     live.discard(pos["pf"])
                 position.pop(token, None)
+                tick_track(token, False)
                 last_fail[token] = time.time()
                 print(f"{symbol_of[token]}: entry FAILED ({why}); nothing is open")
         elif ok:
             position.pop(token, None)
+            tick_track(token, False)
             if pos is not None and UNSUB_AFTER_S is not None:
                 timer = threading.Timer(UNSUB_AFTER_S, release, (pos["pf"], token))        # the slot is freed a little later, not at once: the plugin may still be filling its closing order
                 timer.daemon = True
@@ -248,6 +336,7 @@ def run_us_zscore():
         next_slot[token] += 1
         live.add(a["pf"])
         position[token] = {"side": side, "entry": last_px[token], "qty": QTY, "pf": a["pf"], "state": "entering"}
+        tick_track(token, True)
         print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {QTY} lot(s) at {last_px[token]:g} on PF {a['pf']}")
         send_entry(a["pf"], token, side, QTY).add_done_callback(lambda f: settled(token, "enter", f))
         return True
@@ -335,10 +424,14 @@ def run_us_zscore():
         print(f"   z-score ready for {sum(1 for v in zs.values() if v is not None)} of {len(symbol_of)} stocks (Z_DAYS {Z_DAYS}, at least {Z_MIN_DAYS} earlier days): " +
               ", ".join(f"{k} {'-' if v is None else format(v, '+.2f')}" for k, v in zs.items()))
 
+    tick_start()
     listener = watch("candles", on_candle, owner=STRATEGY)         # follows the table if candles are restarted; pasting again replaces this listener
 
     def stop():
         listener.stop()
+        if tick_state:
+            tick_state[1].stop()
+            tick_jobs.put(None)
         algo_stop(STRATEGY)                                        # pause + square up + unsubscribe every portfolio, wait for it, then stop (refuses while sending is OFF)
 
     shared = globals()

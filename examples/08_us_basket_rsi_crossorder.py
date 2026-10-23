@@ -9,6 +9,7 @@
 #                     come first, then today's candles. So the RSI at 09:35 is computed through yesterday's prices, overnight gap included. No files = it says so and starts from today.
 #   The exit          the script's own target and stop-loss on the price: +TARGET_PCT in its favour, or -STOP_PCT against it (checked on every 1-minute close).
 #                     The engine's CrossOrder has no target or stop and reads its parameters ONCE per portfolio, so an exit is the portfolio's `squareup` command.
+#   One entry         ONE_ENTRY_PER_STOCK = True: a stock is entered ONCE. After its take-profit, stop-loss or any other exit it is not entered again (until the script is pasted again).
 #   The time exit     EXIT_AT (15:55 New York time, 5 minutes before the 16:00 close): the automation is stopped the way algo_stop does it: every portfolio is paused and squared up, a minute
 #                     later unsubscribed (so the plugin can close first), and the script stops. No entry is made from then on. It is checked on every batch of 1-minute candles, so it
 #                     starts within a minute of EXIT_AT. It refuses while sending is OFF (it says so; then run us_basket_rsi_stop() by hand).
@@ -28,6 +29,7 @@ def run_us_basket_rsi():
     import glob
     import io
     import os
+    import queue
     import threading
     import time
     from contextlib import nullcontext
@@ -44,7 +46,7 @@ def run_us_basket_rsi():
     # =============================== USER INPUT ===============================
     USER = 3
     STRATEGY = "us_basket_rsi"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
-    BASKETS = {"us_stocks": ["AAPL", "TSLA", "NVDA", "MSFT", "SPY", "QQQ", "IWM"]}
+    BASKETS = {"us_stocks": ["NVDA", "AAPL", "MSFT", "AMZN", "SPCX", "GOOG", "META", "AVGO", "TSLA", "MU", "WMT", "AMD", "ASML", "PLTR", "INTC", "COST", "CSCO", "AMAT", "PANW", "NFLX", "TXN", "CRWD", "AMGN", "LIN", "ARM", "SHOP", "MRVL", "KLAC", "ADI", "GILD", "SNDK", "PEP", "QCOM"]}
 
     TRADE_AS = {}                            # optional: {"AAPL": "<another contract name or token>"} trade another contract than the basket entry
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
@@ -54,8 +56,12 @@ def run_us_basket_rsi():
     RSI_BAR = "5min"                         # the bar the RSI is computed on (made from the 1-minute candles)
     RSI_N, RSI_HIGH, RSI_LOW = 9, 70, 30
     RSI_LIVE = False                          # True: the bar still forming counts too (acts every minute); False: finished bars only
-    HIST_DAYS = 3                            # how many earlier saved days seed the RSI (0 = none)
+    ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an RSI_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
+                                             # 1-minute close. False: look for an entry on every 1-minute candle
+    HIST_DAYS = 1                            # how many earlier saved days seed the RSI (0 = none)
     TARGET_PCT, STOP_PCT = 1.5, 0.5
+    ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
+                                             # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
     ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
     WINDOW = (dtime(10, 0), dtime(15, 45))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
@@ -64,6 +70,9 @@ def run_us_basket_rsi():
                                              # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.
     UNSUB_AFTER_S = 60                       # a closed position's portfolio is unsubscribed this many seconds after its exit (take-profit, stop-loss, z-exit) so the engine frees the slot;
                                              # the wait lets the plugin send and fill its closing order first. None = never (the slot is then held until the stop at the end of the day)
+    TICK_EXITS = True                        # True: target and stop-loss are also checked on every price tick of the live feed (FEED_TABLE) for the open positions only, not just on each 1-minute close.
+                                             # The candle check stays as the backup, and is used alone if the tick listener cannot be set up (it says so). Needs TARGET_PCT or STOP_PCT.
+    FEED_TABLE = "fo_market_data"            # the live feed: columns token and ltp (raw price; the contract's own divisor from the master turns it into the price)
     FAIL_COOLDOWN_S = 30
     # ==========================================================================
     if not (0 <= MID_ZONE[0] < MID_ZONE[1] <= 100 and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
@@ -110,6 +119,7 @@ def run_us_basket_rsi():
     last_px = {}                                                   # token -> the latest 1-minute close
     position = {}                                                  # token -> {side, entry, qty, pf, state}   state: entering | open | exiting
     traded_in_zone = {}                                            # token -> the zone it was traded in: no second trade until the RSI has left it
+    entered = set()                                                # tokens already entered by this script: with ONE_ENTRY_PER_STOCK they are not entered again
     last_fail = {}
     zone_side = {"OVERSOLD": 1, "OVERBOUGHT": 2}                   # 1 = buy, 2 = sell
 
@@ -263,6 +273,88 @@ def run_us_basket_rsi():
         except Exception as e:
             print(f"{STRATEGY}: PF {pf} could not be unsubscribed ({e}); it keeps its slot until the stop")
 
+    tick_state = []                                                # [the table of open tokens, the tick listener] once the tick exits are on
+
+    def divisor_of(token):
+        """The contract's own divisor from the master (100 for NSE futures and US stocks), else the market's default."""
+        app = current()
+        return app.master.divisor_of.get(int(token)) or app.market.price_div
+
+    def tick_exit(token, pos, px):
+        """Target / stop-loss of an open position on the price `px` (the same rule as on the candle close)."""
+        move = 100.0 * (1 if pos["side"] == 1 else -1) * (px / pos["entry"] - 1.0)                 # % in the position's favour (negative = against it)
+        if TARGET_PCT is not None and move >= TARGET_PCT:
+            last_px[token] = px
+            leave(token, f"target {move:+.2f}% (tick)")
+        elif STOP_PCT is not None and move <= -STOP_PCT:
+            last_px[token] = px
+            leave(token, f"stop-loss {move:+.2f}% (tick)")
+
+    def on_tick(update, is_replay):
+        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python)."""
+        ch = update.added(["token", "ltp"])
+        if ch is None:
+            return
+        for tok, ltp in zip(ch["token"], ch["ltp"]):
+            tok = int(tok)
+            pos = position.get(tok)
+            if pos is None or pos["state"] != "open" or ltp <= 0:
+                continue
+            div = divisor_of(tok)
+            if div:
+                tick_exit(tok, pos, float(ltp) / float(div))
+
+    tick_jobs = queue.Queue()                                      # (token, add?) jobs for the one worker thread: Deephaven refuses an input-table edit made from inside a listener or a callback
+
+    def tick_worker():
+        """Adds / removes the tokens of open positions, one at a time and in order, outside any listener."""
+        while True:
+            item = tick_jobs.get()
+            if item is None:
+                return
+            token, on = item
+            if not tick_state:
+                continue
+            try:
+                from deephaven import new_table
+                from deephaven.column import int_col
+                with exec_ctx:
+                    (tick_state[0].add if on else tick_state[0].delete)(new_table([int_col("token", [token])]))
+            except Exception as e:
+                print(f"{STRATEGY}: tick exits: token {token} could not be {'added' if on else 'removed'} ({e})")
+
+    def tick_track(token, on):
+        """Add / remove a token to the set whose ticks are followed (a position opened / closed). Only queued here: it is done by the worker."""
+        if tick_state:
+            tick_jobs.put((int(token), bool(on)))
+
+    def tick_start():
+        if not TICK_EXITS or (TARGET_PCT is None and STOP_PCT is None):
+            return
+        try:
+            feed = globals().get(FEED_TABLE)
+            if feed is None:
+                raise RuntimeError(f"no table {FEED_TABLE!r} in this session")
+            from deephaven import dtypes, input_table
+            from deephaven.table_listener import listen
+            keys = input_table(col_defs={"token": dtypes.int32}, key_cols="token")
+            ticks = feed.where_in(keys, "token").where("ltp > 0").view(["token", "ltp"])           # in the engine: only the open positions' ticks come through
+            old = current().shared.setdefault("tick_handles", {}).pop(STRATEGY, None)
+            if old is not None:
+                old.stop()                                                                      # pasted again: the old listener goes
+            handle = listen(ticks, on_tick)
+            current().shared["tick_handles"][STRATEGY] = handle
+            old_jobs = current().shared.setdefault("tick_workers", {}).pop(STRATEGY, None)
+            if old_jobs is not None:
+                old_jobs.put(None)                                                              # pasted again: the old worker goes too
+            current().shared["tick_workers"][STRATEGY] = tick_jobs
+            tick_state[:] = [keys, handle]
+            threading.Thread(target=tick_worker, name=f"{STRATEGY}-tick-keys", daemon=True).start()
+            print(f"{STRATEGY}: target and stop-loss are checked on every price tick of {FEED_TABLE} (and on each candle as the backup)")
+        except Exception as e:
+            tick_state.clear()
+            print(f"{STRATEGY}: tick exits not available ({e}); target and stop-loss are checked on each 1-minute candle")
+
     def settled(token, what, future):
         """The bridge answered (called from the NATS thread)."""
         try:
@@ -278,10 +370,13 @@ def run_us_basket_rsi():
                 if pos is not None:
                     live.discard(pos["pf"])
                 position.pop(token, None)
+                tick_track(token, False)
                 last_fail[token] = time.time()
+                entered.discard(token)                                 # nothing was opened: this stock may still be entered
                 print(f"{symbol_of[token]}: entry FAILED ({why}); nothing is open")
         elif ok:
             position.pop(token, None)
+            tick_track(token, False)
             if pos is not None and UNSUB_AFTER_S is not None:
                 timer = threading.Timer(UNSUB_AFTER_S, release, (pos["pf"], token))        # the slot is freed a little later, not at once: the plugin may still be filling its closing order
                 timer.daemon = True
@@ -306,7 +401,9 @@ def run_us_basket_rsi():
             return False
         next_slot[token] += 1
         live.add(a["pf"])
+        entered.add(token)
         position[token] = {"side": side, "entry": last_px[token], "qty": QTY, "pf": a["pf"], "state": "entering"}
+        tick_track(token, True)
         print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {QTY} lot(s) at {last_px[token]:g} on PF {a['pf']}")
         send_entry(a["pf"], token, side, QTY).add_done_callback(lambda f: settled(token, "enter", f))
         return True
@@ -319,8 +416,8 @@ def run_us_basket_rsi():
         print(f"{symbol_of[token]}: {why}, closing at {last_px[token]:g}")
         send_exit(pos["pf"]).add_done_callback(lambda f: settled(token, "exit", f))
 
-    def step(token):
-        """One new 1-minute close of a traded stock: manage its position, or look for an entry."""
+    def step(token, entry_ok=True):
+        """One new 1-minute close of a traded stock: manage its position, or look for an entry (only when `entry_ok`: with ACT_ON_BAR_END that is the candle that ends a bar)."""
         px = last_px[token]
         pos = position.get(token)
         if pos is not None:
@@ -330,6 +427,8 @@ def run_us_basket_rsi():
                     leave(token, f"target {move:+.2f}%")
                 elif move <= -STOP_PCT:
                     leave(token, f"stop-loss {move:+.2f}%")
+            return
+        if not entry_ok or (ONE_ENTRY_PER_STOCK and token in entered):
             return
         zone = zone_of(rsi(closes(token)))
         if zone is None:
@@ -368,7 +467,7 @@ def run_us_basket_rsi():
             if tok in bars and close > 0:
                 add_close(tok, minute, close)
                 last_px[tok] = float(close)
-                step(tok)
+                step(tok, not ACT_ON_BAR_END or (epoch_s(minute) + 60) % BAR_S == 0)       # this candle ends a bar of RSI_BAR: an entry may be looked for
         if past_exit() and not stopping:                           # the time exit: stop the whole automation, once (in its own thread: the stop waits for its commands)
             stopping.append(True)
             threading.Thread(target=time_stop, name=f"{STRATEGY}-time-exit", daemon=True).start()
@@ -386,10 +485,14 @@ def run_us_basket_rsi():
         ready = sum(1 for t in symbol_of if rsi(closes(t)) is not None)
         print(f"   RSI is ready for {ready} of {len(symbol_of)} stocks ({RSI_BAR} bars, {RSI_N + 1} needed)")
 
+    tick_start()
     listener = watch("candles", on_candle, owner=STRATEGY)         # follows the table if candles are restarted; pasting again replaces this listener
 
     def stop():
         listener.stop()
+        if tick_state:
+            tick_state[1].stop()
+            tick_jobs.put(None)
         algo_stop(STRATEGY)                                        # pause + square up + unsubscribe every portfolio, wait for it, then stop (refuses while sending is OFF)
 
     shared = globals()

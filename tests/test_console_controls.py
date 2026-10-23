@@ -105,3 +105,20 @@ def test_redraw_batches_a_burst_into_one_and_stops_when_the_window_is_closed():
     boom.soon()
     time.sleep(0.1)                                            # an error inside a redraw does not kill the timer thread's work for the next one
     boom.soon()
+
+
+def test_turnover_is_shown_in_lakhs():
+    from algo.ui.filters import LAKH, in_lakh
+    assert LAKH == 100_000
+    assert in_lakh(12_345_678.9) == "123.46" and in_lakh(0) == "0.00" and in_lakh(50_000) == "0.50" and in_lakh(1e9) == "10,000.00"
+
+
+def test_the_turnover_box_is_typed_in_lakhs_and_stored_in_rupees():
+    import pytest
+    from algo.ui.filters import LAKH, limit_text, limit_value
+    assert limit_value("50", LAKH) == 5_000_000.0 and limit_value("0.5", LAKH) == 50_000.0 and limit_value("12.34", LAKH) == 1_234_000.0
+    assert limit_value("", LAKH) is None and limit_value("1,50", LAKH) == 15_000_000.0                 # (a comma is ignored, as before)
+    assert limit_text(5_000_000, LAKH) == "50" and limit_text(1_234_000, LAKH) == "12.34" and limit_text(None, LAKH) == "" and limit_text(0, LAKH) == ""
+    assert limit_value("-10000", 1) == -10000.0 and limit_text(-10000, 1) == "-10000"                  # the M2M box and the dollar market are unchanged
+    with pytest.raises(ValueError):
+        limit_value("abc", LAKH)

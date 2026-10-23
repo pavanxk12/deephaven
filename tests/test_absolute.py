@@ -445,6 +445,16 @@ def test_warming_iv_for_many_underlyings(folder):
     assert s.absolute("iv", "intraday", "NIFTY", 5, now=2.5)[0].tolist() == pytest.approx([1, 2, 3, 4, 5]) and s.stats()["loads"] == 10
 
 
+def test_a_straddle_day_saved_without_the_iv_column_gives_no_iv_instead_of_an_error(folder):
+    t = pa.table({"Time": ["09:25:02"], "Symbol": ["NIFTY"], "Expiry": ["2026-03-17"], "Date": ["2026-03-10"]})        # like straddle_2026-10-12 on 130
+    pq.write_table(t, str(folder / "straddle_2026-03-10.parquet"), compression="zstd")
+    src = ParquetSource(Store(str(folder)))
+    assert src.iv("2026-03-10", "NIFTY") is None and src.iv_many("2026-03-10", ["NIFTY"]) == {}
+    assert src.iv("2026-03-09", "NIFTY") is not None                                                                   # the other days still read
+    s = AbsoluteService(Clock(IST, NSE_SESSION), src, now=lambda: epoch(TODAY, 11))
+    assert s.warm("iv", "intraday", ["NIFTY"], 5) == 1                                                                 # warming over the bad day does not raise
+
+
 def test_the_contract_picker_skips_a_row_with_no_symbol():
     from algo.series.absolute import month_contract
     names = ["SBIN 30JAN20 FUT", None, "SBIN 27FEB20 FUT"]                       # a day file can hold a row whose token the master did not know
