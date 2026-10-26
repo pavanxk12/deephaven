@@ -1,11 +1,15 @@
 # INDIA STOCK FUTURES BASKET + EMA 5/10 CROSS + EXTREME FILTERS + CrossOrder: 11 without the RSI. A plain script (functions, no class). Paste in the India server's terminal after the services are up (init.py).
 #
 #   The universe      as in 11: every STOCK future of the master that has not expired (ONLY = [...] limits it), "SBIN FUT" = the nearest future of each day, dealt into N_BASKETS baskets.
-#   The signal        the EMA(EMA_FAST) crosses the EMA(EMA_SLOW) of the 5-minute closes (EMA_BAR = "5min", made from the 1-minute candles; seeded from the last HIST_DAYS saved days):
-#                     fast crosses ABOVE slow on the bar that has just finished -> BUY, crosses BELOW -> SELL. Looked at once per finished bar (the candle that ends it: :05, :10, :15 ...).
-#   The filters       the cross is taken only if the stock is EXTREME, not in the middle, both against its basket (relative()) and against its own earlier days (absolute()), for
-#                     the % change from the OPEN, the % change from the VWAP and the IV (USE_IV):  percentile above EXTREME[1] (75) = strong, below EXTREME[0] (25) = weak.
-#                     DIRECTION_MATCH = True: a BUY needs the STRONG side in every one of them, a SELL the WEAK side. False: either extreme passes.
+#   The signal        at the end of every EMA_BAR bar (the candle that ends it: :05, :10, :15 ...), for each stock that has no position, four filters in this order:
+#                     0. TODAY      the latest EMA_BAR close must be the HIGHEST of today's EMA_BAR closes so far (a BUY) or the LOWEST (a SELL) (DAY_EXTREME); a stock that is neither is
+#                                   dropped here, before anything else is asked.
+#                     1. RELATIVE   the stock must be EXTREME against its basket (relative()), for the % change from the OPEN, the % change from the VWAP and the IV (USE_IV): percentile above EXTREME[1] (75) = strong,
+#                                   below EXTREME[0] (25) = weak. DIRECTION_MATCH = True: all STRONG points to a BUY, all WEAK to a SELL. False: either extreme passes and the EMAs choose the side.
+#                     2. EMA        the EMA(EMA_FAST) of the 5-minute closes (EMA_BAR = "5min", made from the 1-minute candles; seeded from the last HIST_DAYS saved days) against the EMA(EMA_SLOW), no crossover
+#                                   needed: fast ABOVE slow = BUY, fast BELOW slow = SELL; with DIRECTION_MATCH it must agree with the side the ranking pointed to.
+#                     3. ABSOLUTE   the stock must also be EXTREME against its own earlier days at the same minute (absolute(), ABS_DAYS = 22 saved days), on the same side.
+#                     Each filter runs only for the stocks that passed the one before it. With fewer than half of the days in the files absolute() cannot tell and there is no trade.
 #                     The IV of a future is the IV of its underlying (the straddle series of the nearest expiry): the script STARTS the straddle itself if it is not running (straddle_start(STRADDLE_N); the candles must
 #                     hold the OPTIONS too, not futures only) and straddle_<day>.parquet files must exist for the earlier days. Without them the IV filter says "cannot tell" and nothing trades; USE_IV = False
 #                     leaves the IV out.
@@ -69,13 +73,14 @@ def run_india_fut_ema():
     EXCLUDE = []                             # optional: underlyings to leave out
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
     EXTREME = (25.0, 75.0)                   # a percentile is EXTREME when it is below EXTREME[0] (weak) or above EXTREME[1] (strong); the middle band does not trade
-    DIRECTION_MATCH = True                   # True: a BUY (fast EMA crosses above the slow) needs the STRONG side (above 75) everywhere, a SELL (crosses below) the WEAK side (below 25).
-                                             # False: either extreme passes, whatever the direction of the cross
+    DIRECTION_MATCH = True                   # True: a BUY (fast EMA above the slow) needs the STRONG side (above 75) everywhere, a SELL (fast below slow) the WEAK side (below 25).
+                                             # False: either extreme passes, whatever the side of the EMAs
     USE_IV = True                            # True: the IV must be extreme too (against the basket and against its own days). Needs the straddle running and straddle_<day> files. False: % from open / VWAP only
     STRADDLE_N = 0                           # straddle_start(STRADDLE_N) when the script starts it itself: 0 = the nearest expiry only (what the IV filters read)
+    DAY_EXTREME = True                       # True: filter 0, the latest EMA_BAR close (5min) must be the highest (BUY) or the lowest (SELL) of today's EMA_BAR closes so far (at least 2 bars today). False: off
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
     EMA_BAR = "5min"                         # the bar the EMAs are computed on (made from the 1-minute candles)
-    EMA_FAST, EMA_SLOW = 5, 10               # the two EMAs: a cross of the fast over the slow is the signal
+    EMA_FAST, EMA_SLOW = 5, 10               # the two EMAs: fast above slow = long, fast below slow = short
     ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an EMA_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
                                              # 1-minute close. False: look for an entry on every 1-minute candle
     HIST_DAYS = 1                            # how many earlier saved days seed the EMAs (0 = none)
@@ -83,7 +88,7 @@ def run_india_fut_ema():
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
-    ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
+    ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 26286, "ACCOUNT": "", "ALGOID": "34500"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
     WINDOW = (dtime(9, 30), dtime(15, 0))    # entries only inside it (India time, the session is 09:15 to 15:30); an exit is sent at any time
     EXIT_AT = dtime(15, 15)                  # time exit (India time): 15 minutes before the 15:30 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
     MAX_PORTFOLIOS = 32                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
@@ -94,6 +99,8 @@ def run_india_fut_ema():
                                              # The candle check stays as the backup, and is used alone if the tick listener cannot be set up (it says so). Needs TARGET_PCT or STOP_PCT.
     FEED_TABLE = "fo_market_data"            # the live feed: columns token and ltp (raw price; the contract's own divisor from the master turns it into the price)
     FAIL_COOLDOWN_S = 30
+    RETRY_RANKING_S = 20                     # a ranking read that fails (a rare clash with the update cycle: "Previous values requested or inconsistent") is tried again on the next candle batches
+                                             # for this many seconds instead of giving up on that stock for the whole bar. 0 = no retry
     # ==========================================================================
 
     def make_baskets():
@@ -164,9 +171,27 @@ def run_india_fut_ema():
     bars = {t: {} for t in symbol_of}                              # token -> {5-minute bar number: the last 1-minute close inside it}: what the EMAs are computed from
     last_px = {}                                                   # token -> the latest 1-minute close
     position = {}                                                  # token -> {side, entry, qty, pf, state}   state: entering | open | exiting
-    last_cross = {}                                                # token -> the bar of the cross it was last entered on: one entry per cross
+    last_cross = {}                                                # token -> the bar it was last entered on: not twice on one bar
     entered = set()                                                # tokens already entered by this script: with ONE_ENTRY_PER_STOCK they are not entered again
     last_fail = {}
+    counts = {}                                                    # where the signals went (shown by status()): looked at, refused at which filter, ranking errors, entered
+    retry = {}                                                     # token -> when its ranking first failed; looked at again on the next candle batches for RETRY_RANKING_S seconds
+
+    def count(key):
+        counts[key] = counts.get(key, 0) + 1
+
+    def ranking_failed(token, first, e):
+        """A ranking read raised: count it and, for RETRY_RANKING_S seconds from the first failure, look at this stock again on the next candle batch."""
+        count("ranking errors")
+        now = time.time()
+        first = first or now
+        said = (str(e).splitlines() or [""])[0][:150]
+        if now - first < RETRY_RANKING_S:
+            retry[token] = first
+            print(f"{symbol_of[token]}: the ranking is not available ({said}); trying again on the next candle batch")
+        else:
+            print(f"{symbol_of[token]}: the ranking is still not available ({said}); no trade this time")
+
 
     def epoch_s(minute):
         """A candle's Minute (a numpy / pandas / Java time) as UTC epoch seconds. 5-minute bars line up with the clock in India too (its offset, 5 h 30 min, is a whole number of 5-minute bars)."""
@@ -266,7 +291,7 @@ def run_india_fut_ema():
             if len(h):
                 last_px[t] = float(h["Close"].iloc[-1])
 
-    # ---- the indicator: the EMA cross --------------------------------------------------------------------------------------------------
+    # ---- the indicator: the EMA fast against slow --------------------------------------------------------------------------------------------------
     def ema(values, n):
         """The exponential moving average of the closes, one value per close (alpha = 2 / (n + 1), started from the first close)."""
         k = 2.0 / (n + 1.0)
@@ -277,59 +302,81 @@ def run_india_fut_ema():
             out.append(e)
         return out
 
-    def cross_of(values):
-        """1 = the fast EMA has just crossed ABOVE the slow one on the last bar (buy), 2 = just crossed BELOW (sell), None = no cross on the last bar."""
-        if len(values) < 2 * EMA_SLOW:                             # too little to trust an EMA yet
+    def trend_of(values):
+        """1 = the fast EMA is ABOVE the slow one on the last bar (long), 2 = BELOW (short), None = equal, or too few bars to trust an EMA yet."""
+        if len(values) < 2 * EMA_SLOW:
             return None
         fast, slow = ema(values, EMA_FAST), ema(values, EMA_SLOW)
-        before, now = fast[-2] - slow[-2], fast[-1] - slow[-1]
-        if before <= 0 < now:
-            return 1
-        if before >= 0 > now:
-            return 2
-        return None
+        diff = fast[-1] - slow[-1]
+        return 1 if diff > 0 else 2 if diff < 0 else None
 
-    # ---- the filters: EXTREME, against the basket and against the stock's own days ---------------------------------------------------
-    def extreme_ok(pctile, side):
-        """True when the percentile is extreme: above EXTREME[1] (strong) or below EXTREME[0] (weak). With DIRECTION_MATCH a BUY needs the strong side and a SELL the weak side."""
-        if pctile is None or pctile != pctile:
-            return False
-        strong, weak = pctile > EXTREME[1], pctile < EXTREME[0]
+    def day_sides(token):
+        """Filter 0: the sides today's EMA_BAR closes allow. {1} (BUY) when the latest bar close is the highest of today so far, {2} (SELL) when it is the lowest, empty when it is neither or when
+        there are fewer than 2 bars today (the first one is both). Only today's bars count, not the history that seeds the EMAs. Everything is allowed when DAY_EXTREME is False."""
+        if not DAY_EXTREME:
+            return {1, 2}
+        b = bars[token]
+        if not b:
+            return set()
+        keys = sorted(b, reverse=True)
+        day = datetime.fromtimestamp(keys[0] * BAR_S, ZoneInfo("Asia/Kolkata")).date()
+        today = []
+        for k in keys:                                             # newest first, until an earlier day begins
+            if datetime.fromtimestamp(k * BAR_S, ZoneInfo("Asia/Kolkata")).date() != day:
+                break
+            today.append(b[k])
+        if len(today) < 2:
+            return set()
+        return ({1} if today[0] >= max(today) else set()) | ({2} if today[0] <= min(today) else set())
+
+    # ---- the filters: EXTREME against the basket (relative), the EMAs, EXTREME against the stock's own days (absolute) ------------------------
+    def sides_of(pctiles):
+        """The sides these percentiles allow. {1} (BUY) when every one is STRONG (above EXTREME[1]), {2} (SELL) when every one is WEAK (below EXTREME[0]). With DIRECTION_MATCH False, {1, 2} when
+        every one is extreme on either side (the EMAs then choose the side). Empty when one of them is in the middle, or unknown."""
+        if not pctiles or any(p is None or p != p for p in pctiles):
+            return set()
+        strong, weak = all(p > EXTREME[1] for p in pctiles), all(p < EXTREME[0] for p in pctiles)
         if DIRECTION_MATCH:
-            return strong if side == 1 else weak
-        return strong or weak
+            return ({1} if strong else set()) | ({2} if weak else set())
+        return {1, 2} if all(p > EXTREME[1] or p < EXTREME[0] for p in pctiles) else set()
 
     def under_of(symbol):
         return symbol[:-4]                                         # "SBIN FUT" -> "SBIN": the IV is the underlying's
 
-    def in_extreme_of_basket(symbol, side):
-        """% from the open, % from the VWAP and (USE_IV) the IV of the symbol each rank extreme among the OTHER symbols of ITS basket (relative())."""
+    def basket_sides(symbol):
+        """Filter 1, relative(): the sides the ranking of the symbol among the OTHER symbols of ITS basket allows (the % from the open, from the VWAP and the IV)."""
         members = BASKETS[basket_of[symbol]]
+        pctiles = []
         for ref in ("open", "vwap"):
-            with exec_ctx:                                         # relative() reads the candles table; a listener thread needs the terminal's query context for that
+            with exec_ctx:                                         # the call reads the candles table; a listener thread needs the terminal's query context for that
                 result = relative("pct", LEVEL, symbol, members, ref=ref)
-            if result[1] < 0 or not extreme_ok(result.pctile, side):          # (the second item is -1 when it cannot be told)
-                return False
+            if result[1] < 0:                                      # (the second item is -1 when it cannot be told)
+                return set()
+            pctiles.append(result.pctile)
         if USE_IV:
             with exec_ctx:
                 result = relative("iv", LEVEL, under_of(symbol), [under_of(m) for m in members])
-            if result[1] < 0 or not extreme_ok(result.pctile, side):
-                return False
-        return True
+            if result[1] < 0:
+                return set()
+            pctiles.append(result.pctile)
+        return sides_of(pctiles)
 
-    def in_extreme_of_own_days(symbol, side):
-        """The same three measures, now, each rank extreme among the same minute of the previous ABS_DAYS trading days (absolute()); -1 (cannot tell) is no trade."""
+    def own_days_sides(symbol):
+        """Filter 3, absolute(): the sides the ranking of the symbol among the same minute of its previous ABS_DAYS trading days allows; -1 (cannot tell) is none."""
+        pctiles = []
         for ref in ("open", "vwap"):
-            with exec_ctx:                                         # absolute() reads today's candles table once, and the saved day files
+            with exec_ctx:                                         # the call reads the candles table; a listener thread needs the terminal's query context for that
                 result = absolute("pct", LEVEL, symbol, ABS_DAYS, ref=ref)
-            if result[1] < 0 or not extreme_ok(result.pctile, side):
-                return False
+            if result[1] < 0:                                      # (the second item is -1 when it cannot be told)
+                return set()
+            pctiles.append(result.pctile)
         if USE_IV:
             with exec_ctx:
                 result = absolute("iv", LEVEL, under_of(symbol), ABS_DAYS)
-            if result[1] < 0 or not extreme_ok(result.pctile, side):
-                return False
-        return True
+            if result[1] < 0:
+                return set()
+            pctiles.append(result.pctile)
+        return sides_of(pctiles)
 
     # ---- the orders ------------------------------------------------------------------------------------------------------------------
     def in_window():
@@ -521,21 +568,36 @@ def run_india_fut_ema():
             return
         if not entry_ok or (ONE_ENTRY_PER_STOCK and token in entered):
             return
-        side = cross_of(closes(token, finished_only=not ends_bar))
-        if side is None:
-            return
         keys = sorted(bars[token])
-        bar = keys[-1] if ends_bar else (keys[-2] if len(keys) > 1 else None)       # the bar the cross happened on
+        bar = keys[-1] if ends_bar else (keys[-2] if len(keys) > 1 else None)       # the bar this look is at
         if last_cross.get(token) == bar or not in_window() or not algo_sending(STRATEGY) or not pf_allowed(STRATEGY, token):
             return
         if time.time() - last_fail.get(token, 0.0) < FAIL_COOLDOWN_S:
             return
+        first = retry.pop(token, None)
+        if first is None:
+            count("looked at")
         try:
-            ok = (ABS_DAYS == 0 or in_extreme_of_own_days(symbol_of[token], side)) and in_extreme_of_basket(symbol_of[token], side)      # its own days first (cached), then the basket
+            today = day_sides(token)                               # 0. today's bar closes: the latest is the day's highest (buy) or lowest (sell)
+            if not today:
+                count("not the high/low of the day")
+                return
+            allowed = basket_sides(symbol_of[token])               # 1. relative: extreme in its basket (and on which side)
+            if not allowed:
+                count("refused by basket")
+                return
+            side = trend_of(closes(token, finished_only=not ends_bar))        # 2. the EMAs: fast above slow = buy, below = sell
+            if side is None or side not in allowed or side not in today:
+                count("refused by EMAs")
+                return
+            if ABS_DAYS > 0 and side not in own_days_sides(symbol_of[token]):         # 3. absolute: extreme against its own days, on the same side
+                count("refused by own days")
+                return
         except Exception as e:
-            print(f"{symbol_of[token]}: the ranking is not available ({e}); no trade")
+            ranking_failed(token, first, e)
             return
-        if ok and enter(token, side):
+        if enter(token, side):
+            count("entered")
             last_cross[token] = bar
 
     stopping = []                                                  # set once the time exit has started the stop
@@ -554,6 +616,7 @@ def run_india_fut_ema():
         ch = update.added(["token", "Close", "Minute"])
         if ch is None:
             return
+        due = list(retry.items())                                  # stocks whose ranking failed in an earlier batch: looked at again below, once this batch has been taken in
         for tok, close, minute in zip(ch["token"], ch["Close"], ch["Minute"]):
             tok = int(tok)
             if tok in bars and close > 0:
@@ -561,6 +624,11 @@ def run_india_fut_ema():
                 last_px[tok] = float(close)
                 ends_bar = (epoch_s(minute) + 60) % BAR_S == 0                              # this candle completes a bar of EMA_BAR
                 step(tok, not ACT_ON_BAR_END or ends_bar, ends_bar)
+        for tok, t0 in due:
+            if time.time() - t0 >= RETRY_RANKING_S:
+                retry.pop(tok, None)                               # waited long enough: given up on this bar
+            elif tok in retry:
+                step(tok, True, True)
         if past_exit() and not stopping:                           # the time exit: stop the whole automation, once (in its own thread: the stop waits for its commands)
             stopping.append(True)
             threading.Thread(target=time_stop, name=f"{STRATEGY}-time-exit", daemon=True).start()
@@ -577,6 +645,7 @@ def run_india_fut_ema():
             print(f"   {symbol_of[token]:16} {'LONG' if p['side'] == 1 else 'SHORT'} {p['qty']} lot(s) entry {p['entry']:g} now {last_px.get(token, float('nan')):g} PF {p['pf']} {p['state']}")
         ready = sum(1 for t in symbol_of if len(closes(t, True)) >= 2 * EMA_SLOW)
         print(f"   the EMAs are ready for {ready} of {len(symbol_of)} stocks ({EMA_BAR} bars, {2 * EMA_SLOW} needed)")
+        print("   signals: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none yet"))
 
     tick_start()
     listener = watch("candles", on_candle, owner=STRATEGY)         # follows the table if candles are restarted; pasting again replaces this listener

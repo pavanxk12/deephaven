@@ -63,6 +63,8 @@ def run_us_basket_rsi():
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
+    ENTRY_VALUE = None                       # None: every entry is QTY lots. A number (dollars): the quantity at entry is int(ENTRY_VALUE / the last 1-minute close), QTY is then not used;
+                                             # if one share costs more than ENTRY_VALUE the quantity would be 0 and that entry is skipped (it says so)
     ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
     WINDOW = (dtime(10, 0), dtime(15, 45))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
     EXIT_AT = dtime(15, 55)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
@@ -74,8 +76,10 @@ def run_us_basket_rsi():
                                              # The candle check stays as the backup, and is used alone if the tick listener cannot be set up (it says so). Needs TARGET_PCT or STOP_PCT.
     FEED_TABLE = "fo_market_data"            # the live feed: columns token and ltp (raw price; the contract's own divisor from the master turns it into the price)
     FAIL_COOLDOWN_S = 30
+    RETRY_RANKING_S = 20                     # a ranking read that fails (a rare clash with the update cycle: "Previous values requested or inconsistent") is tried again on the next candle batches
+                                             # for this many seconds instead of giving up on that stock for the whole bar. 0 = no retry
     # ==========================================================================
-    if not (0 <= MID_ZONE[0] < MID_ZONE[1] <= 100 and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
+    if not (0 <= MID_ZONE[0] < MID_ZONE[1] <= 100 and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and (ENTRY_VALUE is None or ENTRY_VALUE > 0) and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
             and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and 0 <= ABS_ZONE[0] < ABS_ZONE[1] <= 100 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
         raise ValueError("MID_ZONE and ABS_ZONE must be inside 0 to 100, TARGET_PCT and STOP_PCT above 0, QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, "
                          "and every basket needs at least 3 symbols")
@@ -121,6 +125,24 @@ def run_us_basket_rsi():
     traded_in_zone = {}                                            # token -> the zone it was traded in: no second trade until the RSI has left it
     entered = set()                                                # tokens already entered by this script: with ONE_ENTRY_PER_STOCK they are not entered again
     last_fail = {}
+    counts = {}                                                    # where the signals went (shown by status()): looked at, refused at which filter, ranking errors, entered
+    retry = {}                                                     # token -> when its ranking first failed; looked at again on the next candle batches for RETRY_RANKING_S seconds
+
+    def count(key):
+        counts[key] = counts.get(key, 0) + 1
+
+    def ranking_failed(token, first, e):
+        """A ranking read raised: count it and, for RETRY_RANKING_S seconds from the first failure, look at this stock again on the next candle batch."""
+        count("ranking errors")
+        now = time.time()
+        first = first or now
+        said = (str(e).splitlines() or [""])[0][:150]
+        if now - first < RETRY_RANKING_S:
+            retry[token] = first
+            print(f"{symbol_of[token]}: the ranking is not available ({said}); trying again on the next candle batch")
+        else:
+            print(f"{symbol_of[token]}: the ranking is still not available ({said}); no trade this time")
+
     zone_side = {"OVERSOLD": 1, "OVERBOUGHT": 2}                   # 1 = buy, 2 = sell
 
     def epoch_s(minute):
@@ -396,16 +418,20 @@ def run_us_basket_rsi():
         if next_slot[token] >= 100:
             print(f"{symbol_of[token]}: all 100 portfolios of the day are used, no trade")
             return False
+        qty = QTY if ENTRY_VALUE is None else int(ENTRY_VALUE / last_px[token])         # by value: whole units for ENTRY_VALUE at the last close
+        if qty < 1:
+            print(f"{symbol_of[token]}: ENTRY_VALUE {ENTRY_VALUE:g} buys less than one unit at {last_px[token]:g}, no trade")
+            return False
         a = pf_assign(STRATEGY, token, token, name=symbol_of[token], slot=next_slot[token])       # the BOOK gives a NEW portfolio number (None while OFF or unticked)
         if not a:
             return False
         next_slot[token] += 1
         live.add(a["pf"])
         entered.add(token)
-        position[token] = {"side": side, "entry": last_px[token], "qty": QTY, "pf": a["pf"], "state": "entering"}
+        position[token] = {"side": side, "entry": last_px[token], "qty": qty, "pf": a["pf"], "state": "entering"}
         tick_track(token, True)
-        print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {QTY} lot(s) at {last_px[token]:g} on PF {a['pf']}")
-        send_entry(a["pf"], token, side, QTY).add_done_callback(lambda f: settled(token, "enter", f))
+        print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {qty} lot(s) at {last_px[token]:g} on PF {a['pf']}")
+        send_entry(a["pf"], token, side, qty).add_done_callback(lambda f: settled(token, "enter", f))
         return True
 
     def leave(token, why):
@@ -438,12 +464,21 @@ def run_us_basket_rsi():
             return
         if time.time() - last_fail.get(token, 0.0) < FAIL_COOLDOWN_S:
             return
+        first = retry.pop(token, None)
+        if first is None:
+            count("signals")
         try:
-            middle = (ABS_DAYS == 0 or in_own_history(symbol_of[token])) and in_middle(symbol_of[token])      # its own days first (cached), then the basket
+            own = ABS_DAYS == 0 or in_own_history(symbol_of[token])               # its own days first (cached), then the basket
+            middle = own and in_middle(symbol_of[token])
         except Exception as e:
-            print(f"{symbol_of[token]}: the ranking is not available ({e}); no trade")
+            ranking_failed(token, first, e)
             return
-        if middle and enter(token, zone_side[zone]):
+        if not own:
+            count("refused by own days")
+        elif not middle:
+            count("refused by basket")
+        elif enter(token, zone_side[zone]):
+            count("entered")
             traded_in_zone[token] = zone
 
     stopping = []                                                  # set once the time exit has started the stop
@@ -462,12 +497,18 @@ def run_us_basket_rsi():
         ch = update.added(["token", "Close", "Minute"])
         if ch is None:
             return
+        due = list(retry.items())                                  # stocks whose ranking failed in an earlier batch: looked at again below, once this batch has been taken in
         for tok, close, minute in zip(ch["token"], ch["Close"], ch["Minute"]):
             tok = int(tok)
             if tok in bars and close > 0:
                 add_close(tok, minute, close)
                 last_px[tok] = float(close)
                 step(tok, not ACT_ON_BAR_END or (epoch_s(minute) + 60) % BAR_S == 0)       # this candle ends a bar of RSI_BAR: an entry may be looked for
+        for tok, t0 in due:
+            if time.time() - t0 >= RETRY_RANKING_S:
+                retry.pop(tok, None)                               # waited long enough: given up on this bar
+            elif tok in retry:
+                step(tok, True)
         if past_exit() and not stopping:                           # the time exit: stop the whole automation, once (in its own thread: the stop waits for its commands)
             stopping.append(True)
             threading.Thread(target=time_stop, name=f"{STRATEGY}-time-exit", daemon=True).start()
@@ -484,6 +525,7 @@ def run_us_basket_rsi():
             print(f"   {symbol_of[token]:8} {'LONG' if p['side'] == 1 else 'SHORT'} {p['qty']} lot(s) entry {p['entry']:g} now {last_px.get(token, float('nan')):g} PF {p['pf']} {p['state']}")
         ready = sum(1 for t in symbol_of if rsi(closes(t)) is not None)
         print(f"   RSI is ready for {ready} of {len(symbol_of)} stocks ({RSI_BAR} bars, {RSI_N + 1} needed)")
+        print("   signals: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none yet"))
 
     tick_start()
     listener = watch("candles", on_candle, owner=STRATEGY)         # follows the table if candles are restarted; pasting again replaces this listener

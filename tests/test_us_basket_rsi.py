@@ -300,3 +300,43 @@ def test_with_one_entry_per_stock_a_stock_is_not_entered_again_after_its_exit(tm
     (tmp_path / "b").mkdir()
     sides = run_two_oversold_spells(tmp_path / "b", fake_dh, monkeypatch, **{"ONE_ENTRY_PER_STOCK = True": "ONE_ENTRY_PER_STOCK = False"})
     assert sides[0] == 1 and len(sides) >= 2                                                         # with the rule off the same candles enter again
+
+
+def test_entry_value_makes_the_quantity_int_value_over_the_close_and_skips_an_entry_it_cannot_afford(tmp_path, fake_dh, monkeypatch, capsys):
+    assert "ENTRY_VALUE = None" in SCRIPT
+    ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch, **{"ENTRY_VALUE = None": "ENTRY_VALUE = 1000.0"})
+    feed(fake_dh, [100.0 - 0.25 * i for i in range(60)])
+    assert wait_for(lambda: len(wire.sent) == 1)
+    px = float(re.search(r"BUY (\d+) lot\(s\) at ([0-9.]+) on PF", capsys.readouterr().out).group(2))
+    assert wire.sent[0][2]["QTY"] == int(1000.0 / px) and wire.sent[0][2]["QTY"] > 1                  # by value, not the fixed QTY = 1
+    svc.on_stop()
+    fake_dh.clear()
+    (tmp_path / "b").mkdir()
+    ns, app, svc, wire, calls, before = start(tmp_path / "b", monkeypatch, **{"ENTRY_VALUE = None": "ENTRY_VALUE = 50.0"})
+    feed(fake_dh, [100.0 - 0.25 * i for i in range(60)])
+    time.sleep(0.3)
+    assert wire.sent == [] and "ENTRY_VALUE 50 buys less than one unit" in capsys.readouterr().out    # one share costs more than the value: no trade
+    svc.on_stop()
+    fake_dh.clear()
+    with pytest.raises(ValueError):
+        start(tmp_path / "c", monkeypatch, **{"ENTRY_VALUE = None": "ENTRY_VALUE = -5"})
+
+
+def test_a_ranking_that_fails_is_counted_said_in_one_line_and_tried_again(tmp_path, fake_dh, monkeypatch, capsys):
+    assert "RETRY_RANKING_S = 20" in SCRIPT
+    ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch)
+    orig, n = ns["relative"], {"calls": 0}
+
+    def flaky(*a, **k):
+        n["calls"] += 1
+        if n["calls"] == 1:
+            raise RuntimeError("io.deephaven.base.verify.AssertionFailure: asserted Previous values requested" + chr(10) + "Traceback (most recent call last):" + chr(10) + "  File x")
+        return orig(*a, **k)
+    ns["relative"] = flaky
+    feed(fake_dh, [100.0 - 0.25 * i for i in range(60)])                                              # oversold from the 10th bar on
+    assert wait_for(lambda: len(wire.sent) == 1)
+    ns["us_basket_rsi_status"]()
+    out = capsys.readouterr().out
+    assert out.count("the ranking is not available") == 1 and "Traceback" not in out and "trying again" in out
+    assert "ranking errors 1" in out and "signals" in out and "entered 1" in out
+    svc.on_stop()

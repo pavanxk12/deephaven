@@ -342,3 +342,15 @@ def test_script_11_does_not_enter_a_stock_again_after_its_exit(tmp_path, fake_dh
     (tmp_path / "b").mkdir()
     sides = one_entry_run(tmp_path / "b", fake_dh, monkeypatch, **{"ONE_ENTRY_PER_STOCK = True": "ONE_ENTRY_PER_STOCK = False"})
     assert sides[0] == 1 and len(sides) >= 2                                                         # with the rule off the same candles enter again
+
+
+ALL_SIX = ["08_us_basket_rsi_crossorder.py", "10_us_zscore_crossorder.py", "11_india_fut_rsi_crossorder.py", "12_india_fut_zscore_crossorder.py", "13_india_fut_ema_cross_crossorder.py", "14_us_ema_cross_crossorder.py"]
+
+
+@pytest.mark.parametrize("name", ALL_SIX, ids=[n[:2] for n in ALL_SIX])
+def test_every_ranking_script_retries_a_failed_ranking_and_counts_where_signals_go(name):
+    text = (EXAMPLES / name).read_text(encoding="utf-8")
+    for needle in ("RETRY_RANKING_S = 20", "def ranking_failed(token, first, e):", "retry[token] = first", "due = list(retry.items())", 'count("signals")' if name[:2] in ("08", "10", "11", "12") else 'count("looked at")',
+                   'count("entered")', 'count("ranking errors")', '"   signals: "'):
+        assert needle in text, (name, needle)
+    assert "the ranking is not available ({e}); no trade" not in text                                    # the old one-shot message (with the whole stack trace) is gone

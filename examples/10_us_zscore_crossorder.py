@@ -73,6 +73,8 @@ def run_us_zscore():
                                              # The candle check stays as the backup, and is used alone if the tick listener cannot be set up (it says so). Needs TARGET_PCT or STOP_PCT.
     FEED_TABLE = "fo_market_data"            # the live feed: columns token and ltp (raw price; the contract's own divisor from the master turns it into the price)
     FAIL_COOLDOWN_S = 30
+    RETRY_RANKING_S = 20                     # a ranking read that fails (a rare clash with the update cycle: "Previous values requested or inconsistent") is tried again on the next candle batches
+                                             # for this many seconds instead of giving up on that stock for the whole bar. 0 = no retry
     # ==========================================================================
     if not (0 <= MID_ZONE[0] < MID_ZONE[1] <= 100 and (TARGET_PCT is None or TARGET_PCT > 0) and (STOP_PCT is None or STOP_PCT > 0) and QTY >= 1 and BASKETS
             and all(len(v) >= 3 for v in BASKETS.values()) and isinstance(Z_DAYS, int) and 5 <= Z_DAYS <= 560 and isinstance(Z_MIN_DAYS, int) and 3 <= Z_MIN_DAYS and Z_ENTRY > 0
@@ -121,6 +123,24 @@ def run_us_zscore():
     traded_in_zone = {}                                            # token -> the zone it was traded in: no second trade until z has come back inside the band
     z_error_said = set()                                           # symbols whose z-score error was already printed
     last_fail = {}
+    counts = {}                                                    # where the signals went (shown by status()): looked at, refused at which filter, ranking errors, entered
+    retry = {}                                                     # token -> when its ranking first failed; looked at again on the next candle batches for RETRY_RANKING_S seconds
+
+    def count(key):
+        counts[key] = counts.get(key, 0) + 1
+
+    def ranking_failed(token, first, e):
+        """A ranking read raised: count it and, for RETRY_RANKING_S seconds from the first failure, look at this stock again on the next candle batch."""
+        count("ranking errors")
+        now = time.time()
+        first = first or now
+        said = (str(e).splitlines() or [""])[0][:150]
+        if now - first < RETRY_RANKING_S:
+            retry[token] = first
+            print(f"{symbol_of[token]}: the ranking is not available ({said}); trying again on the next candle batch")
+        else:
+            print(f"{symbol_of[token]}: the ranking is still not available ({said}); no trade this time")
+
     zone_side = {"LOW": 1, "HIGH": 2}                              # z <= -Z_ENTRY -> buy (1), z >= Z_ENTRY -> sell (2)
 
     try:                                                           # read the earlier days of every stock NOW (one read per day file for all of them), not in the candle thread at the first signal
@@ -374,13 +394,18 @@ def run_us_zscore():
             return
         if time.time() - last_fail.get(token, 0.0) < FAIL_COOLDOWN_S:
             return
+        first = retry.pop(token, None)
+        if first is None:
+            count("signals")
         try:
-            if not in_middle(symbol_of[token]):                    # the middle of its basket
-                return
+            middle = in_middle(symbol_of[token])                   # the middle of its basket
         except Exception as e:
-            print(f"{symbol_of[token]}: the ranking is not available ({e}); no trade")
+            ranking_failed(token, first, e)
             return
-        if enter(token, zone_side[zone]):
+        if not middle:
+            count("refused by basket")
+        elif enter(token, zone_side[zone]):
+            count("entered")
             traded_in_zone[token] = zone
 
     stopping = []                                                  # set once the time exit has started the stop
@@ -399,12 +424,18 @@ def run_us_zscore():
         ch = update.added(["token", "Close", "Minute"])
         if ch is None:
             return
+        due = list(retry.items())                                  # stocks whose ranking failed in an earlier batch: looked at again below, once this batch has been taken in
         for tok, close, minute in zip(ch["token"], ch["Close"], ch["Minute"]):
             tok = int(tok)
             if tok in symbol_of and close > 0:
                 last_px[tok] = float(close)
                 if Z_BAR_LIVE or (epoch_s(minute) + 60) % BAR_S == 0:  # Z_BAR_LIVE: every minute; else only the 1-minute candle that ends a Z_BAR bar (the bar is finished)
                     step(tok)
+        for tok, t0 in due:
+            if time.time() - t0 >= RETRY_RANKING_S:
+                retry.pop(tok, None)                               # waited long enough: given up on this bar
+            elif tok in retry:
+                step(tok)
         if past_exit() and not stopping:                           # the time exit: stop the whole automation, once (in its own thread: the stop waits for its commands)
             stopping.append(True)
             threading.Thread(target=time_stop, name=f"{STRATEGY}-time-exit", daemon=True).start()
@@ -423,6 +454,7 @@ def run_us_zscore():
         zs = {symbol_of[t]: z_now(t) for t in symbol_of}
         print(f"   z-score ready for {sum(1 for v in zs.values() if v is not None)} of {len(symbol_of)} stocks (Z_DAYS {Z_DAYS}, at least {Z_MIN_DAYS} earlier days): " +
               ", ".join(f"{k} {'-' if v is None else format(v, '+.2f')}" for k, v in zs.items()))
+        print("   signals: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none yet"))
 
     tick_start()
     listener = watch("candles", on_candle, owner=STRATEGY)         # follows the table if candles are restarted; pasting again replaces this listener
