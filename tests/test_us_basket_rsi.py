@@ -93,9 +93,10 @@ def write_history(folder, days, start_px=200.0, step=-0.25, symbol="NIFTY", minu
 
 def test_the_basket_is_one_basket_of_us_tickers_in_new_york_time():
     block = basket_block(SCRIPT)[0]
-    assert re.findall(r'"([a-z_]+)":', block) == ["us_stocks"]                                      # ONE basket
-    tickers = re.findall(r'"([A-Z]+)"', block)
-    assert len(tickers) >= 3 and len(set(tickers)) == len(tickers)                                # at least 3, none twice
+    names = re.findall(r'"([a-z_]+)":', block)
+    assert len(names) >= 1 and len(set(names)) == len(names)                                      # one or more named baskets, none twice
+    tickers = re.findall(r'"([A-Z][A-Z&-]*)"', block)
+    assert len(tickers) >= 3 and len(set(tickers)) == len(tickers)                                # at least 3 across all baskets, none twice
     assert "America/New_York" in SCRIPT and "Asia/Kolkata" not in SCRIPT                           # no India clock left in it
     assert 'RSI_BAR = "5min"' in SCRIPT and "HIST_DAYS = " in SCRIPT and "ABS_DAYS = 22" in SCRIPT
 

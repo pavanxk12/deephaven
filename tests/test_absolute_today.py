@@ -203,3 +203,96 @@ def test_the_functions_in_the_console_share_one_service_and_settings_rebuild_it(
     r = ns["absolute"]("pct_open", "intraday", "ABC", 5)                                                                           # no saved days at all: still answers
     assert r[1] == -1 and r.n_valid == 0 and np.isnan(r[0]).all()
     assert app.plugins.keys() == {"master"}                                                                                        # nothing was started
+
+
+# ---- today's rows are read once while the live table has not grown ------------------------------------------------------------------------------------
+def test_size_cached_reads_again_only_when_the_table_grew_or_cannot_say_its_size():
+    import threading
+    from algo.series.absolute import size_cached
+    store, lock, reads = {}, threading.Lock(), []
+
+    class T:
+        size = 5
+
+    def read():
+        reads.append(1)
+        return len(reads)
+
+    t = T()
+    assert [size_cached(store, lock, "k", t, read) for _ in range(3)] == [1, 1, 1] and len(reads) == 1      # same row count: one read
+    t.size = 6
+    assert size_cached(store, lock, "k", t, read) == 2 and size_cached(store, lock, "k", t, read) == 2      # it grew: read again, then kept
+    assert size_cached(store, lock, "other", t, read) == 3                                                 # another question: its own read
+    assert size_cached(store, lock, "k", T(), read) == 4                                                   # a different table object (candles restarted): read again
+    assert [size_cached(store, lock, "k", object(), read) for _ in range(2)] == [5, 6]                     # no row count: never kept
+
+
+def test_the_readers_make_one_read_of_the_candles_for_calls_in_the_same_cycle(readers):
+    app, candles, _ = readers
+    reads = []
+    sys.modules["deephaven.pandas"].to_pandas = lambda t: (reads.append(1), t.df)[1]
+    candles.size = 2
+    today_bars, _, _, _, _ = deephaven_readers(app)
+    first = today_bars(("cash", "ABC"), TODAY)
+    again = today_bars(("cash", "ABC"), TODAY)
+    assert len(reads) == 1 and again is first                                                              # open and VWAP of one stock: one read
+    candles.size = 3                                                                                       # a new candle came in
+    today_bars(("cash", "ABC"), TODAY)
+    assert len(reads) == 2
+
+
+def test_the_futures_master_is_searched_once_per_stock_and_day(readers):
+    app, _, _ = readers
+    searches = []
+
+    class Futs(pd.DataFrame):
+        def __getitem__(self, key):
+            if isinstance(key, pd.Series) and key.dtype == bool:
+                searches.append(1)                                                                         # one filter of the master = one search
+            return super().__getitem__(key)
+
+    app.master.futs = Futs(app.master.futs)
+    today_bars, _, _, _, _ = deephaven_readers(app)
+    for _ in range(4):
+        today_bars(("fut", "NIFTY"), "2026-03-18")
+    assert len(searches) == 1
+    today_bars(("fut", "NIFTY"), "2026-03-10")                                                             # another day: searched again
+    assert len(searches) == 2
+
+
+def test_the_iv_rows_are_read_once_per_change_and_an_underlying_reuses_the_read_of_its_basket(readers):
+    app, _, straddle = readers
+    straddle.df.insert(0, "Symbol", ["NIFTY", "NIFTY", "NIFTY"])
+    reads = []
+    sys.modules["deephaven.pandas"].to_pandas = lambda t: (reads.append(t.where_expr), t.df)[1]
+    sys.modules["deephaven.pandas"].to_table = lambda df: types.SimpleNamespace(df=df)
+    straddle.where_in = lambda keys, col: straddle
+    straddle.size = 3
+    _, today_iv, _, today_iv_many, _ = deephaven_readers(app)
+    first = today_iv_many(["NIFTY", "BANKNIFTY"], TODAY)
+    assert today_iv_many(["BANKNIFTY", "NIFTY"], TODAY) is first and len(reads) == 1                    # the same basket in another order: one read
+    minute, iv = today_iv("NIFTY", TODAY)                                                                # inside the basket's read: no read of its own
+    assert len(reads) == 1 and minute.tolist() == first["NIFTY"][0].tolist() and iv.tolist() == first["NIFTY"][1].tolist()
+    today_iv("NOPE", TODAY)                                                                              # not in any read: its own, then kept
+    today_iv("NOPE", TODAY)
+    assert len(reads) == 2
+    straddle.size = 4                                                                                    # a new minute: read again
+    today_iv_many(["NIFTY", "BANKNIFTY"], TODAY)
+    assert len(reads) == 3
+
+
+def test_one_stock_reuses_the_candles_read_of_its_basket(readers):
+    app, candles, _ = readers
+    candles.df.insert(0, "token", [7, 7])
+    reads = []
+    sys.modules["deephaven.pandas"].to_pandas = lambda t: (reads.append(t.where_expr), t.df)[1]
+    sys.modules["deephaven.pandas"].to_table = lambda df: types.SimpleNamespace(df=df)
+    candles.where_in = lambda keys, col: candles
+    candles.size = 2
+    today_bars, _, today_bars_many, _, _ = deephaven_readers(app)
+    many = today_bars_many([("cash", "ABC")], TODAY)
+    one = today_bars(("cash", "ABC"), TODAY)
+    assert len(reads) == 1 and one[4].tolist() == many[("cash", "ABC")][4].tolist()
+    candles.size = 3
+    today_bars(("cash", "ABC"), TODAY)                                                                   # the table grew: its own read
+    assert len(reads) == 2

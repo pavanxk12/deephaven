@@ -1070,9 +1070,32 @@ class ParquetSource:
 _NAME = re.compile(r"^[A-Za-z0-9&_.\- ]{1,40}$")
 
 
+def size_cached(store: dict, lock, key, table, read):
+    """read() for today's rows, remembered while the live table has not grown. `candles` only ever gets rows appended, so the same row count means the same rows: the calls that follow
+    in one update cycle (every stock of a basket, open and VWAP) share ONE read. A table without a row count, or one that fails to give it, is read every time."""
+    try:
+        size = int(table.size)
+    except Exception:
+        return read()
+    with lock:
+        hit = store.get(key)
+        if hit is not None and hit[0] == size and hit[1] is table:
+            return hit[2]
+    value = read()
+    with lock:
+        if len(store) >= 64:
+            store.clear()
+        store[key] = (size, table, value)                          # `size` was taken BEFORE the read: rows that arrived meanwhile only make the next call read again
+    return value
+
+
 def deephaven_readers(app):
     """(today_bars, today_iv) for AbsoluteService: each is a one-off read of today's `candles` / `straddle_series` rows of ONE symbol (a filtered snapshot), made when
-    absolute() is called. Nothing is listened to. A symbol that has no token, or a table that is not running, gives None (the saved file of today is used instead)."""
+    absolute() is called. Nothing is listened to. A symbol that has no token, or a table that is not running, gives None (the saved file of today is used instead).
+    The rows read are kept while the candles table has the same number of rows (size_cached), so a burst of calls inside one update cycle makes one read."""
+    import threading
+    seen, seen_lock = {}, threading.Lock()                         # (what was asked) -> (row count, table, rows read)
+    fut_tokens = {}                                                # (futures master, symbol, day) -> (token, the master)
 
     def token_of(spec, day):
         m = app.master
@@ -1081,6 +1104,10 @@ def deephaven_readers(app):
             return m.spot_of.get(name)
         if kind == "exact":
             return m.token_of.get(name)
+        key = (id(m.futs), spec, day)                                # the master of the day does not change under a running session: a pandas filter and sort per stock is done once
+        with seen_lock:
+            if key in fut_tokens:
+                return fut_tokens[key][0]
         import pandas as pd
         und = underlying_of(spec)
         f = m.futs[(m.futs["TckrSymb"] == und) & (m.futs["expiry"] >= pd.Timestamp(day))].sort_values("expiry")
@@ -1089,7 +1116,12 @@ def deephaven_readers(app):
             f = f[f["expiry"].dt.month == _MONTHS.index(mm["mon"]) + 1]
             if mm["yy"]:
                 f = f[f["expiry"].dt.year == 2000 + int(mm["yy"])]
-        return int(f["fut_token"].iloc[0]) if len(f) else None
+        token = int(f["fut_token"].iloc[0]) if len(f) else None
+        with seen_lock:
+            if len(fut_tokens) >= 5000:
+                fut_tokens.clear()
+            fut_tokens[key] = (token, m.futs)                        # (the frame is kept so its id() cannot be reused by another one)
+        return token
 
     def today_bars(spec, day):
         table = app.tables.get("candles")
@@ -1097,23 +1129,47 @@ def deephaven_readers(app):
         if token is None:
             return None
         from deephaven.pandas import to_pandas
-        df = to_pandas(table.where(f"token = {int(token)}").view(["Ts = epochSeconds(Minute)", "Open", "High", "Low", "Close", "Volume"]))
-        if not len(df):
-            return None
-        return (df["Ts"].to_numpy(dtype=np.int64), *(df[c].to_numpy(dtype=np.float64) for c in ("Open", "High", "Low", "Close", "Volume")))
+        try:
+            rows = int(table.size)
+        except Exception:
+            rows = None
+        if rows is not None:
+            with seen_lock:                                         # relative() has just read this token with its basket, and the table has not grown since: that read is the answer
+                for key, (size, tbl, value) in seen.items():
+                    if key[0] == "many" and size == rows and tbl is table and int(token) in value:
+                        return value[int(token)]
+
+        def read():
+            df = to_pandas(table.where(f"token = {int(token)}").view(["Ts = epochSeconds(Minute)", "Open", "High", "Low", "Close", "Volume"]))
+            if not len(df):
+                return None
+            return (df["Ts"].to_numpy(dtype=np.int64), *(df[c].to_numpy(dtype=np.float64) for c in ("Open", "High", "Low", "Close", "Volume")))
+        return size_cached(seen, seen_lock, ("one", int(token)), table, read)
 
     def today_iv(und, day):
         table = app.tables.get("straddle_series")
         if table is None or not _NAME.match(und):
             return None
         from deephaven.pandas import to_pandas
-        df = to_pandas(table.where(f"Symbol = `{und}`").view(["Expiry", "Time", "IV"]))
-        if not len(df):
-            return None
-        expiry = df["Expiry"].astype(str).to_numpy()
-        keep = expiry == min(expiry.tolist())
-        times = df["Time"].astype(str).to_numpy()[keep]
-        return (np.array([int(t[0:2]) * 60 + int(t[3:5]) for t in times], dtype=np.int64), df["IV"].to_numpy(dtype=np.float64)[keep])
+        try:
+            rows = int(table.size)
+        except Exception:
+            rows = None
+        if rows is not None:
+            with seen_lock:                                         # relative("iv") has just read this underlying with its basket, and the table has not grown since: that read is the answer
+                for key, (size, tbl, value) in seen.items():
+                    if key[0] == "ivmany" and size == rows and tbl is table and und in value:
+                        return value[und]
+
+        def read():
+            df = to_pandas(table.where(f"Symbol = `{und}`").view(["Expiry", "Time", "IV"]))
+            if not len(df):
+                return None
+            expiry = df["Expiry"].astype(str).to_numpy()
+            keep = expiry == min(expiry.tolist())
+            times = df["Time"].astype(str).to_numpy()[keep]
+            return (np.array([int(t[0:2]) * 60 + int(t[3:5]) for t in times], dtype=np.int64), df["IV"].to_numpy(dtype=np.float64)[keep])
+        return size_cached(seen, seen_lock, ("iv", und), table, read)
 
     def today_bars_many(specs, day):
         """{spec: arrays} for many symbols from ONE filtered read of the candles table."""
@@ -1129,14 +1185,16 @@ def deephaven_readers(app):
             return {}
         from deephaven.pandas import to_pandas, to_table
         import pandas as pd
-        keys = to_table(pd.DataFrame({"token": pd.Series(sorted(by_token), dtype="int64")}))
-        df = to_pandas(table.where_in(keys, "token").view(["token", "Ts = epochSeconds(Minute)", "Open", "High", "Low", "Close", "Volume"]))
-        out = {}
-        for token, g in df.groupby("token"):
-            arrays = (g["Ts"].to_numpy(dtype=np.int64), *(g[c].to_numpy(dtype=np.float64) for c in ("Open", "High", "Low", "Close", "Volume")))
-            for sp in by_token.get(int(token), ()):
-                out[sp] = arrays
-        return out
+
+        def read():
+            keys = to_table(pd.DataFrame({"token": pd.Series(sorted(by_token), dtype="int64")}))
+            df = to_pandas(table.where_in(keys, "token").view(["token", "Ts = epochSeconds(Minute)", "Open", "High", "Low", "Close", "Volume"]))
+            got = {}
+            for token, g in df.groupby("token"):
+                got[int(token)] = (g["Ts"].to_numpy(dtype=np.int64), *(g[c].to_numpy(dtype=np.float64) for c in ("Open", "High", "Low", "Close", "Volume")))
+            return got
+        got = size_cached(seen, seen_lock, ("many", tuple(sorted(by_token))), table, read)
+        return {sp: got[t] for t, sps in by_token.items() if t in got for sp in sps}
 
     def contract_of(spec, day):
         """The contract a rolling future is today, as ("exact", "NIFTY 27OCT26 FUT") (from the master); anything else is itself."""
@@ -1153,14 +1211,17 @@ def deephaven_readers(app):
             return {}
         from deephaven.pandas import to_pandas, to_table
         import pandas as pd
-        keys = to_table(pd.DataFrame({"Symbol": pd.Series(names, dtype="object")}))
-        df = to_pandas(table.where_in(keys, "Symbol").view(["Symbol", "Expiry", "Time", "IV"]))
-        out = {}
-        for und, g in df.groupby("Symbol"):
-            expiry = g["Expiry"].astype(str).to_numpy()
-            keep = expiry == min(expiry.tolist())
-            times = g["Time"].astype(str).to_numpy()[keep]
-            out[str(und)] = (np.array([int(t[0:2]) * 60 + int(t[3:5]) for t in times], dtype=np.int64), g["IV"].to_numpy(dtype=np.float64)[keep])
-        return out
+
+        def read():
+            keys = to_table(pd.DataFrame({"Symbol": pd.Series(names, dtype="object")}))
+            df = to_pandas(table.where_in(keys, "Symbol").view(["Symbol", "Expiry", "Time", "IV"]))
+            out = {}
+            for und, g in df.groupby("Symbol"):
+                expiry = g["Expiry"].astype(str).to_numpy()
+                keep = expiry == min(expiry.tolist())
+                times = g["Time"].astype(str).to_numpy()[keep]
+                out[str(und)] = (np.array([int(t[0:2]) * 60 + int(t[3:5]) for t in times], dtype=np.int64), g["IV"].to_numpy(dtype=np.float64)[keep])
+            return out
+        return size_cached(seen, seen_lock, ("ivmany", tuple(sorted(set(names)))), table, read)
 
     return today_bars, today_iv, today_bars_many, today_iv_many, contract_of

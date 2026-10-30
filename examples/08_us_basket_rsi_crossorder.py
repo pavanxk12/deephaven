@@ -1,13 +1,14 @@
 # US BASKET + 5-MINUTE RSI + CrossOrder: the US version of 07. A plain script (functions, no class). Paste in the US server's terminal after the services are up (init.py).
 #
-#   The basket        BASKETS = {"us_stocks": [...]}: ONE basket of the 19 stocks. A symbol is ranked against the OTHER 18 (saved as the basket "us_stocks" in baskets.txt too).
-#   The filter        a symbol may be traded only while BOTH its % change from the OPEN and from the VWAP stand in the MIDDLE of the basket (percentile MID_ZONE = Q2 to Q3).
+#   The basket        BASKETS = {"tech": [...], "chips": [...], "other": [...]}: named sector baskets. A symbol is ranked against the OTHERS of its own basket only (each saved in baskets.txt too).
+#   The filter        a symbol may be traded only while BOTH its % change from the OPEN and from the VWAP stand in the MIDDLE of the basket (each ref's own REL_ZONE band, Q2 to Q3).
 #   The own history   AND the stock's own move (% from the OPEN and from the VWAP, now) must sit in Q2 to Q3 of the same minute on its previous ABS_DAYS (22) trading days:
 #                     absolute() reads those days from the saved candle files, one stock and one day at a time. With fewer than half of the days in the files there is no trade.
 #   The signal        5-minute RSI, made from the 1-minute candles: it ENTERS oversold (< RSI_LOW) -> BUY, or overbought (> RSI_HIGH) -> SELL. One position per symbol at a time.
 #   The history       the RSI does not start from nothing at the open: the 5-minute closes of the last HIST_DAYS saved days (candles_<day>.parquet in the market-data / EOD folders)
 #                     come first, then today's candles. So the RSI at 09:35 is computed through yesterday's prices, overnight gap included. No files = it says so and starts from today.
-#   The exit          the script's own target and stop-loss on the price: +TARGET_PCT in its favour, or -STOP_PCT against it (checked on every 1-minute close).
+#   The exit          the script's own target and stop-loss on the price: +TARGET_PCT in its favour, or -STOP_PCT against it (checked on every 1-minute close). TRAIL_TRIGGER_PCT /
+#                     PROFIT_LOCK_PCT (both None, or both set): once the move reaches TRAIL_TRIGGER_PCT the stop shifts, for the rest of that position's life, from -STOP_PCT to PROFIT_LOCK_PCT.
 #                     The engine's CrossOrder has no target or stop and reads its parameters ONCE per portfolio, so an exit is the portfolio's `squareup` command.
 #   One entry         ONE_ENTRY_PER_STOCK = True: a stock is entered ONCE. After its take-profit, stop-loss or any other exit it is not entered again (until the script is pasted again).
 #   The time exit     EXIT_AT (15:55 New York time, 5 minutes before the 16:00 close): the automation is stopped the way algo_stop does it: every portfolio is paused and squared up, a minute
@@ -46,13 +47,17 @@ def run_us_basket_rsi():
     # =============================== USER INPUT ===============================
     USER = 3
     STRATEGY = "us_basket_rsi"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
-    BASKETS = {"us_stocks": ["NVDA", "AAPL", "MSFT", "AMZN", "SPCX", "GOOG", "META", "AVGO", "TSLA", "MU", "WMT", "AMD", "ASML", "PLTR", "INTC", "COST", "CSCO", "AMAT", "PANW", "NFLX", "TXN", "CRWD", "AMGN", "LIN", "ARM", "SHOP", "MRVL", "KLAC", "ADI", "GILD", "SNDK", "PEP", "QCOM"]}
+    BASKETS = {                              # named sector baskets: a symbol is ranked only against the OTHERS of ITS basket (each saved as its own basket.txt entry)
+        "tech":   ["MSFT", "GOOG", "META", "AMZN", "NFLX", "SHOP", "CRWD", "PANW", "PLTR", "AAPL", "TSLA"],
+        "chips":  ["NVDA", "AVGO", "AMD", "MU", "ASML", "INTC", "AMAT", "MRVL", "KLAC", "ADI", "QCOM", "ARM", "SNDK", "TXN", "CSCO"],
+        "other":  ["WMT", "COST", "PEP", "AMGN", "LIN", "GILD", "SPCX"],
+    }
 
     TRADE_AS = {}                            # optional: {"AAPL": "<another contract name or token>"} trade another contract than the basket entry
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
-    MID_ZONE = (25.0, 75.0)                  # percentile of the symbol among its basket, for the % from open AND the % from VWAP: Q2 to Q3
+    REL_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # relative(): each ref's percentile among the basket must land inside its own (low, high) band (Q2 to Q3)
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
-    ABS_ZONE = MID_ZONE                      # the percentile band that comparison must fall in (Q2 to Q3)
+    ABS_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # absolute(): each ref's percentile against its own days must land inside its own (low, high) band (Q2 to Q3)
     RSI_BAR = "5min"                         # the bar the RSI is computed on (made from the 1-minute candles)
     RSI_N, RSI_HIGH, RSI_LOW = 9, 70, 30
     RSI_LIVE = False                          # True: the bar still forming counts too (acts every minute); False: finished bars only
@@ -60,6 +65,8 @@ def run_us_basket_rsi():
                                              # 1-minute close. False: look for an entry on every 1-minute candle
     HIST_DAYS = 1                            # how many earlier saved days seed the RSI (0 = none)
     TARGET_PCT, STOP_PCT = 1.5, 0.5
+    TRAIL_TRIGGER_PCT = 1.25                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
+    PROFIT_LOCK_PCT = 1.0                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
@@ -79,10 +86,14 @@ def run_us_basket_rsi():
     RETRY_RANKING_S = 20                     # a ranking read that fails (a rare clash with the update cycle: "Previous values requested or inconsistent") is tried again on the next candle batches
                                              # for this many seconds instead of giving up on that stock for the whole bar. 0 = no retry
     # ==========================================================================
-    if not (0 <= MID_ZONE[0] < MID_ZONE[1] <= 100 and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and (ENTRY_VALUE is None or ENTRY_VALUE > 0) and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
-            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and 0 <= ABS_ZONE[0] < ABS_ZONE[1] <= 100 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
-        raise ValueError("MID_ZONE and ABS_ZONE must be inside 0 to 100, TARGET_PCT and STOP_PCT above 0, QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, "
-                         "and every basket needs at least 3 symbols")
+    REFS = ("pct_open", "pct_vwap")
+    if not (all(0 <= ZONE[ref][0] < ZONE[ref][1] <= 100 for ZONE in (REL_ZONE, ABS_ZONE) for ref in REFS)
+            and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and (ENTRY_VALUE is None or ENTRY_VALUE > 0) and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
+            and ((TRAIL_TRIGGER_PCT is None) == (PROFIT_LOCK_PCT is None)) and (TRAIL_TRIGGER_PCT is None or TRAIL_TRIGGER_PCT > 0)
+            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
+        raise ValueError("every (low, high) band in REL_ZONE/ABS_ZONE must be inside 0 to 100 with low below high, TARGET_PCT and STOP_PCT above 0, "
+                         "TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
+                         "QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, and every basket needs at least 3 symbols")
     BAR_S = parse_timeframe(RSI_BAR)                               # 300; refuses a size that does not line up with the clock
     basket_of = {}                                                 # symbol -> the name of its basket
     for name, members in BASKETS.items():
@@ -241,25 +252,23 @@ def run_us_basket_rsi():
     def zone_of(value):
         return None if value is None else "OVERBOUGHT" if value > RSI_HIGH else "OVERSOLD" if value < RSI_LOW else None
 
-    # ---- the filter: the middle of the basket --------------------------------------------------------------------------------------
-    def in_middle(symbol):
-        """True when the symbol's % from the open AND its % from the VWAP both rank between MID_ZONE[0] and MID_ZONE[1] percent of ITS basket (the other symbols of it)."""
-        for ref in ("open", "vwap"):
+    # ---- the filters: the middle of the basket (relative), the middle of its own days (absolute) --------------------------------------
+    def relative_sides(symbol):
+        """True when the symbol's % from the open AND its % from the VWAP both rank inside their own REL_ZONE band, among ITS basket (the other symbols of it)."""
+        for ref in ("pct_open", "pct_vwap"):
             with exec_ctx:                                         # relative() reads the candles table; a listener thread needs the terminal's query context for that
-                result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref=ref)
-            values, idx = result                                   # the other symbols' values, and how many of them are below this one (-1 = cannot tell)
-            if idx < 0 or not (MID_ZONE[0] <= result.pctile <= MID_ZONE[1]):
+                result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref=ref[len("pct_"):])
+            if result[1] < 0 or not (REL_ZONE[ref][0] <= result.pctile <= REL_ZONE[ref][1]):      # (the second item is -1 when it cannot be told)
                 return False
         return True
 
-    def in_own_history(symbol):
-        """True when the symbol's % from the open AND from the VWAP, now, each rank between ABS_ZONE[0] and ABS_ZONE[1] percent of the same minute on its previous ABS_DAYS trading days.
+    def absolute_sides(symbol):
+        """True when the symbol's % from the open AND from the VWAP, now, each rank inside their own ABS_ZONE band, against the same minute on its previous ABS_DAYS trading days.
         absolute() answers idx = -1 (cannot tell) when fewer than half of those days are in the saved files; that is no trade."""
-        for ref in ("open", "vwap"):
+        for ref in ("pct_open", "pct_vwap"):
             with exec_ctx:                                         # absolute() reads today's candles table once, and the saved day files
-                result = absolute("pct", LEVEL, symbol, ABS_DAYS, ref=ref)
-            hist, idx = result                                     # the earlier days' values (oldest first), and how many of them are below today's (-1 = cannot tell)
-            if idx < 0 or not (ABS_ZONE[0] <= result.pctile <= ABS_ZONE[1]):
+                result = absolute("pct", LEVEL, symbol, ABS_DAYS, ref=ref[len("pct_"):])
+            if result[1] < 0 or not (ABS_ZONE[ref][0] <= result.pctile <= ABS_ZONE[ref][1]):      # (the second item is -1 when it cannot be told)
                 return False
         return True
 
@@ -302,15 +311,27 @@ def run_us_basket_rsi():
         app = current()
         return app.master.divisor_of.get(int(token)) or app.market.price_div
 
-    def tick_exit(token, pos, px):
-        """Target / stop-loss of an open position on the price `px` (the same rule as on the candle close)."""
-        move = 100.0 * (1 if pos["side"] == 1 else -1) * (px / pos["entry"] - 1.0)                 # % in the position's favour (negative = against it)
+    def exit_reason(pos, move):
+        """Why `move` (the % in the position's favour) should exit now, or None. TRAIL_TRIGGER_PCT off: plain TARGET_PCT / STOP_PCT. On: once `move` reaches TRAIL_TRIGGER_PCT the
+        position's own "trailing" flag turns on (sticky) and the stop becomes PROFIT_LOCK_PCT instead of -STOP_PCT, for the rest of its life."""
+        if TRAIL_TRIGGER_PCT is not None and not pos["trailing"] and move >= TRAIL_TRIGGER_PCT:
+            pos["trailing"] = True
         if TARGET_PCT is not None and move >= TARGET_PCT:
-            last_px[token] = px
-            leave(token, f"target {move:+.2f}% (tick)")
+            return f"target {move:+.2f}%"
+        if pos["trailing"]:
+            if move <= PROFIT_LOCK_PCT:
+                return f"profit-lock {move:+.2f}%"
         elif STOP_PCT is not None and move <= -STOP_PCT:
+            return f"stop-loss {move:+.2f}%"
+        return None
+
+    def tick_exit(token, pos, px):
+        """Target / stop-loss (or trailing profit-lock) of an open position on the price `px` (the same rule as on the candle close)."""
+        move = 100.0 * (1 if pos["side"] == 1 else -1) * (px / pos["entry"] - 1.0)                 # % in the position's favour (negative = against it)
+        why = exit_reason(pos, move)
+        if why is not None:
             last_px[token] = px
-            leave(token, f"stop-loss {move:+.2f}% (tick)")
+            leave(token, f"{why} (tick)")
 
     def on_tick(update, is_replay):
         """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python)."""
@@ -428,7 +449,7 @@ def run_us_basket_rsi():
         next_slot[token] += 1
         live.add(a["pf"])
         entered.add(token)
-        position[token] = {"side": side, "entry": last_px[token], "qty": qty, "pf": a["pf"], "state": "entering"}
+        position[token] = {"side": side, "entry": last_px[token], "qty": qty, "pf": a["pf"], "state": "entering", "trailing": False}
         tick_track(token, True)
         print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {qty} lot(s) at {last_px[token]:g} on PF {a['pf']}")
         send_entry(a["pf"], token, side, qty).add_done_callback(lambda f: settled(token, "enter", f))
@@ -449,10 +470,9 @@ def run_us_basket_rsi():
         if pos is not None:
             if pos["state"] == "open":
                 move = 100.0 * (1 if pos["side"] == 1 else -1) * (px / pos["entry"] - 1.0)         # % in the position's favour (negative = against it)
-                if move >= TARGET_PCT:
-                    leave(token, f"target {move:+.2f}%")
-                elif move <= -STOP_PCT:
-                    leave(token, f"stop-loss {move:+.2f}%")
+                why = exit_reason(pos, move)
+                if why is not None:
+                    leave(token, why)
             return
         if not entry_ok or (ONE_ENTRY_PER_STOCK and token in entered):
             return
@@ -468,8 +488,8 @@ def run_us_basket_rsi():
         if first is None:
             count("signals")
         try:
-            own = ABS_DAYS == 0 or in_own_history(symbol_of[token])               # its own days first (cached), then the basket
-            middle = own and in_middle(symbol_of[token])
+            own = ABS_DAYS == 0 or absolute_sides(symbol_of[token])               # its own days first (cached), then the basket
+            middle = own and relative_sides(symbol_of[token])
         except Exception as e:
             ranking_failed(token, first, e)
             return

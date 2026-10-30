@@ -3,16 +3,17 @@
 #   The universe      every STOCK future in the master that has not expired (about 200; index futures are left out), taken at the NEAREST expiry. A basket entry is "SBIN FUT" = the nearest
 #                     future that has not expired, on each day: the script trades today's nearest future, and every comparison with the past uses the nearest future of THAT day,
 #                     so a stock is only ever compared with its own futures (never its cash price, never an option, never two contracts mixed inside one day).
-#   The baskets       the sorted underlyings are dealt one by one into N_BASKETS (4) baskets, fut_1 ... fut_4, about 50 each (saved in baskets.txt too). A symbol is ranked against the OTHER
-#                     symbols of its own basket only. ONLY = [...] limits the list, EXCLUDE = [...] removes some.
-#   The filter        a symbol may be traded only while BOTH its % change from the OPEN and from the VWAP stand in the MIDDLE of its basket (percentile MID_ZONE = Q2 to Q3).
+#   The baskets       SECTOR_BASKETS names each basket's underlyings (e.g. "bank", "fin"), saved in baskets.txt too. A symbol is ranked against the OTHER symbols of its own basket only.
+#                     EXCLUDE = [...] removes some underlyings from every basket.
+#   The filter        a symbol may be traded only while BOTH its % change from the OPEN and from the VWAP stand in the MIDDLE of its basket (each ref's own REL_ZONE band, Q2 to Q3).
 #   The own history   AND the future's own move (% from the OPEN and from the VWAP, now) must sit in Q2 to Q3 of the same minute on the nearest future of its previous ABS_DAYS (22) trading days:
 #                     absolute() reads those days from the saved candle files, one future and one day at a time. With fewer than half of the days in the files there is no trade.
 #   The signal        5-minute RSI, made from the 1-minute candles: it ENTERS oversold (< RSI_LOW) -> BUY, or overbought (> RSI_HIGH) -> SELL. One position per future at a time.
 #   The history       the RSI does not start from nothing at the open: the 5-minute closes of the last HIST_DAYS saved days (candles_<day>.parquet in the market-data / EOD folders)
 #                     come first, then today's candles, from each day's nearest future. On the day a stock rolls to the next expiry its price jumps by the spread between the two
 #                     contracts, which can show once in the RSI that morning. No files = it says so and starts from today.
-#   The exit          the script's own target and stop-loss on the price: +TARGET_PCT in its favour, or -STOP_PCT against it (checked on every 1-minute close).
+#   The exit          the script's own target and stop-loss on the price: +TARGET_PCT in its favour, or -STOP_PCT against it (checked on every 1-minute close). TRAIL_TRIGGER_PCT /
+#                     PROFIT_LOCK_PCT (both None, or both set): once the move reaches TRAIL_TRIGGER_PCT the stop shifts, for the rest of that position's life, from -STOP_PCT to PROFIT_LOCK_PCT.
 #                     The engine's CrossOrder has no target or stop and reads its parameters ONCE per portfolio, so an exit is the portfolio's `squareup` command.
 #   One entry         ONE_ENTRY_PER_STOCK = True: a stock is entered ONCE. After its take-profit, stop-loss or any other exit it is not entered again (until the script is pasted again).
 #   The time exit     EXIT_AT (15:15 India time): the automation is stopped the way algo_stop does it: every portfolio is paused and squared up, a minute later unsubscribed (so the plugin
@@ -60,25 +61,19 @@ def run_india_fut_rsi():
     # =============================== USER INPUT ===============================
     USER = 4
     STRATEGY = "india_fut_rsi"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
-    N_BASKETS = 1                            # every stock future (about 200) is dealt into this many baskets, fut_1 ... fut_4; a symbol is ranked only against the others of ITS basket
     INDEX_FUTURES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}      # index futures are left out: stock futures only
-    ONLY = [
-        "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-        "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE", "BEL", "BHARTIARTL",
-        "BSE", "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT",
-        "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
-        "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDIGO", "INFY",
-        "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT",
-        "M&M", "MARUTI", "MAXHEALTH", "NESTLEIND", "NTPC",
-        "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN",
-        "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATASTEEL", "TCS",
-        "TECHM", "TITAN", "TMPV", "TRENT", "ULTRACEMCO",
-    ]                               # optional: trade only these underlyings, e.g. ["SBIN", "TCS", "INFY"]; empty = every stock future
-    EXCLUDE = []                             # optional: underlyings to leave out
+    SECTOR_BASKETS = {                       # named baskets: a symbol is ranked only against the others of ITS named basket (at least 3 members each)
+        "bank":   ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK"],
+        "fin":    ["BAJFINANCE", "BAJAJFINSV", "SBILIFE", "HDFCLIFE", "BSE"],
+        "it":     ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM"],
+        "auto":   ["M&M", "MARUTI", "TATAMOTORS", "EICHERMOT", "BAJAJ-AUTO"],
+        "health":["SUNPHARMA","DRREDDY","CIPLA","APOLLOHOSP","MAXHEALTH"],
+    }                                         # add/remove/comment out symbols or whole baskets here; empty = none
+    EXCLUDE = []                             # optional: underlyings to leave out (applied across every basket)
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
-    MID_ZONE = (25.0, 75.0)                  # percentile of the symbol among its basket, for the % from open AND the % from VWAP: Q2 to Q3
+    REL_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # relative(): each ref's percentile among the basket must land inside its own (low, high) band (Q2 to Q3)
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
-    ABS_ZONE = MID_ZONE                      # the percentile band that comparison must fall in (Q2 to Q3)
+    ABS_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # absolute(): each ref's percentile against its own days must land inside its own (low, high) band (Q2 to Q3)
     RSI_BAR = "5min"                         # the bar the RSI is computed on (made from the 1-minute candles)
     RSI_N, RSI_HIGH, RSI_LOW = 14, 70, 30
     RSI_LIVE = False                          # True: the bar still forming counts too (acts every minute); False: finished bars only
@@ -86,11 +81,13 @@ def run_india_fut_rsi():
                                              # 1-minute close. False: look for an entry on every 1-minute candle
     HIST_DAYS = 3                            # how many earlier saved days seed the RSI (0 = none)
     TARGET_PCT, STOP_PCT = 1.5, 0.5
+    TRAIL_TRIGGER_PCT = 1.25                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
+    PROFIT_LOCK_PCT = 1.0                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
     ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 26286, "ACCOUNT": "", "ALGOID": "34500"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
-    WINDOW = (dtime(9, 30), dtime(15, 0))    # entries only inside it (India time, the session is 09:15 to 15:30); an exit is sent at any time
+    WINDOW = (dtime(9, 45), dtime(15, 0))    # entries only inside it (India time, the session is 09:15 to 15:30); an exit is sent at any time
     EXIT_AT = dtime(15, 15)                  # time exit (India time): 15 minutes before the 15:30 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
     MAX_PORTFOLIOS = 32                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
                                              # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.
@@ -105,24 +102,28 @@ def run_india_fut_rsi():
     # ==========================================================================
 
     def make_baskets():
-        """The underlyings of every stock future that has not expired (the master), sorted, dealt one by one into N_BASKETS baskets so each basket is a similar cross-section of the market.
-        A basket entry is "SBIN FUT": the NEAREST future that has not expired, on each day. relative() ranks today's nearest futures against each other, absolute() compares a future with
-        the nearest future of each earlier day, so a stock is only ever compared with its own futures, and a roll never mixes two contracts inside one day."""
+        """SECTOR_BASKETS gives each basket's underlyings by name (e.g. "bank", "fin"). A basket entry is "SBIN FUT": the NEAREST future that has not expired, on each day, among the underlyings
+        of that sector that have not expired (the master) and are not in INDEX_FUTURES/EXCLUDE. relative() then ranks today's nearest futures against the others in the SAME sector, absolute()
+        compares a future with the nearest future of each earlier day, so a stock is only ever compared with its own futures, and a roll never mixes two contracts inside one day."""
         futs = current().master.futs
         today = pd.Timestamp(datetime.now(ZoneInfo("Asia/Kolkata")).date())
-        unders = sorted({str(u).upper() for u in futs.loc[futs["expiry"] >= today, "TckrSymb"]} - set(INDEX_FUTURES) - {u.upper() for u in EXCLUDE})
-        if ONLY:
-            unders = [u for u in unders if u in {o.upper() for o in ONLY}]
-        names = [f"{u} FUT" for u in unders]
-        if len(names) < 3 * N_BASKETS:
-            raise ValueError(f"{len(names)} stock futures found: that is too few for {N_BASKETS} baskets of at least 3 (is the master loaded for today?)")
-        return {f"fut_{i + 1}": names[i::N_BASKETS] for i in range(N_BASKETS)}
+        live = {str(u).upper() for u in futs.loc[futs["expiry"] >= today, "TckrSymb"]} - set(INDEX_FUTURES) - {u.upper() for u in EXCLUDE}
+        baskets = {}
+        for name, unders in SECTOR_BASKETS.items():
+            members = [f"{u.upper()} FUT" for u in unders if u.upper() in live]
+            if members:
+                baskets[name] = members
+        return baskets
 
     BASKETS = make_baskets()
-    if not (0 <= MID_ZONE[0] < MID_ZONE[1] <= 100 and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
-            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and 0 <= ABS_ZONE[0] < ABS_ZONE[1] <= 100 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
-        raise ValueError("MID_ZONE and ABS_ZONE must be inside 0 to 100, TARGET_PCT and STOP_PCT above 0, QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, "
-                         "and every basket needs at least 3 symbols")
+    REFS = ("pct_open", "pct_vwap")
+    if not (all(0 <= ZONE[ref][0] < ZONE[ref][1] <= 100 for ZONE in (REL_ZONE, ABS_ZONE) for ref in REFS)
+            and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
+            and ((TRAIL_TRIGGER_PCT is None) == (PROFIT_LOCK_PCT is None)) and (TRAIL_TRIGGER_PCT is None or TRAIL_TRIGGER_PCT > 0)
+            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
+        raise ValueError("every (low, high) band in REL_ZONE/ABS_ZONE must be inside 0 to 100 with low below high, TARGET_PCT and STOP_PCT above 0, "
+                         "TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
+                         "QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, and every basket needs at least 3 symbols")
     BAR_S = parse_timeframe(RSI_BAR)                               # 300; refuses a size that does not line up with the clock
     basket_of = {}                                                 # symbol -> the name of its basket
     for name, members in BASKETS.items():
@@ -298,25 +299,23 @@ def run_india_fut_rsi():
     def zone_of(value):
         return None if value is None else "OVERBOUGHT" if value > RSI_HIGH else "OVERSOLD" if value < RSI_LOW else None
 
-    # ---- the filter: the middle of the basket --------------------------------------------------------------------------------------
-    def in_middle(symbol):
-        """True when the symbol's % from the open AND its % from the VWAP both rank between MID_ZONE[0] and MID_ZONE[1] percent of ITS basket (the other symbols of it)."""
-        for ref in ("open", "vwap"):
+    # ---- the filters: the middle of the basket (relative), the middle of its own days (absolute) --------------------------------------
+    def relative_sides(symbol):
+        """True when the symbol's % from the open AND its % from the VWAP both rank inside their own REL_ZONE band, among ITS basket (the other symbols of it)."""
+        for ref in ("pct_open", "pct_vwap"):
             with exec_ctx:                                         # relative() reads the candles table; a listener thread needs the terminal's query context for that
-                result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref=ref)
-            values, idx = result                                   # the other symbols' values, and how many of them are below this one (-1 = cannot tell)
-            if idx < 0 or not (MID_ZONE[0] <= result.pctile <= MID_ZONE[1]):
+                result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref=ref[len("pct_"):])
+            if result[1] < 0 or not (REL_ZONE[ref][0] <= result.pctile <= REL_ZONE[ref][1]):      # (the second item is -1 when it cannot be told)
                 return False
         return True
 
-    def in_own_history(symbol):
-        """True when the symbol's % from the open AND from the VWAP, now, each rank between ABS_ZONE[0] and ABS_ZONE[1] percent of the same minute on its previous ABS_DAYS trading days.
+    def absolute_sides(symbol):
+        """True when the symbol's % from the open AND from the VWAP, now, each rank inside their own ABS_ZONE band, against the same minute on its previous ABS_DAYS trading days.
         absolute() answers idx = -1 (cannot tell) when fewer than half of those days are in the saved files; that is no trade."""
-        for ref in ("open", "vwap"):
+        for ref in ("pct_open", "pct_vwap"):
             with exec_ctx:                                         # absolute() reads today's candles table once, and the saved day files
-                result = absolute("pct", LEVEL, symbol, ABS_DAYS, ref=ref)
-            hist, idx = result                                     # the earlier days' values (oldest first), and how many of them are below today's (-1 = cannot tell)
-            if idx < 0 or not (ABS_ZONE[0] <= result.pctile <= ABS_ZONE[1]):
+                result = absolute("pct", LEVEL, symbol, ABS_DAYS, ref=ref[len("pct_"):])
+            if result[1] < 0 or not (ABS_ZONE[ref][0] <= result.pctile <= ABS_ZONE[ref][1]):      # (the second item is -1 when it cannot be told)
                 return False
         return True
 
@@ -359,15 +358,27 @@ def run_india_fut_rsi():
         app = current()
         return app.master.divisor_of.get(int(token)) or app.market.price_div
 
-    def tick_exit(token, pos, px):
-        """Target / stop-loss of an open position on the price `px` (the same rule as on the candle close)."""
-        move = 100.0 * (1 if pos["side"] == 1 else -1) * (px / pos["entry"] - 1.0)                 # % in the position's favour (negative = against it)
+    def exit_reason(pos, move):
+        """Why `move` (the % in the position's favour) should exit now, or None. TRAIL_TRIGGER_PCT off: plain TARGET_PCT / STOP_PCT. On: once `move` reaches TRAIL_TRIGGER_PCT the
+        position's own "trailing" flag turns on (sticky) and the stop becomes PROFIT_LOCK_PCT instead of -STOP_PCT, for the rest of its life."""
+        if TRAIL_TRIGGER_PCT is not None and not pos["trailing"] and move >= TRAIL_TRIGGER_PCT:
+            pos["trailing"] = True
         if TARGET_PCT is not None and move >= TARGET_PCT:
-            last_px[token] = px
-            leave(token, f"target {move:+.2f}% (tick)")
+            return f"target {move:+.2f}%"
+        if pos["trailing"]:
+            if move <= PROFIT_LOCK_PCT:
+                return f"profit-lock {move:+.2f}%"
         elif STOP_PCT is not None and move <= -STOP_PCT:
+            return f"stop-loss {move:+.2f}%"
+        return None
+
+    def tick_exit(token, pos, px):
+        """Target / stop-loss (or trailing profit-lock) of an open position on the price `px` (the same rule as on the candle close)."""
+        move = 100.0 * (1 if pos["side"] == 1 else -1) * (px / pos["entry"] - 1.0)                 # % in the position's favour (negative = against it)
+        why = exit_reason(pos, move)
+        if why is not None:
             last_px[token] = px
-            leave(token, f"stop-loss {move:+.2f}% (tick)")
+            leave(token, f"{why} (tick)")
 
     def on_tick(update, is_replay):
         """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python)."""
@@ -481,7 +492,7 @@ def run_india_fut_rsi():
         next_slot[token] += 1
         live.add(a["pf"])
         entered.add(token)
-        position[token] = {"side": side, "entry": last_px[token], "qty": QTY, "pf": a["pf"], "state": "entering"}
+        position[token] = {"side": side, "entry": last_px[token], "qty": QTY, "pf": a["pf"], "state": "entering", "trailing": False}
         tick_track(token, True)
         print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {QTY} lot(s) at {last_px[token]:g} on PF {a['pf']}")
         send_entry(a["pf"], token, side, QTY).add_done_callback(lambda f: settled(token, "enter", f))
@@ -502,10 +513,9 @@ def run_india_fut_rsi():
         if pos is not None:
             if pos["state"] == "open":
                 move = 100.0 * (1 if pos["side"] == 1 else -1) * (px / pos["entry"] - 1.0)         # % in the position's favour (negative = against it)
-                if move >= TARGET_PCT:
-                    leave(token, f"target {move:+.2f}%")
-                elif move <= -STOP_PCT:
-                    leave(token, f"stop-loss {move:+.2f}%")
+                why = exit_reason(pos, move)
+                if why is not None:
+                    leave(token, why)
             return
         if not entry_ok or (ONE_ENTRY_PER_STOCK and token in entered):
             return
@@ -521,8 +531,8 @@ def run_india_fut_rsi():
         if first is None:
             count("signals")
         try:
-            own = ABS_DAYS == 0 or in_own_history(symbol_of[token])               # its own days first (cached), then the basket
-            middle = own and in_middle(symbol_of[token])
+            own = ABS_DAYS == 0 or absolute_sides(symbol_of[token])               # its own days first (cached), then the basket
+            middle = own and relative_sides(symbol_of[token])
         except Exception as e:
             ranking_failed(token, first, e)
             return

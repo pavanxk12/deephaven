@@ -57,7 +57,7 @@ Three rules hold the design together:
 | **registry** | the portfolio registry: (user, number) -> strategy, name, owner | `registry_start()` | caller's (a small file append) | `portfolio_registry`, `portfolio_registry_log` |
 | **nats** | the ONE command service | `nats_start(ip, port, users=[...])` | one asyncio loop thread `algo-nats` | `cmd_queue_automated`, `nats_events`, `portfolio_state_log` |
 | **console** | the operator dashboards | `app.run(algo.Console())` | Deephaven UI render threads; redraws of the shared portfolio states are batched by one `threading.Timer` per window (`Redraw`, 0.5 s, none after the window closes) | `operator_console`, `<strategy>` |
-| **absolute / relative** | the history service behind `absolute()` and `relative()`: one `AbsoluteService` per session (kept in `app.shared`), a 200 MB LRU cache of per-(symbol, day) arrays, `ParquetSource` for the saved day files, and readers for today's `candles` and `straddle_series` tables | first call of `absolute()` / `relative()` / `absolute_warm()` | none of its own: it runs on the caller's thread (the terminal, or a candle listener that holds the terminal's query context) | none |
+| **absolute / relative** | the history service behind `absolute()` and `relative()`: one `AbsoluteService` per session (kept in `app.shared`), a 200 MB LRU cache of per-(symbol, day) arrays, `ParquetSource` for the saved day files, and readers for today's `candles` and `straddle_series` tables (each read is kept while the table has the same row count, see "Today's rows" below) | first call of `absolute()` / `relative()` / `absolute_warm()` | none of its own: it runs on the caller's thread (the terminal, or a candle listener that holds the terminal's query context) | none |
 | **per algo**: `<name>_book`, `<name>_bridge`, `<name>` | what `algo_start` creates for one automation | your script | none of their own (the bridge uses the NATS loop) | - |
 
 Plain functions (not plugins) read the master and candles: `contract`, `strikes`, `nearest_strikes`, `last_price`, `last_candles` (`algo/lookup.py`).
@@ -367,11 +367,22 @@ on 130 that step alone took about 380 ms of the 360 ms a call took; on a PC with
 each file's `Symbol` column once into `{underlying: [its future names]}` (800 files kept) and the answers are cached up to 200,000 (file, spec). Measured live on 130 with the new wheel: z-scores of 209
 futures in 2.9 s (about 14 ms each; before about 240 to 360 ms each).
 
-A straddle day file saved before the IV column existed (130's own save of 2026-10-12 had no `IV`) made `ParquetSource.iv` / `iv_many` raise `ArrowInvalid`, which broke `absolute("iv")` for every stock; they now check the file's schema and return "no data" for that day, so the series skips it (measured on 130 with the patched reader: 194 underlyings, 22 days, 2.5 ms per call, warm-up 4.3 s). The wheel on the servers does not have this fix yet; on 130 the file was moved out of `fo_market_data` instead.
+A straddle day file saved before the IV column existed (130's own save of 2026-10-12 had no `IV`) made `ParquetSource.iv` / `iv_many` raise `ArrowInvalid`, which broke `absolute("iv")` for every stock; they now check the file's schema and return "no data" for that day, so the series skips it (measured on 130 with the patched reader: 194 underlyings, 22 days, 2.5 ms per call, warm-up 4.3 s). The wheel built on 2026-10-27 has this fix (in the servers' build folders; live after the image is rebuilt); on 130 the file was moved out of `fo_market_data` meanwhile.
 
 A day file can hold a row with a null `Symbol` (130's own end-of-day save of 2026-10-12 had 1,675 of them, tokens the master did not know). `month_contract` used to raise `TypeError` on it, which made
 `absolute_warm` and every later `absolute()` fail; it now skips names that are not text. Scripts 11 and 12 also wrap `month_contract` themselves when they are pasted (once), so they work
 on a wheel that does not have the fix yet.
+
+### Today's rows are read once per change (2026-10-27)
+
+`relative()` and `absolute()` read TODAY from the live `candles` and `straddle_series` tables at every call (the history comes from the 200 MB cache). Measured on 130 from a candle listener, 25 stocks, the six calls a script makes per stock
+(`relative` open / VWAP / IV, `absolute` open / VWAP / IV): **255 ms per stock, 6.4 s for the pass**, all on the update-graph thread, so the candle builder, the tick listeners and every other strategy waited behind it. Timing the parts of one
+`relative()` call (79 ms): the table read about 25 ms, and **about 50 ms the futures-master lookup** (a pandas filter and sort per stock, done twice per stock: once for the token, once to pin the contract).
+
+`deephaven_readers` now (a) remembers the master lookup per (stock, day), and (b) keeps each read of `candles` / `straddle_series` while the table has the same number of rows (`size_cached`; both tables are written by a `DynamicTableWriter`, rows are only
+appended, a restart makes a new table object, which the cache treats as a different table). A basket read made by `relative()` is also the answer for one of its stocks in `absolute()` at the same row count; without it `absolute()` reads on its own. Nothing is started: still plain functions, no thread, no listener.
+Same live data, old code and patched code side by side on 130 (750 results compared, 0 different): `relative` open 85 ms to 5 ms, VWAP 84 to 4, IV 32 to 3; `absolute` open 22 to 0.8, VWAP 20 to 0.8, IV 16 to 0.4; **a pass of 25 stocks 6.5 s to 0.35 s**. The first call after each new candle batch still pays one read per basket.
+The wheel with this is on the three servers' build folders (backup `*.bak_20261027`); the running containers have it only after their images are rebuilt. Not measured on 131 (US cash symbols have no master lookup, so the gain there is the table reads only).
 
 ## India stock-futures scripts (`examples/11_*`, `12_*`)
 

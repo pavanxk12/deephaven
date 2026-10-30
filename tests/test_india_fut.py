@@ -49,7 +49,8 @@ def start(src_text, name, tmp_path, monkeypatch, unders=STOCKS, rel=None, extra_
 
     def relative(series, level, symbol, basket=None, ref=None, **kw):
         relative_calls.append((symbol, tuple(basket), ref))
-        return Relative(np.array([1.0, 2.0, 3.0]), -1 if (series == "iv" and iv_cannot) else 3, now=0.5, n_valid=7, pctile=pct, symbols=list(basket), series=series, level=level, symbol=symbol)
+        offset = (pct - 50.0) / 25.0                                  # so the basket's own average tracks pct too: positive above 50, negative below, ~0 at the middle
+        return Relative(np.array([-1.0, 0.0, 1.0]) + offset, -1 if (series == "iv" and iv_cannot) else 3, now=0.5, n_valid=7, pctile=pct, symbols=list(basket), series=series, level=level, symbol=symbol)
 
     def absolute(series, level, symbol, n=22, ref=None, **kw):
         return Absolute(np.arange(float(n)), -1 if (series == "iv" and iv_cannot) else 11, now=0.5, n_valid=n, pctile=pct, series=series, level=level, symbol=symbol)
@@ -59,10 +60,14 @@ def start(src_text, name, tmp_path, monkeypatch, unders=STOCKS, rel=None, extra_
     ns["relative"], ns["absolute"] = relative, absolute
     ns["basket"] = lambda n, members, **k: saved.append((n, list(members)))
     src_text = re.sub(r"^    ONLY = \[.*?\]", "    ONLY = []", src_text, count=1, flags=re.M | re.S)                    # the owner's own list of stocks: the tests use the fake futures
-    src = src_text.replace("WINDOW = (dtime(9, 30), dtime(15, 0))", ALWAYS_OPEN).replace("EXIT_AT = dtime(15, 15)", "EXIT_AT = dtime(23, 59, 59)")
+    src_text = re.sub(r"^    SECTOR_BASKETS = \{.*?\n    \}", f"    SECTOR_BASKETS = {{\"all\": {list(unders)!r}}}", src_text, count=1, flags=re.M | re.S)   # one basket of the fake futures
+    src = re.sub(r"^    WINDOW = \(dtime\([^)]*\), dtime\([^)]*\)\)", f"    {ALWAYS_OPEN}", src_text, count=1, flags=re.M)        # whatever hours the script owns, tests run all day
+    src = src.replace("EXIT_AT = dtime(15, 15)", "EXIT_AT = dtime(23, 59, 59)")
     if "ACT_ON_BAR_END = True" not in replace:                                                      # the older tests feed any number of candles: they look at every minute
         src = src.replace("ACT_ON_BAR_END = True", "ACT_ON_BAR_END = False")
     for old, new in replace.items():
+        if old == "N_BASKETS = 4" and old not in src:                                                  # scripts with SECTOR_BASKETS (one basket of the fake futures already) have no N_BASKETS
+            continue
         assert old in src, old
         src = src.replace(old, new)
     before = set(ns)
@@ -70,9 +75,8 @@ def start(src_text, name, tmp_path, monkeypatch, unders=STOCKS, rel=None, extra_
     return ns, app, svc, wire, saved, relative_calls, before
 
 
-@pytest.mark.parametrize("text,name", [(RSI, "11_india_fut_rsi_crossorder.py"), (Z, "12_india_fut_zscore_crossorder.py")], ids=["11", "12"])
-def test_four_baskets_of_stock_futures_only_no_index_no_expired_every_stock_once(text, name, tmp_path, fake_dh, monkeypatch):
-    ns, app, svc, wire, saved, rel, before = start(text, name, tmp_path, monkeypatch)
+def test_four_baskets_of_stock_futures_only_no_index_no_expired_every_stock_once(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire, saved, rel, before = start(Z, "12_india_fut_zscore_crossorder.py", tmp_path, monkeypatch)
     assert [n for n, _ in saved] == ["fut_1", "fut_2", "fut_3", "fut_4"]
     members = [m for _, ms in saved for m in ms]
     assert sorted(members) == sorted(f"{s} FUT" for s in STOCKS)                                    # every stock future once; no NIFTY, BANKNIFTY, OLDSTOCK
@@ -81,15 +85,27 @@ def test_four_baskets_of_stock_futures_only_no_index_no_expired_every_stock_once
     svc.on_stop()
 
 
-@pytest.mark.parametrize("text,name", [(RSI, "11_india_fut_rsi_crossorder.py"), (Z, "12_india_fut_zscore_crossorder.py")], ids=["11", "12"])
-def test_only_and_exclude_and_too_few_futures(text, name, tmp_path, fake_dh, monkeypatch):
-    ns, app, svc, wire, saved, rel, before = start(text, name, tmp_path, monkeypatch, **{"ONLY = []": 'ONLY = ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13"]',
-                                                                                          "EXCLUDE = []": 'EXCLUDE = ["s02"]'})
+def test_only_and_exclude_and_too_few_futures(tmp_path, fake_dh, monkeypatch):
+    ns, app, svc, wire, saved, rel, before = start(Z, "12_india_fut_zscore_crossorder.py", tmp_path, monkeypatch,
+                                                    **{"ONLY = []": 'ONLY = ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13"]',
+                                                       "EXCLUDE = []": 'EXCLUDE = ["s02"]'})
     members = sorted(m for _, ms in saved for m in ms)
     assert members == sorted(f"S{i:02d} FUT" for i in range(1, 14) if i != 2)                       # only those, minus the excluded (any case)
     svc.on_stop()
     with pytest.raises(ValueError, match="too few"):
-        start(text, name, tmp_path, monkeypatch, unders=STOCKS[:5])
+        start(Z, "12_india_fut_zscore_crossorder.py", tmp_path, monkeypatch, unders=STOCKS[:5])
+
+
+def test_11_builds_named_sector_baskets_from_sector_baskets_and_excludes(tmp_path, fake_dh, monkeypatch):
+    """11's SECTOR_BASKETS replaced in start() with one basket "all" of every fake underlying; EXCLUDE still removes symbols from it."""
+    ns, app, svc, wire, saved, rel, before = start(RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S01", "S02", "S03", "S04"],
+                                                    **{"EXCLUDE = []": 'EXCLUDE = ["s02"]'})
+    assert [n for n, _ in saved] == ["all"]
+    members = sorted(m for _, ms in saved for m in ms)
+    assert members == ["S01 FUT", "S03 FUT", "S04 FUT"]                                             # S02 excluded (any case)
+    svc.on_stop()
+    with pytest.raises(ValueError, match="basket needs at least 3"):
+        start(RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=STOCKS[:2])
 
 
 @pytest.mark.parametrize("text,name,tag", [(RSI, "11_india_fut_rsi_crossorder.py", "india_fut_rsi"), (Z, "12_india_fut_zscore_crossorder.py", "india_fut_zscore")], ids=["11", "12"])
@@ -302,7 +318,7 @@ def test_the_tick_exit_edits_the_token_table_from_a_worker_thread_and_a_tick_clo
     svc.on_stop()
 
 
-@pytest.mark.parametrize("text", [RSI, Z, (EXAMPLES / "13_india_fut_ema_cross_crossorder.py").read_text(encoding="utf-8")], ids=["11", "12", "13"])
+@pytest.mark.parametrize("text", [RSI, Z, (EXAMPLES / "13_india_directional_crossorder.py").read_text(encoding="utf-8")], ids=["11", "12", "13"])
 def test_the_india_scripts_have_the_one_entry_per_stock_rule(text):
     for needle in ("ONE_ENTRY_PER_STOCK = True", "entered.add(token)", "entered.discard(token)", "ONE_ENTRY_PER_STOCK and token in entered"):
         assert needle in text, needle
@@ -344,7 +360,7 @@ def test_script_11_does_not_enter_a_stock_again_after_its_exit(tmp_path, fake_dh
     assert sides[0] == 1 and len(sides) >= 2                                                         # with the rule off the same candles enter again
 
 
-ALL_SIX = ["08_us_basket_rsi_crossorder.py", "10_us_zscore_crossorder.py", "11_india_fut_rsi_crossorder.py", "12_india_fut_zscore_crossorder.py", "13_india_fut_ema_cross_crossorder.py", "14_us_ema_cross_crossorder.py"]
+ALL_SIX = ["08_us_basket_rsi_crossorder.py", "10_us_zscore_crossorder.py", "11_india_fut_rsi_crossorder.py", "12_india_fut_zscore_crossorder.py", "13_india_directional_crossorder.py", "14_us_directional_crossorder.py"]
 
 
 @pytest.mark.parametrize("name", ALL_SIX, ids=[n[:2] for n in ALL_SIX])

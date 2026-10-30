@@ -26,6 +26,17 @@ def master_is_off(svc) -> bool:
     return svc.state == "service_down" or not svc.sending
 
 
+NATS_LABEL = {"on": "CONNECTED", "off": "CONNECTED", "dry": "DRY RUN", "disconnected": "DISCONNECTED", "service_down": "NOT RUNNING"}
+NATS_OK = {"on", "off", "dry"}                                      # states where the NATS link itself is fine (sending may still be OFF)
+
+
+def nats_status(svc) -> tuple[str, bool]:
+    """(label, ok) for a NATS-link indicator, separate from the SENDING switch: a strategy can be switched OFF while NATS is perfectly connected.
+    ok is True for on / off / dry (the link itself is fine), False for disconnected or service_down (red)."""
+    state = svc.state
+    return NATS_LABEL.get(state, state.upper()), state in NATS_OK
+
+
 def set_sending(app, svc, strategy: "str | None", on: bool) -> str:
     """Do what the button says. Returns "" when it worked, else the reason it did not (to show under the button)."""
     if svc.state == "service_down":

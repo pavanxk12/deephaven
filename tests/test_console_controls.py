@@ -122,3 +122,31 @@ def test_the_turnover_box_is_typed_in_lakhs_and_stored_in_rupees():
     assert limit_value("-10000", 1) == -10000.0 and limit_text(-10000, 1) == "-10000"                  # the M2M box and the dollar market are unchanged
     with pytest.raises(ValueError):
         limit_value("abc", LAKH)
+
+
+# ---- the NATS-link indicator (separate from the SENDING switch) --------------------------------------------------------------------------------
+def test_nats_status_is_connected_whatever_the_sending_switch_shows(console):
+    from algo.ui.controls import nats_status
+    app, svc, wire = console
+    algo_start(3, "a")
+    assert nats_status(svc) == ("CONNECTED", True)                  # sending is OFF by default, the link is still up
+    on("a")
+    assert nats_status(svc) == ("CONNECTED", True)                  # sending ON: still just "connected"
+
+
+def test_nats_status_says_disconnected_or_not_running(console):
+    from algo.ui.controls import nats_status
+    app, svc, wire = console
+    svc.transport = None
+    assert nats_status(svc) == ("DISCONNECTED", False)
+    svc.on_stop()
+    assert nats_status(svc) == ("NOT RUNNING", False)
+    from algo.comms.nats_service import NO_SERVICE
+    assert nats_status(NO_SERVICE) == ("NOT RUNNING", False)
+
+
+def test_nats_status_says_dry_run(console):
+    from algo.ui.controls import nats_status
+    app, svc, wire = console
+    svc.cfg = type(svc.cfg)(**{**svc.cfg.__dict__, "dry_run": True})
+    assert nats_status(svc) == ("DRY RUN", True)

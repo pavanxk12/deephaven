@@ -36,7 +36,7 @@ from algo.core.plugin import Plugin
 from algo.strategy.guard import guard_of
 from algo.ui import tables as q
 from algo.ui.redraw import Redraw
-from algo.ui.controls import is_sending, master_is_off, set_sending
+from algo.ui.controls import is_sending, master_is_off, nats_status, set_sending
 from algo.ui.filters import LAKH, PF_PER_USER, Filters, in_lakh, limit_text, limit_value, Strategies, as_int, number_of, plain, row_value, safe_strategy, strategy_cond, time_conds
 
 GREEN, RED, BLUE, ORANGE, AMBER, PURPLE, GREY, INK = (
@@ -589,6 +589,7 @@ def control_panel(ctx: Ctx):
         if confirm and all_paused else pbtn("Square off all", RED, lambda: set_confirm(True), disabled=not all_paused)
     )
     status_color = GREEN if sending else RED
+    nats_label, nats_ok = nats_status(svc)
     return ui.panel(
         ui.flex(
             ui.flex(
@@ -597,6 +598,11 @@ def control_panel(ctx: Ctx):
                     ui.html.div("ON" if sending else "OFF",
                                 style={"color": status_color, "fontSize": "22px", "fontWeight": "700", "lineHeight": "1.1"}),
                     direction="column",
+                ),
+                ui.flex(
+                    ui.html.div("NATS", style={"color": GREY, "fontSize": "11px", "fontWeight": "bold"}),
+                    ui.html.div(nats_label, style={"color": GREEN if nats_ok else RED, "fontSize": "13px", "fontWeight": "700", "lineHeight": "1.1"}),
+                    direction="column", align_items="end",
                 ),
                 ui.flex(pbtn("ON", GREEN, lambda: handle_switch(True), outline=not sending),      # filled = current state
                         pbtn("OFF", RED, lambda: handle_switch(False), outline=sending), gap="size-100"),
