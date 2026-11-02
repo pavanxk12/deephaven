@@ -10,6 +10,8 @@
 #                                   (percentile 100) on both; SELL needs it WEAK (below EXTREME[0]) on both. DIRECTION_MATCH = True: BUY needs the best, SELL the weak side. False: either passes.
 #                     3. ABSOLUTE   the stock must also be EXTREME against its own earlier days at the same minute (absolute(), ABS_DAYS = 22 saved days). BUY needs it above 90 on both refs;
 #                                   SELL needs it below EXTREME[0] on both, on the same side as filter 2.
+#                     4. RVOL       today's cumulative volume so far (absolute("volume", ...)) must be at least RVOL_MIN_MULT times the AVERAGE of the same point in the session over the
+#                                   previous ABS_DAYS days. Not directional (no side of its own): a gate on both BUY and SELL alike. Off when RVOL_MIN_MULT is None, or ABS_DAYS is 0.
 #                     Each filter runs only for the stocks that passed the one before it. With fewer than half of the days in the files absolute() cannot tell and there is no trade.
 #                     A trade needs the sides of 0 and 1 (and 2, and 3 when ABS_DAYS > 0) to agree on exactly one side.
 #                     USE_IV = False: no IV filter (the US has no straddle series; True would make every entry say "cannot tell").
@@ -70,18 +72,20 @@ def run_us_directional():
     USE_IV = False                           # False: % from open / VWAP only. True would also need an IV series (the US has none), so every entry would say "cannot tell"
     DAY_EXTREME = True                       # True: filter 0, the latest SIGNAL_BAR close (5min) must be the highest (BUY) or the lowest (SELL) of today's SIGNAL_BAR closes so far (at least 2 bars today). False: off
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
+    RVOL_MIN_MULT = 1.5                      # filter 4: today's cumulative volume so far must be at least this many times the AVERAGE of the same point in the session over the
+                                             # previous ABS_DAYS days (relative volume). None = off; has no effect while ABS_DAYS is 0 (no history to average)
     SIGNAL_BAR = "5min"                         # the bar filter 0 (TODAY) checks today's highest/lowest close on (made from the 1-minute candles)
     ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an SIGNAL_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
                                              # 1-minute close. False: look for an entry on every 1-minute candle
     TARGET_PCT, STOP_PCT = 1.5, 0.5
-    TRAIL_TRIGGER_PCT = 1.25                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
-    PROFIT_LOCK_PCT = 1.0                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
+    TRAIL_TRIGGER_PCT = 1.0                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
+    PROFIT_LOCK_PCT = 0.8                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
     ENTRY_VALUE = None                       # None: every entry is QTY lots. A number (dollars): the quantity at entry is int(ENTRY_VALUE / the last 1-minute close), QTY is then not used;
                                              # if one share costs more than ENTRY_VALUE the quantity would be 0 and that entry is skipped (it says so)
-    ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
+    ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1","MAX_TRIES":5}      # "CrossOrder" is the engine's name for the CrossOrder plugin
     WINDOW = (dtime(10, 0), dtime(15, 45))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
     EXIT_AT = dtime(15, 55)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
     MAX_PORTFOLIOS = 28                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
@@ -99,10 +103,11 @@ def run_us_directional():
     if not (BASKAVG_SHORT < BASKAVG_LONG and all(0 <= SELL[ref] < BUY[ref] <= 100 for SELL, BUY in ((REL_SELL, REL_BUY), (ABS_SELL, ABS_BUY)) for ref in REFS)
             and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and (ENTRY_VALUE is None or ENTRY_VALUE > 0) and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
             and ((TRAIL_TRIGGER_PCT is None) == (PROFIT_LOCK_PCT is None)) and (TRAIL_TRIGGER_PCT is None or TRAIL_TRIGGER_PCT > 0)
-            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
+            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and (RVOL_MIN_MULT is None or RVOL_MIN_MULT > 0)
+            and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
         raise ValueError("BASKAVG_SHORT below BASKAVG_LONG; every SELL threshold must be below its BUY threshold, both inside 0 to 100, for pct_open, pct_vwap and iv in REL_BUY/REL_SELL/ABS_BUY/ABS_SELL, "
                          "TARGET_PCT and STOP_PCT above 0, TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
-                         "QTY at least 1, ABS_DAYS 0 to 400, EXIT_AT after the window opens, and every basket needs at least 3 symbols")
+                         "QTY at least 1, ABS_DAYS 0 to 400, RVOL_MIN_MULT None or above 0, EXIT_AT after the window opens, and every basket needs at least 3 symbols")
     BAR_S = parse_timeframe(SIGNAL_BAR)                               # 300; refuses a size that does not line up with the clock
     basket_of = {}                                                 # symbol -> the name of its basket
     for name, members in BASKETS.items():
@@ -179,6 +184,8 @@ def run_us_directional():
                 absolute_warm("pct", LEVEL, sorted(set(symbol_of.values())), ABS_DAYS, ref=warm_ref)
             if USE_IV:
                 absolute_warm("iv", LEVEL, sorted(set(symbol_of.values())), ABS_DAYS)
+            if RVOL_MIN_MULT is not None:
+                absolute_warm("volume", LEVEL, sorted(set(symbol_of.values())), ABS_DAYS)
         except Exception as e:
             print(f"absolute(): the earlier days could not be preloaded ({e}); they are read at the first signal instead")
     for t in symbol_of:                                            # today's candles already built
@@ -255,6 +262,16 @@ def run_us_directional():
         """Filter 3, absolute(): the ranking among the same minute of its previous ABS_DAYS trading days, for pct_open, pct_vwap and iv (if USE_IV), each against its own
         ABS_BUY / ABS_SELL threshold."""
         return ranked_sides(lambda series, ref: absolute(series, LEVEL, symbol, ABS_DAYS, **({"ref": ref} if ref else {})), ABS_BUY, ABS_SELL)
+
+    def rvol_ok(symbol):
+        """Filter 4: today's cumulative volume so far must be at least RVOL_MIN_MULT times the AVERAGE of the same point in the session over the previous ABS_DAYS days.
+        Not a ranking: True/False only (no side), so it never decides BUY vs SELL, only whether there is enough volume behind the move to trade it at all."""
+        with exec_ctx:                                             # the call reads the candles table; a listener thread needs the terminal's query context for that
+            result = absolute("volume", LEVEL, symbol, ABS_DAYS)
+        if result[1] < 0:                                          # (the second item is -1 when it cannot be told)
+            return False
+        avg = float(np.mean(result[0][np.isfinite(result[0])]))
+        return avg > 0 and result.now >= RVOL_MIN_MULT * avg
 
     # ---- the orders ------------------------------------------------------------------------------------------------------------------
     def in_window():
@@ -488,6 +505,9 @@ def run_us_directional():
             if len(sides) != 1:
                 count("refused by own days" if ABS_DAYS > 0 and not sides else "no single side agreed")
                 return
+            if RVOL_MIN_MULT is not None and ABS_DAYS > 0 and not rvol_ok(symbol_of[token]):      # 4. rvol: enough volume behind the move (not directional)
+                count("refused by rvol")
+                return
             side = next(iter(sides))
         except Exception as e:
             ranking_failed(token, first, e)
@@ -549,7 +569,7 @@ def run_us_directional():
         if tick_state:
             tick_state[1].stop()
             tick_jobs.put(None)
-        algo_stop(STRATEGY)                                        # pause + square up + unsubscribe every portfolio, wait for it, then stop (refuses while sending is OFF)
+        algo_stop(STRATEGY, pause=False)                           # square up + unsubscribe every portfolio (no pause step), wait for it, then stop (refuses while sending is OFF)
 
     shared = globals()
     shared["us_directional_status"], shared["us_directional_exit_all"], shared["us_directional_stop"] = status, exit_all, stop

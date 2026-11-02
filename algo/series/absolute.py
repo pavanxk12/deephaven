@@ -7,6 +7,8 @@
     series   "pct"       the percent change of the price from a REFERENCE POINT you choose with ref=  (default "open")
              "iv"        the IV column of straddle_series (the nearest expiry of the symbol); with ref= its percent change from that point
              "pct_open" / "pct_vwap"   shorthands for series "pct" with ref "open" / "vwap"
+             "volume"    relative volume (rvol): today's CUMULATIVE volume up to this minute, ranked against the same minute of the previous n days (no ref: it is
+                         always the plain running total, never a percent change)
     ref      "open"        the open of the period (the level's: day, week or month)
              "vwap"        the VWAP since that open (typical price (H+L+C)/3 x volume), prices only
              "prev_close"  the last value of the previous trading day
@@ -37,7 +39,7 @@ from datetime import date, datetime, timedelta
 
 import numpy as np
 
-SERIES = ("pct", "iv", "pct_open", "pct_vwap")             # pct_open / pct_vwap are "pct" with ref="open" / "vwap"
+SERIES = ("pct", "iv", "pct_open", "pct_vwap", "volume")   # pct_open / pct_vwap are "pct" with ref="open" / "vwap"; "volume" is relative volume (rvol), no ref
 LEVELS = ("intraday", "intraweek", "intramonth")
 NAN = float("nan")
 _FUT = re.compile(r"^(?P<und>.+?) (?P<exp>\d{2}[A-Z]{3}\d{2}) FUT$")
@@ -670,6 +672,11 @@ class AbsoluteService:
             if spec is not None and spec[0] == "vwap":
                 raise ValueError("an IV has no volume, so no VWAP; use ref='open', 'prev_close', '10min' or 'HH:MM' (or no ref for the IV itself)")
             return "iv", spec
+        if series == "volume":
+            if ref is not None:
+                raise ValueError("series 'volume' has no reference point (it is always today's running total, ranked against the same minute of earlier days); call "
+                                  "absolute('volume', level, symbol, n) with no ref=")
+            return "volume", None
         raise ValueError(f"series must be one of {SERIES}, got {series!r}")
 
     def _obj(self, kind: str, spec, d: str, today: str):
@@ -704,6 +711,9 @@ class AbsoluteService:
         """The series at slot m of day d, given that day's data (None = none): the IV itself (no reference) or the percent change of the value from its reference point."""
         if obj is None:
             return NAN
+        if kind == "volume":
+            v = float(obj.cum_v[m])
+            return v if v == v else NAN
         arr = obj.iv if kind == "iv" else obj.close
         v = float(arr[m])
         if not v == v:
@@ -898,7 +908,7 @@ class AbsoluteService:
             value = {sp: self._value_from("iv", rf, level, sp, ivs[underlying_of(sp)], today, slot, days, today) for sp in everyone}
         else:
             tod = self._today_days(everyone, today)
-            value = {sp: self._value_from("pct", rf, level, sp, tod[sp], today, slot, days, today) for sp in everyone}
+            value = {sp: self._value_from(kind, rf, level, sp, tod[sp], today, slot, days, today) for sp in everyone}
         vals = np.array([value[sp] for sp in specs], dtype=np.float64)
         cur = float(now) if now is not None else value[target]
         valid = vals[np.isfinite(vals)]

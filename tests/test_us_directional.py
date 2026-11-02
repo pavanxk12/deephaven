@@ -18,7 +18,7 @@ SCRIPT = (EXAMPLES / "14_us_directional_crossorder.py").read_text(encoding="utf-
 OPEN_WINDOW = re.search(r"WINDOW = [(]dtime[(]\d+, \d+[)], dtime[(]\d+, \d+[)][)]", SCRIPT).group(0)
 
 
-def start(tmp_path, monkeypatch, pct=50.0, iv_cannot=False, **replace):
+def start(tmp_path, monkeypatch, pct=50.0, iv_cannot=False, rvol_now=10.0, **replace):
     ns, app, svc, wire = console_with_services(tmp_path, monkeypatch, "ok")
     calls = []
 
@@ -29,6 +29,8 @@ def start(tmp_path, monkeypatch, pct=50.0, iv_cannot=False, **replace):
 
     def absolute(series, level, symbol, n=22, ref=None, **kw):
         calls.append(("absolute", series, symbol))
+        if series == "volume":                                       # history averaging 1.0; rvol_now defaults well above RVOL_MIN_MULT x that, so it passes unless a test lowers it
+            return Absolute(np.ones(n), 11, now=rvol_now, n_valid=n, pctile=100.0, series=series, level=level, symbol=symbol)
         return Absolute(np.arange(float(n)), -1 if (series == "iv" and iv_cannot) else 11, now=0.5, n_valid=n, pctile=pct, series=series, level=level, symbol=symbol)
 
     ns["absolute_warm"] = lambda *a, **k: None
@@ -88,6 +90,14 @@ def test_the_weak_side_on_both_refs_sells(tmp_path, fake_dh, monkeypatch):
     svc, wire, entries, calls = run(tmp_path, fake_dh, monkeypatch, up=False, pct=10.0)                   # below EXTREME[0] (20) on both open and vwap, and below 20 on absolute
     subs = [p for _, lab, p in wire.sent if lab == "subscribe"]
     assert len(subs) == 1 and subs[0]["SIDE"] == 2 and entries[0] % 5 == 4
+    svc.on_stop()
+
+
+def test_rvol_below_the_minimum_multiple_of_the_average_refuses_the_entry(tmp_path, fake_dh, monkeypatch):
+    assert "RVOL_MIN_MULT = 2.0" in SCRIPT                                                                # history averages 1.0 (see start()); 2.0 under it fails the gate
+    svc, wire, entries, calls = run(tmp_path, fake_dh, monkeypatch, up=True, pct=100.0, rvol_now=1.5)     # would otherwise be the clean BUY of the first test
+    assert wire.sent == []
+    assert ("absolute", "volume", "NIFTY") in calls
     svc.on_stop()
 
 

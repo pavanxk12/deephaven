@@ -246,9 +246,10 @@ class Bridge(Plugin):
             self.log.error("PF %s swap FAILED: %r", pf, e)
             self.nats.note(pf, "swap", "failed", str(e), self.user or 0)
 
-    def _exit_job(self, pf: int):
+    def _exit_job(self, pf: int, pause: bool = True):
         async def job(call: Call) -> None:
-            await self._pause(call, pf, "Pause")
+            if pause:
+                await self._pause(call, pf, "Pause")
             await call("squareup", None)
         return job
 
@@ -261,12 +262,12 @@ class Bridge(Plugin):
         st = self.nats.pf_state(pf, self.user)
         return int(st.option) if st is not None and st.subscribed and st.option is not None else None
 
-    def _unsubscribe_job(self, pf: int):
+    def _unsubscribe_job(self, pf: int, pause: bool = True):
         async def job(call: Call) -> None:
             opt = self.subscribed_option(pf)
             if opt is None:
                 return
-            steps = (("pause_unpause", lambda: self._pause(call, pf, "Pause")),
+            steps = ((("pause_unpause", lambda: self._pause(call, pf, "Pause")),) if pause else ()) + (
                      ("squareup", lambda: call("squareup", None)),
                      ("unsubscribe", lambda: call("unsubscribe", self._sub(opt))))
             for cmd, step in steps:
@@ -338,19 +339,19 @@ class Bridge(Plugin):
             if not self._dry(f"unpause {pf}"):
                 self._after_pause(self.nats.unpause(pf, user=self.user, client=self.client), pf, False)
 
-    def exit_all(self) -> None:
-        """Pause + square up every portfolio."""
+    def exit_all(self, pause: bool = True) -> None:
+        """Square up every portfolio. `pause` (default True, the old behaviour): pause it first; False sends the squareup alone, with no pause step."""
         if not self._guard("exit_all"):
             return
         for pf in self.book.all_pfs():
-            if not self._dry(f"pause + squareup {pf}"):
-                self.nats.submit(pf, self._exit_job(pf), user=self.user, client=self.client, label="exit")
+            if not self._dry(f"{'pause + ' if pause else ''}squareup {pf}"):
+                self.nats.submit(pf, self._exit_job(pf, pause), user=self.user, client=self.client, label="exit")
         for t in list(self.book.tracked):
             self.book.set_live(t, None)
 
-    def unsubscribe_all(self) -> "list | None":
-        """Stop signals, then pause + square up + unsubscribe every current portfolio. Returns the futures of the jobs (so a caller can wait for them to finish), or None
-        when nothing was sent because the service is down, sending is OFF or this is a dry run."""
+    def unsubscribe_all(self, pause: bool = True) -> "list | None":
+        """Stop signals, then square up + unsubscribe every current portfolio. `pause` (default True, the old behaviour): pause it first; False skips that step.
+        Returns the futures of the jobs (so a caller can wait for them to finish), or None when nothing was sent because the service is down, sending is OFF or this is a dry run."""
         if self.dry_run or not self.sending:
             self.log.warning("the NATS service is not running (nats_start())" if self.nats is NO_SERVICE
                              else "sending is OFF or dry run: call send_on() first (dry_run must be False)")
@@ -358,7 +359,7 @@ class Bridge(Plugin):
         for cb in list(self._halt_cbs):
             cb()
         pfs = self.book.current_pfs()
-        futures = [self.nats.submit(pf, self._unsubscribe_job(pf), user=self.user, client=self.client, label="unsubscribe") for pf in pfs]
+        futures = [self.nats.submit(pf, self._unsubscribe_job(pf, pause), user=self.user, client=self.client, label="unsubscribe") for pf in pfs]
         for t in list(self.book.tracked):
             self.book.set_live(t, None)
         self.log.info("unsubscribing %d portfolio(s), watch the log", len(pfs))

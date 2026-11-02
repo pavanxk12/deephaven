@@ -302,19 +302,20 @@ def algo_sending(strategy: str) -> bool:
     return isinstance(run, _AlgoRun) and run.nats.sending
 
 
-def algo_stop(strategy: str, unsubscribe: bool = True, wait_s: float = 10.0) -> None:
+def algo_stop(strategy: str, unsubscribe: bool = True, wait_s: float = 10.0, pause: bool = True) -> None:
     """Stop an automation: first close it down on the trading side, then stop it.
 
     By default it does what algo_exit does (pauses and squares up every portfolio) AND unsubscribes every current portfolio, waits for those commands (up to `wait_s` seconds; the
     unsubscribe itself follows `squareup_settle_s` = a minute after the squareup, so that a plugin can close its position first, and finishes in the background), and only then stops the automation (its book, bridge and candle listeners; the portfolio numbers and files are kept).
     If the portfolios cannot be unsubscribed because sending is OFF (a switched-off strategy, a breached limit) or the NATS service is down, NOTHING is stopped and it says
     so: switch the strategy ON and call it again, or algo_stop(name, unsubscribe=False) to stop it as it is (its portfolios stay subscribed, positions open).
+    `pause` (default True, the old behaviour): pause each portfolio before its squareup; False sends the squareup alone, with no pause step.
     A dry run, or an automation with no portfolios, just stops. It waits, so call it from the terminal, not from a listener."""
     run = current().get(strategy) if strategy else None
     if unsubscribe and isinstance(run, _AlgoRun):
         bridge = run.nats.bridge
         if not bridge.dry_run and bridge.book is not None and bridge.book.current_pfs():
-            futures = bridge.unsubscribe_all()
+            futures = bridge.unsubscribe_all(pause)
             if futures is None:
                 print(f"{strategy}: NOT stopped: its portfolios could not be unsubscribed (sending is OFF or the NATS service is down). Switch it ON and call algo_stop again, "
                       f"or algo_stop({strategy!r}, unsubscribe=False) to stop it as it is, with its portfolios still subscribed")
@@ -397,10 +398,10 @@ def algo_portfolios(strategy: str) -> pd.DataFrame | None:
     return df
 
 
-def _all(strategy: str, what: str, call: str) -> None:
+def _all(strategy: str, what: str, call: str, *args) -> None:
     run = _run(strategy, what)
     if run is not None:
-        getattr(run.nats.bridge, call)()
+        getattr(run.nats.bridge, call)(*args)
 
 
 def algo_pause(strategy: str) -> None:
@@ -413,11 +414,11 @@ def algo_unpause(strategy: str) -> None:
     _all(strategy, "algo_unpause", "unpause_all")
 
 
-def algo_exit(strategy: str) -> None:
-    """Pause, then square up, every portfolio this automation has touched."""
-    _all(strategy, "algo_exit", "exit_all")
+def algo_exit(strategy: str, pause: bool = True) -> None:
+    """Square up every portfolio this automation has touched. `pause` (default True, the old behaviour): pause each one first; False skips that step."""
+    _all(strategy, "algo_exit", "exit_all", pause)
 
 
-def algo_unsubscribe(strategy: str) -> None:
-    """Pause, square up and unsubscribe every current portfolio of this automation."""
-    _all(strategy, "algo_unsubscribe", "unsubscribe_all")
+def algo_unsubscribe(strategy: str, pause: bool = True) -> None:
+    """Square up and unsubscribe every current portfolio of this automation. `pause` (default True, the old behaviour): pause each one first; False skips that step."""
+    _all(strategy, "algo_unsubscribe", "unsubscribe_all", pause)
