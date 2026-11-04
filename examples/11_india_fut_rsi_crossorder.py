@@ -18,18 +18,18 @@
 #   One entry         ONE_ENTRY_PER_STOCK = True: a stock is entered ONCE. After its take-profit, stop-loss or any other exit it is not entered again (until the script is pasted again).
 #   The time exit     EXIT_AT (15:15 India time): the automation is stopped the way algo_stop does it: every portfolio is paused and squared up, a minute later unsubscribed (so the plugin
 #                     can close first), and the script stops. No entry is made from then on. It is checked on every batch of 1-minute candles. It refuses while sending is OFF
-#                     (it says so; then run india_fut_rsi_stop() by hand).
+#                     (it says so; then run meanrevert_stop() by hand).
 #   The order         a NEW portfolio for every trade: ONE `subscribe` that carries the fields, as for 07 (the engine knows the plugin as "CrossOrder"; SIDE 1 = buy, 2 = sell):
 #                     {"strategyname": "CrossOrder", "TOKEN": <the future>, "SIDE": 1|2, "QTY": n lots, "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}
 #                     The NATS service adds USERIDENTIFIER and user_id. The book gives the portfolio numbers; each future may use up to 100 a day.
 #   Needs             the master and the candles running for the FUTURES (candles_start(kind="FUT") is enough, no options needed), and the saved candles_<day>.parquet files for the history.
 #
-# EVERYTHING is inside the function run_india_fut_rsi() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of
-# names shared by every script you paste. The only names left in the terminal start with india_fut_rsi:
-#   india_fut_rsi_status()   india_fut_rsi_exit_all()   india_fut_rsi_stop()   (stop pauses, squares up and unsubscribes every portfolio, then stops; it refuses while sending is OFF)
+# EVERYTHING is inside the function run_meanrevert() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of
+# names shared by every script you paste. The only names left in the terminal start with meanrevert:
+#   meanrevert_status()   meanrevert_exit_all()   meanrevert_stop()   (stop pauses, squares up and unsubscribes every portfolio, then stops; it refuses while sending is OFF)
 # Positions are kept in the script only: if you stop it or Deephaven restarts while a position is open, it no longer knows about it (square it up from the console).
 
-def run_india_fut_rsi():
+def run_meanrevert():
     import contextlib
     import glob
     import io
@@ -60,14 +60,10 @@ def run_india_fut_rsi():
 
     # =============================== USER INPUT ===============================
     USER = 4
-    STRATEGY = "india_fut_rsi"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
+    STRATEGY = "meanrevert"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
     INDEX_FUTURES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}      # index futures are left out: stock futures only
     SECTOR_BASKETS = {                       # named baskets: a symbol is ranked only against the others of ITS named basket (at least 3 members each)
-        "bank":   ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK"],
-        "fin":    ["BAJFINANCE", "BAJAJFINSV", "SBILIFE", "HDFCLIFE", "BSE"],
-        "it":     ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM"],
-        "auto":   ["M&M", "MARUTI", "TATAMOTORS", "EICHERMOT", "BAJAJ-AUTO"],
-        "health":["SUNPHARMA","DRREDDY","CIPLA","APOLLOHOSP","MAXHEALTH"],
+        "nifty":   ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK","BAJFINANCE", "BAJAJFINSV", "SBILIFE", "HDFCLIFE", "BSE","TCS", "INFY", "HCLTECH", "WIPRO", "TECHM","M&M", "MARUTI", "TATAMOTORS", "EICHERMOT", "BAJAJ-AUTO","SUNPHARMA","DRREDDY","CIPLA","APOLLOHOSP","MAXHEALTH","ITC","NESTLEIND","TITAN","HINDUNILVR","ETERNAL","ONGC","BPCL","RELIANCE","NTPC","POWERGRID","HINDALCO","JSWSTEEL","TATASTEEL","COALINDIA"],
     }                                         # add/remove/comment out symbols or whole baskets here; empty = none
     EXCLUDE = []                             # optional: underlyings to leave out (applied across every basket)
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
@@ -80,15 +76,17 @@ def run_india_fut_rsi():
     ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an RSI_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
                                              # 1-minute close. False: look for an entry on every 1-minute candle
     HIST_DAYS = 1                            # how many earlier saved days seed the RSI (0 = none)
-    TARGET_PCT, STOP_PCT = 1.5, 0.5
-    TRAIL_TRIGGER_PCT = 1.0                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
-    PROFIT_LOCK_PCT = 0.8                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
+    TARGET_PCT, STOP_PCT = 3.0, 0.5
+    TRAIL_TRIGGER_PCT = 0.8                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
+    PROFIT_LOCK_PCT = 0.6                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
+    TRAIL_STEP_PCT = 0.2                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
+                                             # move - TRAIL_STEP_PCT (never lowered), so once the move is up X% the lock is up (X - TRAIL_STEP_PCT)% -- it never gives back more than TRAIL_STEP_PCT
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
     ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 26286, "ACCOUNT": "", "ALGOID": "34500"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
     WINDOW = (dtime(9, 45), dtime(13, 30))    # entries only inside it (India time, the session is 09:15 to 15:30); an exit is sent at any time
-    EXIT_AT = dtime(15, 15)                  # time exit (India time): 15 minutes before the 15:30 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
+    EXIT_AT = dtime(15, 10)                  # time exit (India time): 15 minutes before the 15:30 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
     MAX_PORTFOLIOS = 32                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
                                              # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.
     UNSUB_AFTER_S = 60                       # a closed position's portfolio is unsubscribed this many seconds after its exit (take-profit, stop-loss, z-exit) so the engine frees the slot;
@@ -120,10 +118,12 @@ def run_india_fut_rsi():
     if not (all(0 <= ZONE[ref][0] < ZONE[ref][1] <= 100 for ZONE in (REL_ZONE, ABS_ZONE) for ref in REFS)
             and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
             and ((TRAIL_TRIGGER_PCT is None) == (PROFIT_LOCK_PCT is None)) and (TRAIL_TRIGGER_PCT is None or TRAIL_TRIGGER_PCT > 0)
+            and (TRAIL_STEP_PCT is None or (TRAIL_TRIGGER_PCT is not None and TRAIL_STEP_PCT > 0))
             and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
         raise ValueError("every (low, high) band in REL_ZONE/ABS_ZONE must be inside 0 to 100 with low below high, TARGET_PCT and STOP_PCT above 0, "
                          "TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
-                         "QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, and every basket needs at least 3 symbols")
+                         "QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, every basket needs at least 3 symbols, "
+                         "and TRAIL_STEP_PCT (if set) needs TRAIL_TRIGGER_PCT set too and must be above 0")
     BAR_S = parse_timeframe(RSI_BAR)                               # 300; refuses a size that does not line up with the clock
     basket_of = {}                                                 # symbol -> the name of its basket
     for name, members in BASKETS.items():
@@ -360,14 +360,19 @@ def run_india_fut_rsi():
 
     def exit_reason(pos, move):
         """Why `move` (the % in the position's favour) should exit now, or None. TRAIL_TRIGGER_PCT off: plain TARGET_PCT / STOP_PCT. On: once `move` reaches TRAIL_TRIGGER_PCT the
-        position's own "trailing" flag turns on (sticky) and the stop becomes PROFIT_LOCK_PCT instead of -STOP_PCT, for the rest of its life."""
-        if TRAIL_TRIGGER_PCT is not None and not pos["trailing"] and move >= TRAIL_TRIGGER_PCT:
-            pos["trailing"] = True
+        position's own "trailing" flag turns on (sticky) and its lock starts at PROFIT_LOCK_PCT instead of -STOP_PCT, for the rest of its life. TRAIL_STEP_PCT set: from then on, for every
+        TRAIL_STEP_PCT set, the lock then continuously follows the move, held at move - TRAIL_STEP_PCT (pos["lock"] only ever goes up, never down)."""
+        if TRAIL_TRIGGER_PCT is not None and move >= TRAIL_TRIGGER_PCT:
+            if not pos["trailing"]:
+                pos["trailing"] = True
+                pos["lock"] = PROFIT_LOCK_PCT
+            if TRAIL_STEP_PCT is not None:
+                pos["lock"] = max(pos["lock"], move - TRAIL_STEP_PCT)
         if TARGET_PCT is not None and move >= TARGET_PCT:
             return f"target {move:+.2f}%"
         if pos["trailing"]:
-            if move <= PROFIT_LOCK_PCT:
-                return f"profit-lock {move:+.2f}%"
+            if move <= pos["lock"]:
+                return f"profit-lock {move:+.2f}% (lock {pos['lock']:+.2f}%)"
         elif STOP_PCT is not None and move <= -STOP_PCT:
             return f"stop-loss {move:+.2f}%"
         return None
@@ -492,7 +497,7 @@ def run_india_fut_rsi():
         next_slot[token] += 1
         live.add(a["pf"])
         entered.add(token)
-        position[token] = {"side": side, "entry": last_px[token], "qty": QTY, "pf": a["pf"], "state": "entering", "trailing": False}
+        position[token] = {"side": side, "entry": last_px[token], "qty": QTY, "pf": a["pf"], "state": "entering", "trailing": False, "lock": None}
         tick_track(token, True)
         print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {QTY} lot(s) at {last_px[token]:g} on PF {a['pf']}")
         send_entry(a["pf"], token, side, QTY).add_done_callback(lambda f: settled(token, "enter", f))
@@ -601,8 +606,8 @@ def run_india_fut_rsi():
         algo_stop(STRATEGY, pause=False)                           # square up + unsubscribe every portfolio (no pause step), wait for it, then stop (refuses while sending is OFF)
 
     shared = globals()
-    shared["india_fut_rsi_status"], shared["india_fut_rsi_exit_all"], shared["india_fut_rsi_stop"] = status, exit_all, stop
+    shared["meanrevert_status"], shared["meanrevert_exit_all"], shared["meanrevert_stop"] = status, exit_all, stop
     nats_send(True, client=STRATEGY)                               # NOW it may send. Stop just this automation: nats_send(False, client=STRATEGY)
 
 
-run_india_fut_rsi()
+run_meanrevert()

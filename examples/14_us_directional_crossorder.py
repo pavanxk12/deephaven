@@ -63,10 +63,10 @@ def run_us_directional():
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
     BASKAVG_LONG = 0.1                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
     BASKAVG_SHORT = -0.1                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
-    REL_BUY = {"pct_open": 100.0, "pct_vwap": 100.0, "iv": 100.0}         # relative(): BUY needs every ref at least its own threshold here
-    REL_SELL = {"pct_open": 20.0, "pct_vwap": 20.0, "iv": 20.0}           # relative(): SELL needs every ref below its own threshold here
-    ABS_BUY = {"pct_open": 90.0, "pct_vwap": 90.0, "iv": 90.0}            # absolute(): BUY needs every ref at least its own threshold here
-    ABS_SELL = {"pct_open": 20.0, "pct_vwap": 20.0, "iv": 20.0}           # absolute(): SELL needs every ref below its own threshold here
+    REL_BUY = {"pct_open": 90.0, "pct_vwap": 51.0, "iv": 80.0}         # relative(): BUY needs every ref at least its own threshold here
+    REL_SELL = {"pct_open": 10.0, "pct_vwap": 49.0, "iv": 80.0}           # relative(): SELL needs every ref below its own threshold here
+    ABS_BUY = {"pct_open": 90.0, "pct_vwap": 51.0, "iv": 80.0}            # absolute(): BUY needs every ref at least its own threshold here
+    ABS_SELL = {"pct_open": 10.0, "pct_vwap": 49.0, "iv": 80.0}           # absolute(): SELL needs every ref below its own threshold here
     DIRECTION_MATCH = True                   # True: a BUY needs the REL_BUY/ABS_BUY side everywhere, a SELL the REL_SELL/ABS_SELL side.
                                              # False: either side passes
     USE_IV = False                           # False: % from open / VWAP only. True would also need an IV series (the US has none), so every entry would say "cannot tell"
@@ -80,6 +80,8 @@ def run_us_directional():
     TARGET_PCT, STOP_PCT = 1.5, 0.5
     TRAIL_TRIGGER_PCT = 1.0                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
     PROFIT_LOCK_PCT = 0.8                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
+    TRAIL_STEP_PCT = 0.2                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
+                                             # move - TRAIL_STEP_PCT (never lowered), so once the move is up X% the lock is up (X - TRAIL_STEP_PCT)% -- it never gives back more than TRAIL_STEP_PCT
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
@@ -103,11 +105,13 @@ def run_us_directional():
     if not (BASKAVG_SHORT < BASKAVG_LONG and all(0 <= SELL[ref] < BUY[ref] <= 100 for SELL, BUY in ((REL_SELL, REL_BUY), (ABS_SELL, ABS_BUY)) for ref in REFS)
             and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and (ENTRY_VALUE is None or ENTRY_VALUE > 0) and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
             and ((TRAIL_TRIGGER_PCT is None) == (PROFIT_LOCK_PCT is None)) and (TRAIL_TRIGGER_PCT is None or TRAIL_TRIGGER_PCT > 0)
+            and (TRAIL_STEP_PCT is None or (TRAIL_TRIGGER_PCT is not None and TRAIL_STEP_PCT > 0))
             and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and (RVOL_MIN_MULT is None or RVOL_MIN_MULT > 0)
             and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
         raise ValueError("BASKAVG_SHORT below BASKAVG_LONG; every SELL threshold must be below its BUY threshold, both inside 0 to 100, for pct_open, pct_vwap and iv in REL_BUY/REL_SELL/ABS_BUY/ABS_SELL, "
                          "TARGET_PCT and STOP_PCT above 0, TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
-                         "QTY at least 1, ABS_DAYS 0 to 400, RVOL_MIN_MULT None or above 0, EXIT_AT after the window opens, and every basket needs at least 3 symbols")
+                         "QTY at least 1, ABS_DAYS 0 to 400, RVOL_MIN_MULT None or above 0, EXIT_AT after the window opens, every basket needs at least 3 symbols, "
+                         "and TRAIL_STEP_PCT (if set) needs TRAIL_TRIGGER_PCT set too and must be above 0")
     BAR_S = parse_timeframe(SIGNAL_BAR)                               # 300; refuses a size that does not line up with the clock
     basket_of = {}                                                 # symbol -> the name of its basket
     for name, members in BASKETS.items():
@@ -314,14 +318,19 @@ def run_us_directional():
 
     def exit_reason(pos, move):
         """Why `move` (the % in the position's favour) should exit now, or None. TRAIL_TRIGGER_PCT off: plain TARGET_PCT / STOP_PCT. On: once `move` reaches TRAIL_TRIGGER_PCT the
-        position's own "trailing" flag turns on (sticky) and the stop becomes PROFIT_LOCK_PCT instead of -STOP_PCT, for the rest of its life."""
-        if TRAIL_TRIGGER_PCT is not None and not pos["trailing"] and move >= TRAIL_TRIGGER_PCT:
-            pos["trailing"] = True
+        position's own "trailing" flag turns on (sticky) and its lock starts at PROFIT_LOCK_PCT instead of -STOP_PCT, for the rest of its life. TRAIL_STEP_PCT set: from then on, for every
+        TRAIL_STEP_PCT set, the lock then continuously follows the move, held at move - TRAIL_STEP_PCT (pos["lock"] only ever goes up, never down)."""
+        if TRAIL_TRIGGER_PCT is not None and move >= TRAIL_TRIGGER_PCT:
+            if not pos["trailing"]:
+                pos["trailing"] = True
+                pos["lock"] = PROFIT_LOCK_PCT
+            if TRAIL_STEP_PCT is not None:
+                pos["lock"] = max(pos["lock"], move - TRAIL_STEP_PCT)
         if TARGET_PCT is not None and move >= TARGET_PCT:
             return f"target {move:+.2f}%"
         if pos["trailing"]:
-            if move <= PROFIT_LOCK_PCT:
-                return f"profit-lock {move:+.2f}%"
+            if move <= pos["lock"]:
+                return f"profit-lock {move:+.2f}% (lock {pos['lock']:+.2f}%)"
         elif STOP_PCT is not None and move <= -STOP_PCT:
             return f"stop-loss {move:+.2f}%"
         return None
@@ -450,7 +459,7 @@ def run_us_directional():
         next_slot[token] += 1
         live.add(a["pf"])
         entered.add(token)
-        position[token] = {"side": side, "entry": last_px[token], "qty": qty, "pf": a["pf"], "state": "entering", "trailing": False}
+        position[token] = {"side": side, "entry": last_px[token], "qty": qty, "pf": a["pf"], "state": "entering", "trailing": False, "lock": None}
         tick_track(token, True)
         print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {qty} lot(s) at {last_px[token]:g} on PF {a['pf']}")
         send_entry(a["pf"], token, side, qty).add_done_callback(lambda f: settled(token, "enter", f))

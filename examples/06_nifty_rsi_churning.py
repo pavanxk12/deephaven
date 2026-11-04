@@ -26,8 +26,8 @@ from algo.core.timeframe import parse_timeframe
 
 # =============================== USER INPUT ===============================
 USER = 4                         # USER_ID
-STRATEGY = "nifty_rsi_churning"           # its name: recorded with every portfolio, the name of its sending switch and of its console window
-PF_START = 1200                  # PF_START
+STRATEGY = "nifty_churning"           # its name: recorded with every portfolio, the name of its sending switch and of its console window
+PF_START = 1300                  # PF_START
 ADD_QTY = 20                      # ADD_QTY
 UNDERLYING = "NIFTY"             # UNDERLYING
 EXPIRY_INDEX = 0                 # OPT_EXPIRY_IDX: 0 = the nearest expiry that has not passed
