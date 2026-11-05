@@ -15,7 +15,7 @@
 #                       squareup/unsubscribe) stays off until the RSI leaves the zone (the old `blocked` behaviour).
 #   The order           ONE `subscribe` per entry: {"strategyname": "Churning", ...SUBSCRIBE..., "jval"/"ival"/... from order_params on the
 #                       stock's own CASH price/tick, "side": "BUY"/"SELL"}, same mechanics as 06. The book gives the portfolio numbers; each
-#                       stock's CASH token is both the instrument AND the "option" (there is no separate contract to pick): N_SLOTS per stock.
+#                       stock's CASH token is the only instrument there is -- no separate contract to pick: N_SLOTS per stock.
 #
 # Everything is inside run_stock_churning() so the terminal keeps one set of names. Left in the terminal: stockchurn_status(), stockchurn_exit_all(),
 # stockchurn_stop(), buy(), sell() (by hand, force=True, every stock).
@@ -36,7 +36,7 @@ def run_stock_churning():
     STRATEGY = "stock_churning"      # its name: recorded with every portfolio, the name of its sending switch and of its console window
     PF_START = 1500
     ADD_QTY = 10
-    STOCKS = ["SBIN", "RELIANCE", "HDFCBANK", "ICICIBANK", "TCS", "INFY", "AXISBANK", "KOTAKBANK"]   # give your own list here: this is also the basket for relative()
+    STOCKS = ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK","BAJFINANCE", "BAJAJFINSV", "SBILIFE", "HDFCLIFE", "BSE","TCS", "INFY", "HCLTECH", "WIPRO", "TECHM","M&M", "MARUTI", "TATAMOTORS", "EICHERMOT", "BAJAJ-AUTO","SUNPHARMA","DRREDDY","CIPLA","APOLLOHOSP","MAXHEALTH","ITC","NESTLEIND","TITAN","HINDUNILVR","ETERNAL","ONGC","BPCL","RELIANCE","NTPC","POWERGRID","HINDALCO","JSWSTEEL","TATASTEEL","COALINDIA"]   # give your own list here: this is also the basket for relative()
     N_SLOTS = 1                      # how many concurrent churn entries a single stock may hold on one side at once
     LEVEL = "intraday"                # relative()/absolute() level: today's open and VWAP
     REL_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # relative(): percentile within the basket (STOCKS) must land in (low, high)
@@ -224,7 +224,7 @@ def run_stock_churning():
                 "lowerrange": max(floor_tick(premium * (1 - range_pct), tick), tick), "upperrange": floor_tick(premium * (1 + range_pct), tick),
                 "side": side, **apply_fields}
 
-    # ---- WHEN: churn while the zone + both filters hold (same shape as 06's on_zone, the stock itself is both instrument and "option") ----
+    # ---- WHEN: churn while the zone + both filters hold (same shape as 06's on_zone, just cash both times) ----
     def in_window():
         return WINDOW[0] <= datetime.now(ZoneInfo("Asia/Kolkata")).time() <= WINDOW[1]
 
@@ -251,8 +251,7 @@ def run_stock_churning():
                 continue
             if pf_leg(STRATEGY, cash, k) == side or (not force and pf_cooling(STRATEGY, cash, FAIL_COOLDOWN_S, k)):
                 continue                                         # this slot already runs this side, or failed a moment ago
-            option_id = cash if side == "BUY" else -cash          # distinct "option" per side, so a flip (SELL<->BUY) retires the old PF and takes a NEW one
-            a = pf_assign(STRATEGY, cash, option_id, name=sym, slot=k)
+            a = pf_assign(STRATEGY, cash, cash, name=sym, slot=k)   # it's just cash, both times
             if a:
                 pf_activate(a, side, params)
 
