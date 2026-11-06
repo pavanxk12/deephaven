@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Erase ALL PF/registry state for ALL strategies: every row in Postgres plus every
-# pf_map_*.json and portfolio_registry.json backup file, so nothing gets reimported.
+# Erase ALL PF/registry/limits state for ALL strategies: every row in Postgres (algo_portfolios,
+# algo_pf_map, algo_pf_sub, algo_limits) plus every pf_map_*.json, pf_sub_*.json, limits.json and
+# portfolio_registry.json backup file, so nothing gets reimported.
 # Run this on the deephaven host (104/130/131), from the compose directory, BEFORE
 # restarting deephaven.
 #
@@ -34,15 +35,16 @@ else
     fi
 fi
 
-echo "== Wiping ALL rows from algo_portfolios, algo_pf_map, algo_pf_sub =="
+echo "== Wiping ALL rows from algo_portfolios, algo_pf_map, algo_pf_sub, algo_limits =="
 docker compose exec -T postgres psql -U algofusion -d algofusion -v ON_ERROR_STOP=1 <<SQL
 delete from algo_portfolios;
 delete from algo_pf_map;
 delete from algo_pf_sub;
+delete from algo_limits;
 SQL
 
-echo "== Resetting all pf_map_*.json in ${STATE_DIR} to {} =="
-for f in "${STATE_DIR}"/pf_map_*.json; do
+echo "== Resetting all pf_map_*.json, pf_sub_*.json and limits.json in ${STATE_DIR} to {} =="
+for f in "${STATE_DIR}"/pf_map_*.json "${STATE_DIR}"/pf_sub_*.json "${STATE_DIR}"/limits.json; do
     [[ -e "$f" ]] || continue
     echo '{}' > "$f"
     echo "  reset $f"

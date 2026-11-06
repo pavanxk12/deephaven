@@ -63,18 +63,7 @@ def run_india_fut_zscore():
     STRATEGY = "india_fut_zscore"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
     N_BASKETS = 4                            # every stock future (about 200) is dealt into this many baskets, fut_1 ... fut_4; a symbol is ranked only against the others of ITS basket
     INDEX_FUTURES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}      # index futures are left out: stock futures only
-    ONLY = [
-        "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-        "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE", "BEL", "BHARTIARTL",
-        "BSE", "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT",
-        "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
-        "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDIGO", "INFY",
-        "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT",
-        "M&M", "MARUTI", "MAXHEALTH", "NESTLEIND", "NTPC",
-        "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN",
-        "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATASTEEL", "TCS",
-        "TECHM", "TITAN", "TMPV", "TRENT", "ULTRACEMCO",
-    ]                                # optional: trade only these underlyings, e.g. ["SBIN", "TCS", "INFY"]; empty = every stock future
+    ONLY = ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK","BAJFINANCE", "BAJAJFINSV", "SBILIFE", "HDFCLIFE", "BSE","TCS", "INFY", "HCLTECH", "WIPRO", "TECHM","M&M", "MARUTI", "TATAMOTORS", "EICHERMOT", "BAJAJ-AUTO","SUNPHARMA","DRREDDY","CIPLA","APOLLOHOSP","MAXHEALTH","ITC","NESTLEIND","TITAN","HINDUNILVR","ETERNAL","ONGC","BPCL","RELIANCE","NTPC","POWERGRID","HINDALCO","JSWSTEEL","TATASTEEL","COALINDIA"]                              # optional: trade only these underlyings, e.g. ["SBIN", "TCS", "INFY"]; empty = every stock future
     EXCLUDE = []                             # optional: underlyings to leave out
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
     MID_ZONE = (25.0, 75.0)                  # percentile of the symbol among its basket, for the % from open AND the % from VWAP: Q2 to Q3
@@ -88,7 +77,7 @@ def run_india_fut_zscore():
                                              # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
     ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
-    WINDOW = (dtime(9, 30), dtime(15, 0))    # entries only inside it (India time, the session is 09:15 to 15:30); an exit is sent at any time
+    WINDOW = (dtime(9, 45), dtime(15, 0))    # entries only inside it (India time, the session is 09:15 to 15:30); an exit is sent at any time
     EXIT_AT = dtime(15, 15)                  # time exit (India time): 15 minutes before the 15:30 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
     MAX_PORTFOLIOS = 32                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
                                              # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.

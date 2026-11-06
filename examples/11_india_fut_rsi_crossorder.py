@@ -5,7 +5,8 @@
 #                     so a stock is only ever compared with its own futures (never its cash price, never an option, never two contracts mixed inside one day).
 #   The baskets       SECTOR_BASKETS names each basket's underlyings (e.g. "bank", "fin"), saved in baskets.txt too. A symbol is ranked against the OTHER symbols of its own basket only.
 #                     EXCLUDE = [...] removes some underlyings from every basket.
-#   The filter        a symbol may be traded only while its % change from the OPEN stands in the MIDDLE of its basket (REL_ZONE["pct_open"], Q2 to Q3). % from the VWAP is not checked here.
+#   The filter        a symbol may be traded only while its % change from the OPEN stands in the MIDDLE of its basket (REL_ZONE["pct_open"], Q2 to Q3), AND its % from the VWAP, among
+#                     that same basket, sits on the side matching the RSI zone -- ABOVE REL_ZONE["pct_vwap"]'s high for OVERBOUGHT (SELL), BELOW its low for OVERSOLD (BUY).
 #   The own history   AND, against the same minute on the nearest future of its previous ABS_DAYS (22) trading days: its own % from the OPEN, now, must sit INSIDE ABS_ZONE["pct_open"] (Q2 to Q3);
 #                     its own % from the VWAP, now, must sit on the side matching the RSI zone -- ABOVE ABS_ZONE["pct_vwap"]'s high for OVERBOUGHT (SELL), BELOW its low for OVERSOLD (BUY).
 #                     absolute() reads those days from the saved candle files, one future and one day at a time. With fewer than half of the days in the files there is no trade.
@@ -68,7 +69,11 @@ def run_meanrevert():
     }                                         # add/remove/comment out symbols or whole baskets here; empty = none
     EXCLUDE = []                             # optional: underlyings to leave out (applied across every basket)
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
-    REL_ZONE = {"pct_open": (25.0, 75.0)}    # relative(): pct_open's percentile among the basket must land inside this (low, high) band (Q2 to Q3). pct_vwap is not used by relative()
+    REL_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # relative(): pct_open's percentile among the basket must land inside this (low, high) band (Q2 to Q3);
+                                              # pct_vwap's percentile among the basket must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD) -- same extreme test as ABS_ZONE
+    USE_BASKET_AVG = False                   # True: also require the BASKET's own average % from the open (all its members, now) to confirm the direction -- BASKET_AVG_PCT on the SAME
+                                              # side (not the opposite): a BUY needs the average ABOVE +BASKET_AVG_PCT, a SELL needs it BELOW -BASKET_AVG_PCT (the whole basket is already moving that way)
+    BASKET_AVG_PCT = 0.1                     # e.g. 0.1: BUY needs the basket average % from the open above +0.1, SELL needs it below -0.1
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
     ABS_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # absolute(): pct_open's percentile against its own days must land INSIDE its (low, high) band (Q2 to Q3);
                                               # pct_vwap's percentile against its own days must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD)
@@ -117,15 +122,16 @@ def run_meanrevert():
 
     BASKETS = make_baskets()
     REFS = ("pct_open", "pct_vwap")
-    if not (all(0 <= ZONE[ref][0] < ZONE[ref][1] <= 100 for ZONE, refs in ((REL_ZONE, ("pct_open",)), (ABS_ZONE, REFS)) for ref in refs)
+    if not (all(0 <= ZONE[ref][0] < ZONE[ref][1] <= 100 for ZONE, refs in ((REL_ZONE, REFS), (ABS_ZONE, REFS)) for ref in refs)
             and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
             and ((TRAIL_TRIGGER_PCT is None) == (PROFIT_LOCK_PCT is None)) and (TRAIL_TRIGGER_PCT is None or TRAIL_TRIGGER_PCT > 0)
             and (TRAIL_STEP_PCT is None or (TRAIL_TRIGGER_PCT is not None and TRAIL_STEP_PCT > 0))
-            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
+            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)
+            and (not USE_BASKET_AVG or BASKET_AVG_PCT > 0)):
         raise ValueError("every (low, high) band in REL_ZONE/ABS_ZONE must be inside 0 to 100 with low below high, TARGET_PCT and STOP_PCT above 0, "
                          "TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
                          "QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, every basket needs at least 3 symbols, "
-                         "and TRAIL_STEP_PCT (if set) needs TRAIL_TRIGGER_PCT set too and must be above 0")
+                         "and TRAIL_STEP_PCT (if set) needs TRAIL_TRIGGER_PCT set too and must be above 0, and BASKET_AVG_PCT must be above 0 when USE_BASKET_AVG is True")
     BAR_S = parse_timeframe(RSI_BAR)                               # 300; refuses a size that does not line up with the clock
     basket_of = {}                                                 # symbol -> the name of its basket
     for name, members in BASKETS.items():
@@ -302,11 +308,24 @@ def run_meanrevert():
         return None if value is None else "OVERBOUGHT" if value > RSI_HIGH else "OVERSOLD" if value < RSI_LOW else None
 
     # ---- the filters: the middle of the basket (relative), the middle of its own days (absolute) --------------------------------------
-    def relative_sides(symbol):
-        """True when the symbol's % from the open ranks inside its REL_ZONE band, among ITS basket (the other symbols of it). pct_vwap is not checked here."""
+    def relative_sides(symbol, zone):
+        """True when the symbol's % from the open ranks inside its REL_ZONE band, among ITS basket (the other symbols of it), AND its % from the VWAP ranks on the side
+        matching the zone, among that same basket: OVERBOUGHT (SELL) needs it ABOVE the band's high (> 75), OVERSOLD (BUY) needs it BELOW the band's low (< 25).
+        USE_BASKET_AVG adds: the basket's own average % from the open (all its members, now) must confirm the same direction -- above +BASKET_AVG_PCT for a BUY
+        (OVERSOLD), below -BASKET_AVG_PCT for a SELL (OVERBOUGHT)."""
         with exec_ctx:                                             # relative() reads the candles table; a listener thread needs the terminal's query context for that
-            result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref="open")
-        return result[1] >= 0 and REL_ZONE["pct_open"][0] <= result.pctile <= REL_ZONE["pct_open"][1]      # (the second item is -1 when it cannot be told)
+            open_result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref="open")
+        if not (open_result[1] >= 0 and REL_ZONE["pct_open"][0] <= open_result.pctile <= REL_ZONE["pct_open"][1]):      # (the second item is -1 when it cannot be told)
+            return False
+        if USE_BASKET_AVG:
+            avg = np.nanmean(open_result[0])
+            if np.isnan(avg) or not (avg < -BASKET_AVG_PCT if zone == "OVERBOUGHT" else avg > BASKET_AVG_PCT):
+                return False
+        with exec_ctx:
+            vwap_result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref="vwap")
+        if vwap_result[1] < 0:
+            return False
+        return vwap_result.pctile > REL_ZONE["pct_vwap"][1] if zone == "OVERBOUGHT" else vwap_result.pctile < REL_ZONE["pct_vwap"][0]
 
     def absolute_sides(symbol, zone):
         """True when the symbol's % from the open, now, ranks INSIDE its ABS_ZONE band (Q2-Q3) against the same minute on its previous ABS_DAYS trading days,
@@ -540,7 +559,7 @@ def run_meanrevert():
             count("signals")
         try:
             own = ABS_DAYS == 0 or absolute_sides(symbol_of[token], zone)         # its own days first (cached), then the basket
-            middle = own and relative_sides(symbol_of[token])
+            middle = own and relative_sides(symbol_of[token], zone)
         except Exception as e:
             ranking_failed(token, first, e)
             return

@@ -279,7 +279,7 @@ def watch(table: str, fn: Callable, replay: bool = False, owner: str | None = No
     Give `owner=<your strategy name>` in a script: the listener then belongs to that automation, so pasting the script again (or algo_stop) stops the
     old listener first. Without it, every paste adds another listener, and your function runs once per paste."""
     app = current()
-    published = app.tables.get(table)
+    published = app.tables.get(table, app.ns.get(table))      # a service's own table (republished, followed below), or a raw session global (Kafka ingestion: strategy_events, orders_trade, ...)
     if published is None:
         print(f"watch: the {table} table is not there: start it first ({'candles_start()' if table == 'candles' else 'straddle_start(0)'})")
         return None
