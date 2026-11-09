@@ -78,7 +78,7 @@ def run_meanrevert():
     ABS_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # absolute(): pct_open's percentile against its own days must land INSIDE its (low, high) band (Q2 to Q3);
                                               # pct_vwap's percentile against its own days must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD)
     RSI_BAR = "5min"                         # the bar the RSI is computed on (made from the 1-minute candles)
-    RSI_N, RSI_HIGH, RSI_LOW = 14, 70, 30
+    RSI_N, RSI_HIGH, RSI_LOW = 9, 70, 30
     RSI_LIVE = False                          # True: the bar still forming counts too (acts every minute); False: finished bars only
     ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an RSI_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
                                              # 1-minute close. False: look for an entry on every 1-minute candle

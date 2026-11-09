@@ -1,8 +1,10 @@
 # US BASKET + 5-MINUTE RSI + CrossOrder: the US version of 07. A plain script (functions, no class). Paste in the US server's terminal after the services are up (init.py).
 #
 #   The basket        BASKETS = {"tech": [...], "chips": [...], "other": [...]}: named sector baskets. A symbol is ranked against the OTHERS of its own basket only (each saved in baskets.txt too).
-#   The filter        a symbol may be traded only while BOTH its % change from the OPEN and from the VWAP stand in the MIDDLE of the basket (each ref's own REL_ZONE band, Q2 to Q3).
-#   The own history   AND the stock's own move (% from the OPEN and from the VWAP, now) must sit in Q2 to Q3 of the same minute on its previous ABS_DAYS (22) trading days:
+#   The filter        a symbol may be traded only while its % change from the OPEN stands in the MIDDLE of its basket (REL_ZONE["pct_open"], Q2 to Q3), AND its % from the VWAP,
+#                     among that same basket, sits on the side matching the RSI zone -- ABOVE REL_ZONE["pct_vwap"]'s high for OVERBOUGHT (SELL), BELOW its low for OVERSOLD (BUY).
+#   The own history   AND, against the same minute on its previous ABS_DAYS (22) trading days: its own % from the OPEN, now, must sit INSIDE ABS_ZONE["pct_open"] (Q2 to Q3);
+#                     its own % from the VWAP, now, must sit on the side matching the RSI zone -- ABOVE ABS_ZONE["pct_vwap"]'s high for OVERBOUGHT (SELL), BELOW its low for OVERSOLD (BUY).
 #                     absolute() reads those days from the saved candle files, one stock and one day at a time. With fewer than half of the days in the files there is no trade.
 #   The signal        5-minute RSI, made from the 1-minute candles: it ENTERS oversold (< RSI_LOW) -> BUY, or overbought (> RSI_HIGH) -> SELL. One position per symbol at a time.
 #   The history       the RSI does not start from nothing at the open: the 5-minute closes of the last HIST_DAYS saved days (candles_<day>.parquet in the market-data / EOD folders)
@@ -48,23 +50,23 @@ def run_us_basket_rsi():
     USER = 3
     STRATEGY = "us_basket_rsi"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
     BASKETS = {                              # named sector baskets: a symbol is ranked only against the OTHERS of ITS basket (each saved as its own basket.txt entry)
-        "tech":   ["MSFT", "GOOG", "META", "AMZN", "NFLX", "SHOP", "CRWD", "PANW", "PLTR", "AAPL", "TSLA"],
-        "chips":  ["NVDA", "AVGO", "AMD", "MU", "ASML", "INTC", "AMAT", "MRVL", "KLAC", "ADI", "QCOM", "ARM", "SNDK", "TXN", "CSCO"],
-        "other":  ["WMT", "COST", "PEP", "AMGN", "LIN", "GILD", "SPCX"],
+        "us":   ["MSFT", "GOOG", "META", "AMZN", "NFLX", "SHOP", "CRWD", "PANW", "PLTR", "AAPL", "TSLA","WMT", "COST", "PEP", "AMGN", "LIN", "GILD", "SPCX","NVDA", "AVGO", "AMD", "MU", "ASML", "INTC", "AMAT", "MRVL", "KLAC", "ADI", "QCOM", "ARM", "SNDK", "TXN", "CSCO"],
     }
 
     TRADE_AS = {}                            # optional: {"AAPL": "<another contract name or token>"} trade another contract than the basket entry
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
-    REL_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # relative(): each ref's percentile among the basket must land inside its own (low, high) band (Q2 to Q3)
+    REL_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # relative(): pct_open's percentile among the basket must land inside its (low, high) band (Q2 to Q3);
+                                              # pct_vwap's percentile among the basket must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD)
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
-    ABS_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # absolute(): each ref's percentile against its own days must land inside its own (low, high) band (Q2 to Q3)
+    ABS_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # absolute(): pct_open's percentile against its own days must land inside its (low, high) band (Q2 to Q3);
+                                              # pct_vwap's percentile against its own days must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD)
     RSI_BAR = "5min"                         # the bar the RSI is computed on (made from the 1-minute candles)
     RSI_N, RSI_HIGH, RSI_LOW = 9, 70, 30
     RSI_LIVE = False                          # True: the bar still forming counts too (acts every minute); False: finished bars only
     ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an RSI_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
                                              # 1-minute close. False: look for an entry on every 1-minute candle
     HIST_DAYS = 1                            # how many earlier saved days seed the RSI (0 = none)
-    TARGET_PCT, STOP_PCT = 1.5, 0.5
+    TARGET_PCT, STOP_PCT = 3.0, 0.5
     TRAIL_TRIGGER_PCT = 1.25                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
     PROFIT_LOCK_PCT = 1.0                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
     TRAIL_STEP_PCT = 0.2                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
@@ -257,24 +259,32 @@ def run_us_basket_rsi():
         return None if value is None else "OVERBOUGHT" if value > RSI_HIGH else "OVERSOLD" if value < RSI_LOW else None
 
     # ---- the filters: the middle of the basket (relative), the middle of its own days (absolute) --------------------------------------
-    def relative_sides(symbol):
-        """True when the symbol's % from the open AND its % from the VWAP both rank inside their own REL_ZONE band, among ITS basket (the other symbols of it)."""
-        for ref in ("pct_open", "pct_vwap"):
-            with exec_ctx:                                         # relative() reads the candles table; a listener thread needs the terminal's query context for that
-                result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref=ref[len("pct_"):])
-            if result[1] < 0 or not (REL_ZONE[ref][0] <= result.pctile <= REL_ZONE[ref][1]):      # (the second item is -1 when it cannot be told)
-                return False
-        return True
+    def relative_sides(symbol, zone):
+        """True when the symbol's % from the open ranks inside its REL_ZONE band, among ITS basket (the other symbols of it), AND its % from the VWAP ranks on the side
+        matching the zone, among that same basket: OVERBOUGHT (SELL) needs it ABOVE the band's high (> 75), OVERSOLD (BUY) needs it BELOW the band's low (< 25)."""
+        with exec_ctx:                                             # relative() reads the candles table; a listener thread needs the terminal's query context for that
+            open_result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref="open")
+        if not (open_result[1] >= 0 and REL_ZONE["pct_open"][0] <= open_result.pctile <= REL_ZONE["pct_open"][1]):      # (the second item is -1 when it cannot be told)
+            return False
+        with exec_ctx:
+            vwap_result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref="vwap")
+        if vwap_result[1] < 0:
+            return False
+        return vwap_result.pctile > REL_ZONE["pct_vwap"][1] if zone == "OVERBOUGHT" else vwap_result.pctile < REL_ZONE["pct_vwap"][0]
 
-    def absolute_sides(symbol):
-        """True when the symbol's % from the open AND from the VWAP, now, each rank inside their own ABS_ZONE band, against the same minute on its previous ABS_DAYS trading days.
-        absolute() answers idx = -1 (cannot tell) when fewer than half of those days are in the saved files; that is no trade."""
-        for ref in ("pct_open", "pct_vwap"):
-            with exec_ctx:                                         # absolute() reads today's candles table once, and the saved day files
-                result = absolute("pct", LEVEL, symbol, ABS_DAYS, ref=ref[len("pct_"):])
-            if result[1] < 0 or not (ABS_ZONE[ref][0] <= result.pctile <= ABS_ZONE[ref][1]):      # (the second item is -1 when it cannot be told)
-                return False
-        return True
+    def absolute_sides(symbol, zone):
+        """True when the symbol's % from the open, now, ranks INSIDE its ABS_ZONE band (Q2-Q3) against the same minute on its previous ABS_DAYS trading days,
+        AND its % from the VWAP ranks on the side matching the zone: OVERBOUGHT (SELL) needs it ABOVE the band's high (> 75), OVERSOLD (BUY) needs it BELOW
+        the band's low (< 25). absolute() answers idx = -1 (cannot tell) when fewer than half of those days are in the saved files; that is no trade."""
+        with exec_ctx:                                             # absolute() reads today's candles table once, and the saved day files
+            open_result = absolute("pct", LEVEL, symbol, ABS_DAYS, ref="open")
+        if open_result[1] < 0 or not (ABS_ZONE["pct_open"][0] <= open_result.pctile <= ABS_ZONE["pct_open"][1]):
+            return False
+        with exec_ctx:
+            vwap_result = absolute("pct", LEVEL, symbol, ABS_DAYS, ref="vwap")
+        if vwap_result[1] < 0:
+            return False
+        return vwap_result.pctile > ABS_ZONE["pct_vwap"][1] if zone == "OVERBOUGHT" else vwap_result.pctile < ABS_ZONE["pct_vwap"][0]
 
     # ---- the orders ------------------------------------------------------------------------------------------------------------------
     def in_window():
@@ -497,8 +507,8 @@ def run_us_basket_rsi():
         if first is None:
             count("signals")
         try:
-            own = ABS_DAYS == 0 or absolute_sides(symbol_of[token])               # its own days first (cached), then the basket
-            middle = own and relative_sides(symbol_of[token])
+            own = ABS_DAYS == 0 or absolute_sides(symbol_of[token], zone)         # its own days first (cached), then the basket
+            middle = own and relative_sides(symbol_of[token], zone)
         except Exception as e:
             ranking_failed(token, first, e)
             return
