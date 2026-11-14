@@ -24,8 +24,8 @@ from algo.core.nulls import good_price, good_volume
 from algo.core.plugin import Plugin
 from algo.core.timeframe import format_timeframe, parse_timeframe
 
-CandleSink = Callable[[int, int, float, float, float, float, int], None]
-# (token, minute_epoch, open, high, low, close, volume)
+CandleSink = Callable[[int, int, float, float, float, float, int, float], None]
+# (token, minute_epoch, open, high, low, close, volume, cvd)
 
 
 class LttParser:
@@ -70,6 +70,13 @@ class CandleAggregator:
     A candle is emitted once a later bar arrives for the token, or via `flush(cutoff)` once the clock has moved
     past it. Volume per candle is the difference of the feed's cumulative volume. Late ticks are ignored.
     Ticks before `start_min` (epoch seconds of the first bar) build no candle (only cumulative volume is tracked).
+
+    CVD (cumulative volume delta): the tick-rule running total of `ltq` (the size of each individual trade) --
+    added when a trade prints above the previous trade's price (buy-side), subtracted when it prints below
+    (sell-side), and credited to whichever side the last price move was when it prints unchanged. It is a plain
+    running total per token, anchored at 0 from this aggregator's own creation -- since a fresh Candles plugin
+    instance is built at the start of each trading day (day_auto), CVD is naturally anchored to the day with no
+    separate reset logic needed. Each closed candle carries the CVD value as of that bar's close.
     """
 
     def __init__(self, emit: CandleSink, start_min: int, bucket: int = 60):
@@ -77,6 +84,9 @@ class CandleAggregator:
         self._cur: dict[int, list] = {}        # token -> [minute, o, h, l, c, cum_vol, first_vol]
         self._prev_cum: dict[int, int] = {}    # token -> cumulative volume at the end of the last closed candle
         self._seen: dict[int, tuple] = {}      # token -> (ltt, vol) of the last trade seen
+        self._last_price: dict[int, float] = {}   # token -> previous trade's price, for the tick rule
+        self._last_dir: dict[int, int] = {}        # token -> +1 / -1, the last tick's direction (0 until known)
+        self._cvd: dict[int, float] = {}           # token -> running cumulative volume delta, since day start
 
     def is_new(self, token: int, ltt: str, vol: int) -> bool:
         return self._seen.get(token) != (ltt, vol)
@@ -84,7 +94,13 @@ class CandleAggregator:
     def mark(self, token: int, ltt: str, vol: int) -> None:
         self._seen[token] = (ltt, vol)
 
-    def tick(self, token: int, price: float, vol: int, ltt_sec: int) -> None:
+    def tick(self, token: int, price: float, vol: int, ltt_sec: int, ltq: float = 0.0) -> None:
+        last = self._last_price.get(token)
+        direction = self._last_dir.get(token, 0) if last is None or price == last else (1 if price > last else -1)
+        self._last_dir[token] = direction
+        self._last_price[token] = price
+        if ltq:
+            self._cvd[token] = self._cvd.get(token, 0.0) + direction * ltq
         minute = int(ltt_sec // self.bucket * self.bucket)
         if minute < self.start_min:
             self._prev_cum[token] = vol
@@ -112,7 +128,7 @@ class CandleAggregator:
     def _close(self, token: int, c: list) -> None:
         minute, o, h, l, cl, cum, first_vol = c
         base = self._prev_cum.get(token, first_vol)
-        self.emit(token, minute, o, h, l, cl, max(cum - base, 0))
+        self.emit(token, minute, o, h, l, cl, max(cum - base, 0), self._cvd.get(token, 0.0))
         self._prev_cum[token] = cum
 
 
@@ -120,10 +136,10 @@ class Candles(Plugin):
     name = "candles"
     requires = ("master",)
 
-    COLS = ["token", "ltp", "vol", "ltt"]
+    COLS = ["token", "ltp", "vol", "ltt", "ltq"]
     GRACE_S = 10          # a minute is closed this many seconds after its end
     SLOW_BATCH_MS = 250   # a feed batch that takes longer than this holds up every table in the update cycle: say so
-    ROW_BYTES = 56        # one candle row: Minute, token, Open, High, Low, Close, Volume (8 bytes each)
+    ROW_BYTES = 64        # one candle row: Minute, token, Open, High, Low, Close, Volume, CVD (8 bytes each)
     WARN_MB = 500         # say so loudly when a full session of candles is likely to take more than this
 
     def __init__(self, timeframe: str = "1min", multiplier: float | None = None, *, symbols=None, kind: str | None = None,
@@ -169,15 +185,16 @@ class Candles(Plugin):
         writer = DynamicTableWriter({
             "MinuteEpoch": dht.int64, "token": dht.int64,
             "Open": dht.double, "High": dht.double, "Low": dht.double, "Close": dht.double, "Volume": dht.int64,
+            "CVD": dht.double,
         })
         app.shared["candle_seconds"] = self.bucket          # read by plugins that follow `candles`, before they are told
         app.publish("candles", writer.table
                     .natural_join(symbol_table(symbol_of, self.tokens), on="token", joins="Symbol")
                     .view(["Minute = epochSecondsToInstant(MinuteEpoch)", "Symbol", "token",
-                           "Open", "High", "Low", "Close", "Volume"]))
+                           "Open", "High", "Low", "Close", "Volume", "CVD"]))
 
-        def emit(token, minute, o, h, l, c, vol):
-            writer.write_row(minute, token, float(o), float(h), float(l), float(c), int(vol))
+        def emit(token, minute, o, h, l, c, vol, cvd):
+            writer.write_row(minute, token, float(o), float(h), float(l), float(c), int(vol), float(cvd))
             self.rows += 1
 
         b = self.bucket
@@ -219,15 +236,18 @@ class Candles(Plugin):
             self._allowed = allowed
 
     def _clean(self, ch: dict):
-        """One feed batch -> (tokens, prices, volumes, ltt strings) of the usable rows, as plain Python lists.
+        """One feed batch -> (tokens, prices, volumes, ltt strings, ltq) of the usable rows, as plain Python lists.
 
         Everything numeric is done on whole arrays: null / NaN / infinite / non-positive prices, negative volumes,
         missing times, tokens outside the wanted set, the per-contract scale and the rounding. Only survivors are
-        turned into Python objects."""
+        turned into Python objects. A bad/missing ltq (the trade-size CVD is built from) does not drop the row --
+        it is just clamped to 0, same as a tick with no size behind it."""
         tok = np.asarray(ch["token"]).astype(np.int64, copy=False)
         ltp = np.asarray(ch["ltp"], dtype=np.float64)
         vol = np.asarray(ch["vol"], dtype=np.float64)
         lt = np.asarray(ch["ltt"], dtype=object)
+        ltq = np.asarray(ch["ltq"], dtype=np.float64) if "ltq" in ch else np.zeros(len(tok))
+        ltq = np.where(np.isfinite(ltq) & (ltq > 0), ltq, 0.0)
         size = len(self._scale_arr)
         inside = (tok >= 0) & (tok < size)
         ok = np.isfinite(ltp) & (ltp > 0) & np.isfinite(vol) & (vol >= 0) & np.not_equal(lt, None)
@@ -239,9 +259,9 @@ class Candles(Plugin):
         price = np.round(ltp * scale, self.decimals)
         ok &= price > 0                                   # the multiplier must not round a price to zero
         idx = np.flatnonzero(ok)
-        return (tok[idx].tolist(), price[idx].tolist(), vol[idx].astype(np.int64).tolist(), lt[idx].tolist())
+        return (tok[idx].tolist(), price[idx].tolist(), vol[idx].astype(np.int64).tolist(), lt[idx].tolist(), ltq[idx].tolist())
 
-    def _feed(self, agg: CandleAggregator, tok: int, price: float, vol: int, lt) -> int | None:
+    def _feed(self, agg: CandleAggregator, tok: int, price: float, vol: int, lt, ltq: float = 0.0) -> int | None:
         """One clean row -> the aggregator. Returns the tick's time, or None if it was a repeat / unreadable time."""
         try:
             if not agg.is_new(tok, lt, vol):
@@ -250,7 +270,7 @@ class Candles(Plugin):
             if sec is None:
                 return None
             agg.mark(tok, lt, vol)
-            agg.tick(tok, price, vol, sec)
+            agg.tick(tok, price, vol, sec, ltq)
             return sec
         except Exception as e:                            # one bad row must never stop the listener
             self.skipped += 1
@@ -258,7 +278,7 @@ class Candles(Plugin):
                 self.log.warning("tick skipped (%d so far) token=%r: %r", self.skipped, tok, e)
             return None
 
-    def _tick(self, agg: CandleAggregator, tok, ltp, vol, lt) -> int | None:
+    def _tick(self, agg: CandleAggregator, tok, ltp, vol, lt, ltq: float = 0.0) -> int | None:
         """One raw feed row (scalars) -> the aggregator; the same rules as `_clean`, for single rows and tests.
         Nothing a feed row contains can raise out of here: a bad row is counted and skipped."""
         try:
@@ -270,7 +290,8 @@ class Candles(Plugin):
             price = round(float(ltp) * self.scale_of.get(tok, self.scale), self.decimals)
             if not good_price(price):                  # the multiplier rounded it to zero
                 return None
-            return self._feed(agg, tok, price, vol, lt)
+            ltq = float(ltq) if ltq and np.isfinite(ltq) and ltq > 0 else 0.0
+            return self._feed(agg, tok, price, vol, lt, ltq)
         except Exception as e:
             self.skipped += 1
             if self.skipped <= 10 or self.skipped % 1000 == 0:
@@ -283,8 +304,8 @@ class Candles(Plugin):
         for ch in (update.added(self.COLS), update.modified(self.COLS)):
             if ch is None:
                 continue
-            for tok, price, vol, lt in zip(*self._clean(ch)):
-                sec = self._feed(agg, tok, price, vol, lt)
+            for tok, price, vol, lt, ltq in zip(*self._clean(ch)):
+                sec = self._feed(agg, tok, price, vol, lt, ltq)
                 if sec is not None and sec > latest:
                     latest = sec
         if latest:

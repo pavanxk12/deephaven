@@ -88,7 +88,7 @@ def test_candles_rows_reach_the_writer(fake_dh, master, monkeypatch):
     fake_dh[0].fn(Update([(100, 1040, 5, "14-10-2030 10:15:05"), (100, 1120, 9, "14-10-2030 10:15:40"),
                           (100, 960, 12, "14-10-2030 10:16:30")]), False)
     (w,) = writers
-    (minute, token, o, h, l, close, vol) = w.rows[0]
+    (minute, token, o, h, l, close, vol, cvd) = w.rows[0]
     # the NSE feed is in paise: the default multiplier 0.01 gives rupees, and float noise is rounded away
     assert (token, o, h, l, close, vol) == (100, 10.4, 11.2, 10.4, 11.2, 4)
     assert minute % 60 == 0

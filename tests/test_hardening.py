@@ -68,7 +68,7 @@ def test_the_multiplier_gives_proper_rates_without_float_noise():
     c._tick(agg, 1, 24567, 5, GOOD)
     c._tick(agg, 1, 24570, 6, "14-10-2030 10:15:06")
     agg.flush(10 ** 12)
-    (token, minute, o, h, l, close, vol) = rows[0]
+    (token, minute, o, h, l, close, vol, cvd) = rows[0]
     assert (o, h, l, close) == (245.67, 245.7, 245.67, 245.7)          # not 245.67000000000002
     assert repr(o) == "245.67"
 

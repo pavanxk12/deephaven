@@ -223,12 +223,12 @@ def _absolute():
     svc = app.shared.get("absolute_service")
     if svc is None:
         cfg = app.shared.setdefault("absolute_settings", {"memory_mb": 200, "max_age": 5, "iv_max_age": 3, "min_valid": None, "folder": None, "basket_file": None})
-        today_bars, today_iv, today_bars_many, today_iv_many, contract_of = deephaven_readers(app)
+        today_bars, today_iv, today_bars_many, today_iv_many, contract_of, today_v, today_v_many = deephaven_readers(app)
         places = [cfg["basket_file"]] if cfg.get("basket_file") else [os.path.join(app.paths.market_data, "baskets.txt"), os.path.join(app.paths.state, "baskets.txt")]
         baskets = Baskets(places)
         svc = app.shared["absolute_service"] = AbsoluteService(
             Clock(app.market.zone, app.market.session), ParquetSource(make_store(app, cfg["folder"])), cfg["memory_mb"], cfg["max_age"], cfg["iv_max_age"],
-            cfg["min_valid"], today_bars, today_iv, None, today_bars_many, today_iv_many, baskets, contract_of)
+            cfg["min_valid"], today_bars, today_iv, None, today_bars_many, today_iv_many, baskets, contract_of, today_v, today_v_many)
     return svc
 
 

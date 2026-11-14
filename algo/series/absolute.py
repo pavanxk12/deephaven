@@ -6,6 +6,7 @@
 
     series   "pct"       the percent change of the price from a REFERENCE POINT you choose with ref=  (default "open")
              "iv"        the IV column of straddle_series (the nearest expiry of the symbol); with ref= its percent change from that point
+             "v"         the V column of straddle_series (the straddle's own cost, same nearest expiry); with ref= its percent change from that point
              "pct_open" / "pct_vwap"   shorthands for series "pct" with ref "open" / "vwap"
              "volume"    relative volume (rvol): today's CUMULATIVE volume up to this minute, ranked against the same minute of the previous n days (no ref: it is
                          always the plain running total, never a percent change)
@@ -39,7 +40,7 @@ from datetime import date, datetime, timedelta
 
 import numpy as np
 
-SERIES = ("pct", "iv", "pct_open", "pct_vwap", "volume")   # pct_open / pct_vwap are "pct" with ref="open" / "vwap"; "volume" is relative volume (rvol), no ref
+SERIES = ("pct", "iv", "v", "pct_open", "pct_vwap", "volume")   # pct_open / pct_vwap are "pct" with ref="open" / "vwap"; "volume" is relative volume (rvol), no ref
 LEVELS = ("intraday", "intraweek", "intramonth")
 NAN = float("nan")
 _FUT = re.compile(r"^(?P<und>.+?) (?P<exp>\d{2}[A-Z]{3}\d{2}) FUT$")
@@ -586,13 +587,14 @@ class AbsoluteService:
     when `absolute()` is called (a one-off read of the candles / straddle table for that one symbol). Nothing runs between calls; the only memory kept is the cache."""
 
     def __init__(self, clock: Clock, source, memory_mb: float = 200, max_age: int = 5, iv_max_age: int = 3, min_valid: "int | None" = None,
-                 today_bars=None, today_iv=None, now=None, today_bars_many=None, today_iv_many=None, baskets=None, contract_of_today=None):
+                 today_bars=None, today_iv=None, now=None, today_bars_many=None, today_iv_many=None, baskets=None, contract_of_today=None,
+                 today_v=None, today_v_many=None):
         self.clock, self.source = clock, source
         self.cache = Cache(int(memory_mb * 1e6))
         self.max_age, self.iv_max_age, self.min_valid = int(max_age), int(iv_max_age), min_valid
-        self.today_bars, self.today_iv = today_bars, today_iv
+        self.today_bars, self.today_iv, self.today_v = today_bars, today_iv, today_v
         self.baskets = baskets if baskets is not None else Baskets()                          # named lists of symbols for relative() (baskets.txt)
-        self.today_bars_many, self.today_iv_many = today_bars_many, today_iv_many           # many symbols in ONE read (used by relative())
+        self.today_bars_many, self.today_iv_many, self.today_v_many = today_bars_many, today_iv_many, today_v_many   # many symbols in ONE read (used by relative())
         self.contract_of_today = contract_of_today                                          # ("fut", "NIFTY") -> the contract that is the nearest today, as ("exact", name)
         self._now = now                                             # a function returning epoch seconds (the wall clock)
         self._days_cache: dict[str, tuple[float, list]] = {}
@@ -619,11 +621,14 @@ class AbsoluteService:
         _, slot = self.clock.slots_of(r[0])
         return build_day(slot, r[1], r[2], r[3], r[4], r[5], self.clock.slots, self.max_age)
 
-    def _ivday(self, und: str, d: str, today: str) -> "IvDay | None":
+    def _straddleday(self, kind: str, und: str, d: str, today: str) -> "IvDay | None":
+        """`kind` "iv" or "v": the IvDay of the straddle series' IV or V column for that underlying's nearest expiry."""
+        today_reader = self.today_iv if kind == "iv" else self.today_v
+        source_reader = self.source.iv if kind == "iv" else self.source.v
         if d == today:
-            r = self.today_iv(und, d) if self.today_iv is not None else None
-            return self._build_iv(r if r is not None and len(r[0]) else self.source.iv(d, und))
-        return self.cache.get(("iv", und, d), lambda: self._build_iv(self.source.iv(d, und)))
+            r = today_reader(und, d) if today_reader is not None else None
+            return self._build_iv(r if r is not None and len(r[0]) else source_reader(d, und))
+        return self.cache.get((kind, und, d), lambda: self._build_iv(source_reader(d, und)))
 
     def _build_iv(self, r):
         if r is None or len(r[0]) == 0:
@@ -659,7 +664,7 @@ class AbsoluteService:
 
     # ---- one value (a past day or today) -----------------------------------------------------------------------------------------------
     def _split(self, series: str, ref) -> tuple:
-        """(kind, reference): kind is "pct" (a percent change) or "iv"; the reference comes from parse_ref (None for the plain IV level)."""
+        """(kind, reference): kind is "pct" (a percent change), "iv" or "v"; the reference comes from parse_ref (None for the plain level)."""
         if series in ("pct_open", "pct_vwap"):
             want = "open" if series == "pct_open" else "vwap"
             if ref is not None and parse_ref(ref, self.clock) != (want, None):
@@ -667,11 +672,12 @@ class AbsoluteService:
             return "pct", (want, None)
         if series == "pct":
             return "pct", parse_ref("open" if ref is None else ref, self.clock)
-        if series == "iv":
+        if series in ("iv", "v"):
             spec = None if ref is None else parse_ref(ref, self.clock)
             if spec is not None and spec[0] == "vwap":
-                raise ValueError("an IV has no volume, so no VWAP; use ref='open', 'prev_close', '10min' or 'HH:MM' (or no ref for the IV itself)")
-            return "iv", spec
+                raise ValueError(f"{'an IV' if series == 'iv' else 'the straddle V'} has no volume, so no VWAP; use ref='open', 'prev_close', '10min' or 'HH:MM' "
+                                  f"(or no ref for the {'IV' if series == 'iv' else 'V'} itself)")
+            return series, spec
         if series == "volume":
             if ref is not None:
                 raise ValueError("series 'volume' has no reference point (it is always today's running total, ranked against the same minute of earlier days); call "
@@ -680,7 +686,7 @@ class AbsoluteService:
         raise ValueError(f"series must be one of {SERIES}, got {series!r}")
 
     def _obj(self, kind: str, spec, d: str, today: str):
-        return self._ivday(underlying_of(spec), d, today) if kind == "iv" else self._day(spec, d, today)
+        return self._straddleday(kind, underlying_of(spec), d, today) if kind in ("iv", "v") else self._day(spec, d, today)
 
     def _pin(self, spec, d: str, today: str):
         """The symbol to read the EARLIER days of a reference with. A rolling future ("NIFTY FUT") is replaced by the contract that is the nearest on day d, so a week's or month's
@@ -714,7 +720,7 @@ class AbsoluteService:
         if kind == "volume":
             v = float(obj.cum_v[m])
             return v if v == v else NAN
-        arr = obj.iv if kind == "iv" else obj.close
+        arr = obj.iv if kind in ("iv", "v") else obj.close
         v = float(arr[m])
         if not v == v:
             return NAN
@@ -726,7 +732,7 @@ class AbsoluteService:
             prev = [p for p in (self._obj(kind, pin, x, today) for x in self._period_prev(level, d, days)) if p is not None]
             if what == "open":
                 base = prev[0] if prev else obj
-                anchor = base.first if kind == "iv" else base.open
+                anchor = base.first if kind in ("iv", "v") else base.open
             else:
                 pv = sum(p.pv for p in prev) + float(obj.cum_pv[m])
                 vol = sum(p.v for p in prev) + float(obj.cum_v[m])
@@ -778,7 +784,7 @@ class AbsoluteService:
         raw_slot = int(minute[0]) - self.clock.start - 1             # the latest bar that has closed is the one that started a minute ago
         slot = min(max(raw_slot, 0), self.clock.slots - 1)           # before the open: the first slot; after the close: the last
         info = dict(series=series, level=level, symbol=symbol, minute=slot, n=n, ref=ref_label(rf, self.clock))
-        days = self.days("straddle" if kind == "iv" else "candles")
+        days = self.days("straddle" if kind in ("iv", "v") else "candles")
         targets = self._targets(level, n, date.fromisoformat(today), days)
         hist = np.array([NAN if d is None else self._value_at(kind, rf, level, spec, d, slot, days, today) for d in targets], dtype=np.float64)
         cur = float(now) if now is not None else self._value_at(kind, rf, level, spec, today, slot, days, today)
@@ -809,9 +815,9 @@ class AbsoluteService:
             raise ValueError(f"level must be one of {LEVELS}")
         specs = list(dict.fromkeys(parse_symbol(s) for s in symbols))
         today = self.clock.date_of(self._when(at))
-        days = self.days("straddle" if kind == "iv" else "candles")
+        days = self.days("straddle" if kind in ("iv", "v") else "candles")
         needed = [d for d in self._needed_days(kind, rf, level, n, date.fromisoformat(today), days) if d != today]
-        per_symbol = max(1, len(needed)) * (self.clock.slots * (4 if kind == "iv" else 12) + 200)          # bytes of cache one symbol needs for this call
+        per_symbol = max(1, len(needed)) * (self.clock.slots * (4 if kind in ("iv", "v") else 12) + 200)          # bytes of cache one symbol needs for this call
         room = max(1, int(self.cache.max_bytes * 0.9 // per_symbol))
         if len(specs) > room:                                       # warming more than the cache holds would push out what was just loaded
             print(f"absolute_warm: the {self.cache.max_bytes / 1e6:.0f} MB cache holds about {room} symbols of {len(needed)} days; warming the first {room} of "
@@ -823,19 +829,21 @@ class AbsoluteService:
 
     def _load_many(self, series: str, specs, dates) -> None:
         """Put the saved days of these symbols into the cache, reading each day file ONCE for all the symbols that need it."""
-        many = getattr(self.source, "iv_many" if series == "iv" else "bars_many", None)
+        straddle = series in ("iv", "v")
+        many = getattr(self.source, f"{series}_many" if straddle else "bars_many", None)
+        source_one = getattr(self.source, series) if straddle else self.source.bars
         for d in dates:
-            if series == "iv":
+            if straddle:
                 names = list(dict.fromkeys(underlying_of(sp) for sp in specs))
-                missing = [u for u in names if not self.cache.has(("iv", u, d))]
+                missing = [u for u in names if not self.cache.has((series, u, d))]
             else:
                 missing = [sp for sp in specs if not self.cache.has(("bars", sp, d))]
             if not missing:
                 continue
-            got = many(d, missing) if many is not None else {m: (self.source.iv(d, m) if series == "iv" else self.source.bars(d, m)) for m in missing}
+            got = many(d, missing) if many is not None else {m: source_one(d, m) for m in missing}
             for m in missing:
                 r = got.get(m)
-                self.cache.put((("iv", m, d) if series == "iv" else ("bars", m, d)), self._build_iv(r) if series == "iv" else self._build(r))
+                self.cache.put(((series, m, d) if straddle else ("bars", m, d)), self._build_iv(r) if straddle else self._build(r))
 
     # ---- relative: the same series for a basket of symbols, now ---------------------------------------------------------------------------------------
     def _today_days(self, specs, today: str) -> dict:
@@ -850,13 +858,16 @@ class AbsoluteService:
                 out[sp] = self._build(files.get(sp))
         return out
 
-    def _today_ivs(self, unders, today: str) -> dict:
-        got = self.today_iv_many(unders, today) if self.today_iv_many is not None else {}
+    def _today_straddles(self, kind: str, unders, today: str) -> dict:
+        """{underlying: IvDay or None} of today's IV or V (per `kind`), for many underlyings in ONE read of the live table."""
+        today_many = self.today_iv_many if kind == "iv" else self.today_v_many
+        got = today_many(unders, today) if today_many is not None else {}
         out = {u: (self._build_iv(got[u]) if u in got and len(got[u][0]) else None) for u in unders}
         missing = [u for u in unders if out[u] is None]
         if missing:
-            many = getattr(self.source, "iv_many", None)
-            files = many(today, missing) if many is not None else {m: self.source.iv(today, m) for m in missing}
+            many = getattr(self.source, f"{kind}_many", None)
+            source_one = getattr(self.source, kind)
+            files = many(today, missing) if many is not None else {m: source_one(today, m) for m in missing}
             for u in missing:
                 out[u] = self._build_iv(files.get(u))
         return out
@@ -899,13 +910,13 @@ class AbsoluteService:
         _, minute = self.clock.local([int(ts)])
         slot = min(max(int(minute[0]) - self.clock.start - 1, 0), self.clock.slots - 1)
         everyone = [target, *specs]
-        days = self.days("straddle" if kind == "iv" else "candles")
+        days = self.days("straddle" if kind in ("iv", "v") else "candles")
         extra = self._ref_days(rf, level, today, days)               # the earlier days the reference needs, read once for the whole basket
         if extra:
             self._load_many(kind, [self._pin(sp, today, today) if kind == "pct" else sp for sp in everyone], extra)
-        if kind == "iv":
-            ivs = self._today_ivs(list(dict.fromkeys(underlying_of(sp) for sp in everyone)), today)
-            value = {sp: self._value_from("iv", rf, level, sp, ivs[underlying_of(sp)], today, slot, days, today) for sp in everyone}
+        if kind in ("iv", "v"):
+            straddles = self._today_straddles(kind, list(dict.fromkeys(underlying_of(sp) for sp in everyone)), today)
+            value = {sp: self._value_from(kind, rf, level, sp, straddles[underlying_of(sp)], today, slot, days, today) for sp in everyone}
         else:
             tod = self._today_days(everyone, today)
             value = {sp: self._value_from(kind, rf, level, sp, tod[sp], today, slot, days, today) for sp in everyone}
@@ -1036,44 +1047,56 @@ class ParquetSource:
                 out[sp] = arrays
         return out
 
-    def iv_many(self, day: str, underlyings):
-        """{underlying: (minute of day, iv)} of the nearest expiry, from one read."""
+    def _straddle_many(self, day: str, underlyings, col: str):
+        """{underlying: (minute of day, value)} of `col`'s nearest expiry, from one read."""
         path = self._path("straddle", day)
         if path is None:
             return {}
         _, pq = self._pq()
-        if "IV" not in pq.read_schema(path).names:                  # a day saved before the IV column existed: no IV that day
+        if col not in pq.read_schema(path).names:                   # a day saved before this column existed: nothing that day
             return {}
-        t = pq.read_table(path, columns=["Symbol", "Time", "Expiry", "IV"], filters=[("Symbol", "in", sorted(set(underlyings)))])
+        t = pq.read_table(path, columns=["Symbol", "Time", "Expiry", col], filters=[("Symbol", "in", sorted(set(underlyings)))])
         if t.num_rows == 0:
             return {}
         sym = t["Symbol"].to_numpy(zero_copy_only=False).astype(str)
         expiry = t["Expiry"].to_numpy(zero_copy_only=False).astype(str)
         times = t["Time"].to_numpy(zero_copy_only=False).astype(str)
-        iv = t["IV"].to_numpy().astype(np.float64)
+        vals = t[col].to_numpy().astype(np.float64)
         out = {}
         for u in np.unique(sym):
             m = sym == u
             keep = m & (expiry == min(expiry[m].tolist()))
             minute = np.array([int(x[0:2]) * 60 + int(x[3:5]) for x in times[keep]], dtype=np.int64)
-            out[str(u)] = (minute, iv[keep])
+            out[str(u)] = (minute, vals[keep])
         return out
 
-    def iv(self, day: str, underlying: str):
+    def _straddle_one(self, day: str, underlying: str, col: str):
         path = self._path("straddle", day)
         if path is None:
             return None
         _, pq = self._pq()
-        if "IV" not in pq.read_schema(path).names:
+        if col not in pq.read_schema(path).names:
             return None
-        t = pq.read_table(path, columns=["Time", "Expiry", "IV"], filters=[("Symbol", "=", underlying)])
+        t = pq.read_table(path, columns=["Time", "Expiry", col], filters=[("Symbol", "=", underlying)])
         if t.num_rows == 0:
             return None
         expiry = t["Expiry"].to_numpy(zero_copy_only=False).astype(str)
         keep = expiry == min(expiry.tolist())                       # the nearest expiry of that day
         times = t["Time"].to_numpy(zero_copy_only=False).astype(str)[keep]
         minute = np.array([int(s[0:2]) * 60 + int(s[3:5]) for s in times], dtype=np.int64)
-        return minute, t["IV"].to_numpy().astype(np.float64)[keep]
+        return minute, t[col].to_numpy().astype(np.float64)[keep]
+
+    def iv_many(self, day: str, underlyings):
+        return self._straddle_many(day, underlyings, "IV")
+
+    def iv(self, day: str, underlying: str):
+        return self._straddle_one(day, underlying, "IV")
+
+    def v_many(self, day: str, underlyings):
+        return self._straddle_many(day, underlyings, "V")
+
+    def v(self, day: str, underlying: str):
+        return self._straddle_one(day, underlying, "V")
 
 
 # ---- reading TODAY from Deephaven, one symbol at the moment of the call ------------------------------------------------------------------------------
@@ -1156,7 +1179,7 @@ def deephaven_readers(app):
             return (df["Ts"].to_numpy(dtype=np.int64), *(df[c].to_numpy(dtype=np.float64) for c in ("Open", "High", "Low", "Close", "Volume")))
         return size_cached(seen, seen_lock, ("one", int(token)), table, read)
 
-    def today_iv(und, day):
+    def today_straddle(col, manykey, und, day):
         table = app.tables.get("straddle_series")
         if table is None or not _NAME.match(und):
             return None
@@ -1166,20 +1189,26 @@ def deephaven_readers(app):
         except Exception:
             rows = None
         if rows is not None:
-            with seen_lock:                                         # relative("iv") has just read this underlying with its basket, and the table has not grown since: that read is the answer
+            with seen_lock:                                         # relative("iv"/"v") has just read this underlying with its basket, and the table has not grown since: that read is the answer
                 for key, (size, tbl, value) in seen.items():
-                    if key[0] == "ivmany" and size == rows and tbl is table and und in value:
+                    if key[0] == manykey and size == rows and tbl is table and und in value:
                         return value[und]
 
         def read():
-            df = to_pandas(table.where(f"Symbol = `{und}`").view(["Expiry", "Time", "IV"]))
+            df = to_pandas(table.where(f"Symbol = `{und}`").view(["Expiry", "Time", col]))
             if not len(df):
                 return None
             expiry = df["Expiry"].astype(str).to_numpy()
             keep = expiry == min(expiry.tolist())
             times = df["Time"].astype(str).to_numpy()[keep]
-            return (np.array([int(t[0:2]) * 60 + int(t[3:5]) for t in times], dtype=np.int64), df["IV"].to_numpy(dtype=np.float64)[keep])
-        return size_cached(seen, seen_lock, ("iv", und), table, read)
+            return (np.array([int(t[0:2]) * 60 + int(t[3:5]) for t in times], dtype=np.int64), df[col].to_numpy(dtype=np.float64)[keep])
+        return size_cached(seen, seen_lock, (col.lower(), und), table, read)
+
+    def today_iv(und, day):
+        return today_straddle("IV", "ivmany", und, day)
+
+    def today_v(und, day):
+        return today_straddle("V", "vmany", und, day)
 
     def today_bars_many(specs, day):
         """{spec: arrays} for many symbols from ONE filtered read of the candles table."""
@@ -1214,7 +1243,7 @@ def deephaven_readers(app):
         name = app.master.symbol_of.get(int(t)) if t is not None else None
         return parse_symbol(name) if name else None
 
-    def today_iv_many(unders, day):
+    def today_straddle_many(col, manykey, unders, day):
         table = app.tables.get("straddle_series")
         names = [u for u in unders if _NAME.match(u)]
         if table is None or not names:
@@ -1224,14 +1253,20 @@ def deephaven_readers(app):
 
         def read():
             keys = to_table(pd.DataFrame({"Symbol": pd.Series(names, dtype="object")}))
-            df = to_pandas(table.where_in(keys, "Symbol").view(["Symbol", "Expiry", "Time", "IV"]))
+            df = to_pandas(table.where_in(keys, "Symbol").view(["Symbol", "Expiry", "Time", col]))
             out = {}
             for und, g in df.groupby("Symbol"):
                 expiry = g["Expiry"].astype(str).to_numpy()
                 keep = expiry == min(expiry.tolist())
                 times = g["Time"].astype(str).to_numpy()[keep]
-                out[str(und)] = (np.array([int(t[0:2]) * 60 + int(t[3:5]) for t in times], dtype=np.int64), g["IV"].to_numpy(dtype=np.float64)[keep])
+                out[str(und)] = (np.array([int(t[0:2]) * 60 + int(t[3:5]) for t in times], dtype=np.int64), g[col].to_numpy(dtype=np.float64)[keep])
             return out
-        return size_cached(seen, seen_lock, ("ivmany", tuple(sorted(set(names)))), table, read)
+        return size_cached(seen, seen_lock, (manykey, tuple(sorted(set(names)))), table, read)
 
-    return today_bars, today_iv, today_bars_many, today_iv_many, contract_of
+    def today_iv_many(unders, day):
+        return today_straddle_many("IV", "ivmany", unders, day)
+
+    def today_v_many(unders, day):
+        return today_straddle_many("V", "vmany", unders, day)
+
+    return today_bars, today_iv, today_bars_many, today_iv_many, contract_of, today_v, today_v_many

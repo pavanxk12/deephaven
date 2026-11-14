@@ -21,19 +21,19 @@
 #                     set): once the move reaches TRAIL_TRIGGER_PCT the stop shifts, for the rest of that position's life, from -STOP_PCT to PROFIT_LOCK_PCT.
 #   One entry         ONE_ENTRY_PER_STOCK = True: a stock is entered ONCE. After its take-profit, stop-loss or any other exit it is not entered again (until the script is pasted again).
 #   The time exit     EXIT_AT (15:55 New York time, 5 minutes before the 16:00 close): the automation is stopped the way algo_stop does it: every portfolio is paused and squared up, a minute
-#                     later unsubscribed (so the plugin can close first), and the script stops. No entry is made from then on. It refuses while sending is OFF (it says so; then run us_directional_stop() by hand).
+#                     later unsubscribed (so the plugin can close first), and the script stops. No entry is made from then on. It refuses while sending is OFF (it says so; then run directional_stop() by hand).
 #   The order         a NEW portfolio for every trade: ONE `subscribe` that carries the fields, as for 08 (the engine knows the strategy as "CrossOrder"; SIDE 1 = buy, 2 = sell):
 #                     {"strategyname": "CrossOrder", "TOKEN": <contract>, "SIDE": 1|2, "QTY": n lots, "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}
 #                     The NATS service adds USERIDENTIFIER and user_id. The book gives the portfolio numbers; each stock may use up to 100 a day.
 #                     CHECK on the US server before real money: the strategy name "CrossOrder", SERVERCODE and ACCOUNT are India's values.
 #
-# EVERYTHING is inside the function run_us_directional() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of
-# names shared by every script you paste, so top-level `step` or `closes` would overwrite another running script's. The only names left in the terminal start with us_directional:
-#   us_directional_status()   us_directional_exit_all()   us_directional_stop()   (stop pauses, squares up and unsubscribes every portfolio, then stops; it refuses while sending is OFF)
+# EVERYTHING is inside the function run_directional() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of
+# names shared by every script you paste, so top-level `step` or `closes` would overwrite another running script's. The only names left in the terminal start with directional:
+#   directional_status()   directional_exit_all()   directional_stop()   (stop pauses, squares up and unsubscribes every portfolio, then stops; it refuses while sending is OFF)
 # Positions are kept in the script only: if you stop it or Deephaven restarts while a position is open, it no longer knows about it (square it up from the console).
 
 
-def run_us_directional():
+def run_directional():
     import contextlib
     import io
     import queue
@@ -52,7 +52,7 @@ def run_us_directional():
 
     # =============================== USER INPUT ===============================
     USER = 3
-    STRATEGY = "us_directional"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
+    STRATEGY = "directional"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
     BASKETS = {                              # named sector baskets: a symbol is ranked only against the OTHERS of ITS basket (each saved as its own basket.txt entry)
         "tech":   ["MSFT", "GOOG", "META", "AMZN", "NFLX", "SHOP", "CRWD", "PANW", "PLTR", "AAPL", "TSLA"],
         "chips":  ["NVDA", "AVGO", "AMD", "MU", "ASML", "INTC", "AMAT", "MRVL", "KLAC", "ADI", "QCOM", "ARM", "SNDK", "TXN", "CSCO"],
@@ -63,16 +63,16 @@ def run_us_directional():
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
     BASKAVG_LONG = 0.1                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
     BASKAVG_SHORT = -0.1                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
-    REL_BUY = {"pct_open": 90.0, "pct_vwap": 51.0, "iv": 80.0}         # relative(): BUY needs every ref at least its own threshold here
-    REL_SELL = {"pct_open": 10.0, "pct_vwap": 49.0, "iv": 80.0}           # relative(): SELL needs every ref below its own threshold here
-    ABS_BUY = {"pct_open": 90.0, "pct_vwap": 51.0, "iv": 80.0}            # absolute(): BUY needs every ref at least its own threshold here
-    ABS_SELL = {"pct_open": 10.0, "pct_vwap": 49.0, "iv": 80.0}           # absolute(): SELL needs every ref below its own threshold here
+    REL_BUY = {"pct_open": 80.0, "pct_vwap": 51.0, "iv": 80.0}         # relative(): BUY needs every ref at least its own threshold here
+    REL_SELL = {"pct_open": 20.0, "pct_vwap": 49.0, "iv": 20.0}           # relative(): SELL needs every ref below its own threshold here
+    ABS_BUY = {"pct_open": 80.0, "pct_vwap": 51.0, "iv": 80.0}            # absolute(): BUY needs every ref at least its own threshold here
+    ABS_SELL = {"pct_open": 20.0, "pct_vwap": 49.0, "iv": 20.0}           # absolute(): SELL needs every ref below its own threshold here
     DIRECTION_MATCH = True                   # True: a BUY needs the REL_BUY/ABS_BUY side everywhere, a SELL the REL_SELL/ABS_SELL side.
                                              # False: either side passes
     USE_IV = False                           # False: % from open / VWAP only. True would also need an IV series (the US has none), so every entry would say "cannot tell"
     DAY_EXTREME = True                       # True: filter 0, the latest SIGNAL_BAR close (5min) must be the highest (BUY) or the lowest (SELL) of today's SIGNAL_BAR closes so far (at least 2 bars today). False: off
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
-    RVOL_MIN_MULT = 1.5                      # filter 4: today's cumulative volume so far must be at least this many times the AVERAGE of the same point in the session over the
+    RVOL_MIN_MULT = 1.25                      # filter 4: today's cumulative volume so far must be at least this many times the AVERAGE of the same point in the session over the
                                              # previous ABS_DAYS days (relative volume). None = off; has no effect while ABS_DAYS is 0 (no history to average)
     SIGNAL_BAR = "5min"                         # the bar filter 0 (TODAY) checks today's highest/lowest close on (made from the 1-minute candles)
     ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an SIGNAL_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
@@ -85,11 +85,11 @@ def run_us_directional():
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
-    ENTRY_VALUE = None                       # None: every entry is QTY lots. A number (dollars): the quantity at entry is int(ENTRY_VALUE / the last 1-minute close), QTY is then not used;
+    ENTRY_VALUE = 5000                       # None: every entry is QTY lots. A number (dollars): the quantity at entry is int(ENTRY_VALUE / the last 1-minute close), QTY is then not used;
                                              # if one share costs more than ENTRY_VALUE the quantity would be 0 and that entry is skipped (it says so)
     ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1","MAX_TRIES":5}      # "CrossOrder" is the engine's name for the CrossOrder plugin
-    WINDOW = (dtime(10, 0), dtime(15, 45))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
-    EXIT_AT = dtime(15, 55)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
+    WINDOW = (dtime(10, 0), dtime(13, 45))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
+    EXIT_AT = dtime(15, 45)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
     MAX_PORTFOLIOS = 28                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
                                              # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.
     UNSUB_AFTER_S = 60                       # a closed position's portfolio is unsubscribed this many seconds after its exit (take-profit, stop-loss, z-exit) so the engine frees the slot;
@@ -344,18 +344,20 @@ def run_us_directional():
             leave(token, f"{why} (tick)")
 
     def on_tick(update, is_replay):
-        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python)."""
-        ch = update.added(["token", "ltp"])
-        if ch is None:
-            return
-        for tok, ltp in zip(ch["token"], ch["ltp"]):
-            tok = int(tok)
-            pos = position.get(tok)
-            if pos is None or pos["state"] != "open" or ltp <= 0:
+        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python).
+        fo_market_data is a last_by("PF") table: a token's first tick arrives as an added row, every one after that as a
+        modified row (same row, updated in place) -- both must be read or only the very first tick of each position is seen."""
+        for ch in (update.added(["token", "ltp"]), update.modified(["token", "ltp"])):
+            if ch is None:
                 continue
-            div = divisor_of(tok)
-            if div:
-                tick_exit(tok, pos, float(ltp) / float(div))
+            for tok, ltp in zip(ch["token"], ch["ltp"]):
+                tok = int(tok)
+                pos = position.get(tok)
+                if pos is None or pos["state"] != "open" or ltp <= 0:
+                    continue
+                div = divisor_of(tok)
+                if div:
+                    tick_exit(tok, pos, float(ltp) / float(div))
 
     tick_jobs = queue.Queue()                                      # (token, add?) jobs for the one worker thread: Deephaven refuses an input-table edit made from inside a listener or a callback
 
@@ -581,8 +583,8 @@ def run_us_directional():
         algo_stop(STRATEGY, pause=False)                           # square up + unsubscribe every portfolio (no pause step), wait for it, then stop (refuses while sending is OFF)
 
     shared = globals()
-    shared["us_directional_status"], shared["us_directional_exit_all"], shared["us_directional_stop"] = status, exit_all, stop
+    shared["directional_status"], shared["directional_exit_all"], shared["directional_stop"] = status, exit_all, stop
     nats_send(True, client=STRATEGY)                               # NOW it may send. Stop just this automation: nats_send(False, client=STRATEGY)
 
 
-run_us_directional()
+run_directional()

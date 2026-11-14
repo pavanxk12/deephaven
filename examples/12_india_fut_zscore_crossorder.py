@@ -277,18 +277,20 @@ def run_india_fut_zscore():
             leave(token, f"stop-loss {move:+.2f}% (tick)")
 
     def on_tick(update, is_replay):
-        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python)."""
-        ch = update.added(["token", "ltp"])
-        if ch is None:
-            return
-        for tok, ltp in zip(ch["token"], ch["ltp"]):
-            tok = int(tok)
-            pos = position.get(tok)
-            if pos is None or pos["state"] != "open" or ltp <= 0:
+        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python).
+        fo_market_data is a last_by("PF") table: a token's first tick arrives as an added row, every one after that as a
+        modified row (same row, updated in place) -- both must be read or only the very first tick of each position is seen."""
+        for ch in (update.added(["token", "ltp"]), update.modified(["token", "ltp"])):
+            if ch is None:
                 continue
-            div = divisor_of(tok)
-            if div:
-                tick_exit(tok, pos, float(ltp) / float(div))
+            for tok, ltp in zip(ch["token"], ch["ltp"]):
+                tok = int(tok)
+                pos = position.get(tok)
+                if pos is None or pos["state"] != "open" or ltp <= 0:
+                    continue
+                div = divisor_of(tok)
+                if div:
+                    tick_exit(tok, pos, float(ltp) / float(div))
 
     tick_jobs = queue.Queue()                                      # (token, add?) jobs for the one worker thread: Deephaven refuses an input-table edit made from inside a listener or a callback
 

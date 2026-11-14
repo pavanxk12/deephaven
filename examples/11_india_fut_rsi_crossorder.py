@@ -65,13 +65,13 @@ def run_meanrevert():
     STRATEGY = "meanrevert"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
     INDEX_FUTURES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}      # index futures are left out: stock futures only
     SECTOR_BASKETS = {                       # named baskets: a symbol is ranked only against the others of ITS named basket (at least 3 members each)
-        "nifty":   ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK","BAJFINANCE", "BAJAJFINSV", "SBILIFE", "HDFCLIFE", "BSE","TCS", "INFY", "HCLTECH", "WIPRO", "TECHM","M&M", "MARUTI", "TATAMOTORS", "EICHERMOT", "BAJAJ-AUTO","SUNPHARMA","DRREDDY","CIPLA","APOLLOHOSP","MAXHEALTH","ITC","NESTLEIND","TITAN","HINDUNILVR","ETERNAL","ONGC","BPCL","RELIANCE","NTPC","POWERGRID","HINDALCO","JSWSTEEL","TATASTEEL","COALINDIA"],
+        "nifty":   ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK","BAJFINANCE", "BAJAJFINSV", "SBILIFE", "HDFCLIFE", "BSE","TCS", "INFY", "HCLTECH", "WIPRO", "TECHM","M&M", "MARUTI", "TMPV", "EICHERMOT", "BAJAJ-AUTO","SUNPHARMA","DRREDDY","CIPLA","APOLLOHOSP","MAXHEALTH","ITC","NESTLEIND","TITAN","HINDUNILVR","ETERNAL","ONGC","BPCL","RELIANCE","NTPC","POWERGRID","HINDALCO","JSWSTEEL","TATASTEEL","COALINDIA"],
     }                                         # add/remove/comment out symbols or whole baskets here; empty = none
     EXCLUDE = []                             # optional: underlyings to leave out (applied across every basket)
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
     REL_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # relative(): pct_open's percentile among the basket must land inside this (low, high) band (Q2 to Q3);
                                               # pct_vwap's percentile among the basket must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD) -- same extreme test as ABS_ZONE
-    USE_BASKET_AVG = False                   # True: also require the BASKET's own average % from the open (all its members, now) to confirm the direction -- BASKET_AVG_PCT on the SAME
+    USE_BASKET_AVG = True                   # True: also require the BASKET's own average % from the open (all its members, now) to confirm the direction -- BASKET_AVG_PCT on the SAME
                                               # side (not the opposite): a BUY needs the average ABOVE +BASKET_AVG_PCT, a SELL needs it BELOW -BASKET_AVG_PCT (the whole basket is already moving that way)
     BASKET_AVG_PCT = 0.1                     # e.g. 0.1: BUY needs the basket average % from the open above +0.1, SELL needs it below -0.1
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
@@ -408,18 +408,20 @@ def run_meanrevert():
             leave(token, f"{why} (tick)")
 
     def on_tick(update, is_replay):
-        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python)."""
-        ch = update.added(["token", "ltp"])
-        if ch is None:
-            return
-        for tok, ltp in zip(ch["token"], ch["ltp"]):
-            tok = int(tok)
-            pos = position.get(tok)
-            if pos is None or pos["state"] != "open" or ltp <= 0:
+        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python).
+        fo_market_data is a last_by("PF") table: a token's first tick arrives as an added row, every one after that as a
+        modified row (same row, updated in place) -- both must be read or only the very first tick of each position is seen."""
+        for ch in (update.added(["token", "ltp"]), update.modified(["token", "ltp"])):
+            if ch is None:
                 continue
-            div = divisor_of(tok)
-            if div:
-                tick_exit(tok, pos, float(ltp) / float(div))
+            for tok, ltp in zip(ch["token"], ch["ltp"]):
+                tok = int(tok)
+                pos = position.get(tok)
+                if pos is None or pos["state"] != "open" or ltp <= 0:
+                    continue
+                div = divisor_of(tok)
+                if div:
+                    tick_exit(tok, pos, float(ltp) / float(div))
 
     tick_jobs = queue.Queue()                                      # (token, add?) jobs for the one worker thread: Deephaven refuses an input-table edit made from inside a listener or a callback
 

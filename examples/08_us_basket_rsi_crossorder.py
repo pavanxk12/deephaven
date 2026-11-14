@@ -15,19 +15,19 @@
 #   One entry         ONE_ENTRY_PER_STOCK = True: a stock is entered ONCE. After its take-profit, stop-loss or any other exit it is not entered again (until the script is pasted again).
 #   The time exit     EXIT_AT (15:55 New York time, 5 minutes before the 16:00 close): the automation is stopped the way algo_stop does it: every portfolio is paused and squared up, a minute
 #                     later unsubscribed (so the plugin can close first), and the script stops. No entry is made from then on. It is checked on every batch of 1-minute candles, so it
-#                     starts within a minute of EXIT_AT. It refuses while sending is OFF (it says so; then run us_basket_rsi_stop() by hand).
+#                     starts within a minute of EXIT_AT. It refuses while sending is OFF (it says so; then run meanrevert_stop() by hand).
 #   The order         a NEW portfolio for every trade: ONE `subscribe` that carries the fields, as for 07 (the engine knows the strategy as "CrossOrder"; SIDE 1 = buy, 2 = sell):
 #                     {"strategyname": "CrossOrder", "TOKEN": <contract>, "SIDE": 1|2, "QTY": n lots, "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}
 #                     The NATS service adds USERIDENTIFIER and user_id. The book gives the portfolio numbers; each stock may use up to 100 a day.
 #                     CHECK on the US server before real money: the strategy name "CrossOrder", SERVERCODE and ACCOUNT are India's values.
 #
-# EVERYTHING is inside the function run_us_basket_rsi() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of
-# names shared by every script you paste, so top-level `rsi` or `closes` would overwrite another running script's. The only names left in the terminal start with us_basket_rsi:
-#   us_basket_rsi_status()   us_basket_rsi_exit_all()   us_basket_rsi_stop()   (stop pauses, squares up and unsubscribes every portfolio, then stops; it refuses while sending is OFF)
+# EVERYTHING is inside the function run_meanrevert() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of
+# names shared by every script you paste, so top-level `rsi` or `closes` would overwrite another running script's. The only names left in the terminal start with meanrevert:
+#   meanrevert_status()   meanrevert_exit_all()   meanrevert_stop()   (stop pauses, squares up and unsubscribes every portfolio, then stops; it refuses while sending is OFF)
 # Positions are kept in the script only: if you stop it or Deephaven restarts while a position is open, it no longer knows about it (square it up from the console).
 
 
-def run_us_basket_rsi():
+def run_meanrevert():
     import contextlib
     import glob
     import io
@@ -48,7 +48,7 @@ def run_us_basket_rsi():
 
     # =============================== USER INPUT ===============================
     USER = 3
-    STRATEGY = "us_basket_rsi"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
+    STRATEGY = "meanrevert"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
     BASKETS = {                              # named sector baskets: a symbol is ranked only against the OTHERS of ITS basket (each saved as its own basket.txt entry)
         "us":   ["MSFT", "GOOG", "META", "AMZN", "NFLX", "SHOP", "CRWD", "PANW", "PLTR", "AAPL", "TSLA","WMT", "COST", "PEP", "AMGN", "LIN", "GILD", "SPCX","NVDA", "AVGO", "AMD", "MU", "ASML", "INTC", "AMAT", "MRVL", "KLAC", "ADI", "QCOM", "ARM", "SNDK", "TXN", "CSCO"],
     }
@@ -74,11 +74,11 @@ def run_us_basket_rsi():
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
-    ENTRY_VALUE = None                       # None: every entry is QTY lots. A number (dollars): the quantity at entry is int(ENTRY_VALUE / the last 1-minute close), QTY is then not used;
+    ENTRY_VALUE = 5000                       # None: every entry is QTY lots. A number (dollars): the quantity at entry is int(ENTRY_VALUE / the last 1-minute close), QTY is then not used;
                                              # if one share costs more than ENTRY_VALUE the quantity would be 0 and that entry is skipped (it says so)
     ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1","MAX_TRIES":5}      # "CrossOrder" is the engine's name for the CrossOrder plugin
-    WINDOW = (dtime(10, 0), dtime(15, 45))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
-    EXIT_AT = dtime(15, 55)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
+    WINDOW = (dtime(10, 0), dtime(15, 0))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
+    EXIT_AT = dtime(15, 45)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
     MAX_PORTFOLIOS = 28                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
                                              # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.
     UNSUB_AFTER_S = 60                       # a closed position's portfolio is unsubscribed this many seconds after its exit (take-profit, stop-loss, z-exit) so the engine frees the slot;
@@ -353,18 +353,20 @@ def run_us_basket_rsi():
             leave(token, f"{why} (tick)")
 
     def on_tick(update, is_replay):
-        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python)."""
-        ch = update.added(["token", "ltp"])
-        if ch is None:
-            return
-        for tok, ltp in zip(ch["token"], ch["ltp"]):
-            tok = int(tok)
-            pos = position.get(tok)
-            if pos is None or pos["state"] != "open" or ltp <= 0:
+        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python).
+        fo_market_data is a last_by("PF") table: a token's first tick arrives as an added row, every one after that as a
+        modified row (same row, updated in place) -- both must be read or only the very first tick of each position is seen."""
+        for ch in (update.added(["token", "ltp"]), update.modified(["token", "ltp"])):
+            if ch is None:
                 continue
-            div = divisor_of(tok)
-            if div:
-                tick_exit(tok, pos, float(ltp) / float(div))
+            for tok, ltp in zip(ch["token"], ch["ltp"]):
+                tok = int(tok)
+                pos = position.get(tok)
+                if pos is None or pos["state"] != "open" or ltp <= 0:
+                    continue
+                div = divisor_of(tok)
+                if div:
+                    tick_exit(tok, pos, float(ltp) / float(div))
 
     tick_jobs = queue.Queue()                                      # (token, add?) jobs for the one worker thread: Deephaven refuses an input-table edit made from inside a listener or a callback
 
@@ -577,8 +579,8 @@ def run_us_basket_rsi():
         algo_stop(STRATEGY, pause=False)                           # square up + unsubscribe every portfolio (no pause step), wait for it, then stop (refuses while sending is OFF)
 
     shared = globals()
-    shared["us_basket_rsi_status"], shared["us_basket_rsi_exit_all"], shared["us_basket_rsi_stop"] = status, exit_all, stop
+    shared["meanrevert_status"], shared["meanrevert_exit_all"], shared["meanrevert_stop"] = status, exit_all, stop
     nats_send(True, client=STRATEGY)                               # NOW it may send. Stop just this automation: nats_send(False, client=STRATEGY)
 
 
-run_us_basket_rsi()
+run_meanrevert()

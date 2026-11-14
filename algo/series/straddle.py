@@ -42,11 +42,11 @@ class SeriesDef:
 
 
 def implied_vol(v: float, synthetic: float, dte: int) -> float:
-    """The IV column: v / synthetic * sqrt(max(dte, 1)) * 100, with `dte` the calendar days left to the expiry (at least 1, so the expiry day
+    """The IV column: v / (synthetic * sqrt(max(dte, 1))) * 100, with `dte` the calendar days left to the expiry (at least 1, so the expiry day
     itself counts as one day). NaN when the synthetic price is not positive."""
     if not synthetic > 0:
         return float("nan")
-    return float(v / synthetic * math.sqrt(max(dte, 1)) * 100.0)
+    return float(v / (synthetic * math.sqrt(max(dte, 1))) * 100.0)
 
 
 def reference_future(fut_expiries: list, option_expiry) -> int:

@@ -35,7 +35,7 @@ def test_candle_ohlc_and_volume_delta():
     for sec, price, vol in ((60, 10, 100), (70, 12, 110), (80, 9, 130), (119, 11, 140), (125, 20, 150)):
         agg.tick(1, price, vol, sec)
     # first tick of the minute starts the candle; the next minute closes it
-    assert out == [(1, 60, 10, 12, 9, 11, 40)]          # volume 140 - first_vol 100
+    assert out == [(1, 60, 10, 12, 9, 11, 40, 0.0)]          # volume 140 - first_vol 100
     agg.flush(180)
     assert out[1] == (1, 120, 20, 20, 20, 20, 10)       # 150 - 140 carried from the previous candle
 
@@ -46,7 +46,7 @@ def test_ticks_before_start_build_nothing_but_track_volume():
     agg.tick(1, 10, 500, 61)
     agg.tick(1, 11, 520, 130)
     agg.flush(1000)
-    assert out == [(1, 120, 11, 11, 11, 11, 20)]        # 520 - 500 seen before the start
+    assert out == [(1, 120, 11, 11, 11, 11, 20, 0.0)]        # 520 - 500 seen before the start
 
 
 def test_late_tick_is_ignored():

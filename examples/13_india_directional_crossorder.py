@@ -6,15 +6,16 @@
 #                                   dropped here, before anything else is asked.
 #                     1. BASKET AVG the basket's own AVERAGE % change from the open (across every member, from the same relative() read filter 2 uses): BUY needs it at least BASKAVG_LONG,
 #                                   SELL needs it at or below BASKAVG_SHORT. A basket-wide momentum gate, not a per-stock ranking.
-#                     2. RELATIVE   the stock's % change from the OPEN against its basket (relative()), and the IV (USE_IV): BUY needs pct_open and iv both at least REL_BUY's; SELL needs
-#                                   pct_open at or below REL_SELL's and iv at least REL_SELL's own iv threshold. DIRECTION_MATCH = True: each side needs its own. False: either passes.
-#                     3. ABSOLUTE   the same, against its own earlier days at the same minute (absolute(), ABS_DAYS = 22 saved days): BUY needs ABS_BUY's pct_open and iv; SELL needs
-#                                   ABS_SELL's pct_open and its own iv threshold.
+#                     2. RELATIVE   the stock's % change from the OPEN against its basket (relative()), and its underlying's straddle V % change from the open (USE_V): BUY needs pct_open
+#                                   and v both at least REL_BUY's; SELL needs pct_open at or below REL_SELL's and v at least REL_SELL's own v threshold. DIRECTION_MATCH = True: each side
+#                                   needs its own. False: either passes.
+#                     3. ABSOLUTE   the same, against its own earlier days at the same minute (absolute(), ABS_DAYS = 22 saved days): BUY needs ABS_BUY's pct_open and v; SELL needs
+#                                   ABS_SELL's pct_open and its own v threshold.
 #                     Each filter runs only for the stocks that passed the one before it. With fewer than half of the days in the files absolute() cannot tell and there is no trade.
 #                     A trade needs the sides of 0 and 1 (and 2, and 3 when ABS_DAYS > 0) to agree on exactly one side.
-#                     The IV of a future is the IV of its underlying (the straddle series of the nearest expiry): the script STARTS the straddle itself if it is not running (straddle_start(STRADDLE_N); the candles must
-#                     hold the OPTIONS too, not futures only) and straddle_<day>.parquet files must exist for the earlier days. Without them the IV filter says "cannot tell" and nothing trades; USE_IV = False
-#                     leaves the IV out.
+#                     The V of a future is the straddle cost (V column) of its underlying's nearest expiry, as its % change from today's open: the script STARTS the straddle itself if it
+#                     is not running (straddle_start(STRADDLE_N); the candles must hold the OPTIONS too, not futures only) and straddle_<day>.parquet files must exist for the earlier days.
+#                     Without them the V filter says "cannot tell" and nothing trades; USE_V = False leaves it out.
 #   The exit          the same as 11: +TARGET_PCT in your favour or -STOP_PCT against you, on every price tick of the live feed for the open positions (TICK_EXITS) and on each 1-minute close;
 #                     then `squareup`, and the portfolio is unsubscribed UNSUB_AFTER_S seconds later. At most MAX_PORTFOLIOS portfolios are held at once. TRAIL_TRIGGER_PCT / PROFIT_LOCK_PCT
 #                     (both None, or both set): once the move reaches TRAIL_TRIGGER_PCT the stop shifts, for the rest of that position's life, from -STOP_PCT to PROFIT_LOCK_PCT.
@@ -62,23 +63,24 @@ def run_directional():
         "bank":   ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK"],
         "fin":    ["BAJFINANCE", "BAJAJFINSV", "SBILIFE", "HDFCLIFE", "BSE"],
         "it":     ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM"],
-        "auto":   ["M&M", "MARUTI", "TATAMOTORS", "EICHERMOT", "BAJAJ-AUTO"],
+        "auto":   ["M&M", "MARUTI", "TMPV", "EICHERMOT", "BAJAJ-AUTO"],
         "health":["SUNPHARMA","DRREDDY","CIPLA","APOLLOHOSP","MAXHEALTH"],
         "consumer":["ITC","NESTLEIND","TITAN","HINDUNILVR","ETERNAL"],
         "energy":["ONGC","BPCL","RELIANCE","NTPC","POWERGRID"],
-        "metals":["HINDALCO","JSWSTEEL","TATASTEEL","COALINDIA"],
+        "metals":["HINDALCO","JSWSTEEL","TATASTEEL","COALINDIA","NATIONALUM"],
     }                                         # add/remove/comment out symbols or whole baskets here; empty = none
     EXCLUDE = []                             # optional: underlyings to leave out (applied across every basket)
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
     BASKAVG_LONG = 0.1                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
     BASKAVG_SHORT = -0.1                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
-    REL_BUY = {"pct_open": 80.0, "iv": 60.0}        # relative(): BUY needs pct_open at least this; IV (if USE_IV) needs to be at least this too
-    REL_SELL = {"pct_open": 10.0, "iv": 90.0}       # relative(): SELL needs pct_open at or below this; IV (if USE_IV) needs to be at least this (its own threshold, not REL_BUY's)
-    ABS_BUY = {"pct_open": 80.0, "iv": 60.0}        # absolute(): BUY needs pct_open at least this; IV (if USE_IV) needs to be at least this too
-    ABS_SELL = {"pct_open": 10.0, "iv": 90.0}       # absolute(): SELL needs pct_open at or below this; IV (if USE_IV) needs to be at least this (its own threshold, not ABS_BUY's)
+    REL_BUY = {"pct_open": 80.0, "v": 60.0}         # relative(): BUY needs pct_open at least this; the straddle V % from open (if USE_V) needs to be at least this too
+    REL_SELL = {"pct_open": 20.0, "v": 80.0}        # relative(): SELL needs pct_open at or below this; the V % from open (if USE_V) needs to be at least this (its own threshold, not REL_BUY's)
+    ABS_BUY = {"pct_open": 80.0, "v": 60.0}         # absolute(): BUY needs pct_open at least this; the V % from open (if USE_V) needs to be at least this too
+    ABS_SELL = {"pct_open": 10.0, "v": 80.0}        # absolute(): SELL needs pct_open at or below this; the V % from open (if USE_V) needs to be at least this (its own threshold, not ABS_BUY's)
     DIRECTION_MATCH = True                   # True: a BUY needs the REL_BUY/ABS_BUY side everywhere, a SELL the REL_SELL/ABS_SELL side.
                                              # False: either side passes
-    USE_IV = True                            # True: the IV must be high too (against the basket and against its own days). Needs the straddle running and straddle_<day> files. False: % from open only
+    USE_V = True                             # True: the straddle V's % change from the open must be high too (against the basket and against its own days). Needs the straddle running and
+                                             # straddle_<day> files. False: % from open only
     STRADDLE_N = 0                           # straddle_start(STRADDLE_N) when the script starts it itself: 0 = the nearest expiry only (what the IV filters read)
     DAY_EXTREME = True                       # True: filter 0, the latest SIGNAL_BAR close (5min) must be the highest (BUY) or the lowest (SELL) of today's SIGNAL_BAR closes so far (at least 2 bars today). False: off
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
@@ -123,12 +125,12 @@ def run_directional():
         return baskets
 
     BASKETS = make_baskets()
-    if not (BASKAVG_SHORT < BASKAVG_LONG and 0 <= REL_SELL["pct_open"] < REL_BUY["pct_open"] <= 100 and 0 <= ABS_SELL["pct_open"] < ABS_BUY["pct_open"] <= 100 and 0 <= REL_BUY["iv"] <= 100 and 0 <= ABS_BUY["iv"] <= 100
+    if not (BASKAVG_SHORT < BASKAVG_LONG and 0 <= REL_SELL["pct_open"] < REL_BUY["pct_open"] <= 100 and 0 <= ABS_SELL["pct_open"] < ABS_BUY["pct_open"] <= 100 and 0 <= REL_BUY["v"] <= 100 and 0 <= ABS_BUY["v"] <= 100
             and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
             and ((TRAIL_TRIGGER_PCT is None) == (PROFIT_LOCK_PCT is None)) and (TRAIL_TRIGGER_PCT is None or TRAIL_TRIGGER_PCT > 0)
             and (TRAIL_STEP_PCT is None or (TRAIL_TRIGGER_PCT is not None and TRAIL_STEP_PCT > 0))
             and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
-        raise ValueError("REL_SELL/ABS_SELL pct_open must be below REL_BUY/ABS_BUY pct_open, all inside 0 to 100 along with the iv thresholds, TARGET_PCT and STOP_PCT above 0, "
+        raise ValueError("REL_SELL/ABS_SELL pct_open must be below REL_BUY/ABS_BUY pct_open, all inside 0 to 100 along with the v thresholds, TARGET_PCT and STOP_PCT above 0, "
                          "TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
                          "QTY at least 1, ABS_DAYS 0 to 400, EXIT_AT after the window opens, every basket needs at least 3 symbols, "
                          "and TRAIL_STEP_PCT (if set) needs TRAIL_TRIGGER_PCT set too and must be above 0")
@@ -155,15 +157,15 @@ def run_directional():
         except Exception as e:
             print(f"basket {name!r} was not saved ({e}); the ranking still works from BASKETS")
 
-    if USE_IV:
-        if current().get("straddle") is None:                      # the IV of today comes from the straddle series: start it here (it builds the whole day from the candles first, so a late start is fine)
+    if USE_V:
+        if current().get("straddle") is None:                      # the V of today comes from the straddle series: start it here (it builds the whole day from the candles first, so a late start is fine)
             try:
                 straddle_start(STRADDLE_N)
                 print(f"{STRATEGY}: the straddle was not running: straddle_start({STRADDLE_N}) sent from here (it needs the candles WITH the options; it is stopped by the end-of-day step)")
             except Exception as e:
-                print(f"{STRATEGY}: the straddle could not be started ({e}); the IV filters will refuse every entry until it runs: straddle_start({STRADDLE_N}), with the options in the candles")
+                print(f"{STRATEGY}: the straddle could not be started ({e}); the V filters will refuse every entry until it runs: straddle_start({STRADDLE_N}), with the options in the candles")
         else:
-            print(f"{STRATEGY}: the straddle is already running, its IV is used as it is")
+            print(f"{STRATEGY}: the straddle is already running, its V is used as it is")
 
     symbol_of = {}                                                 # token -> the basket entry it trades for
     for name in basket_of:
@@ -216,8 +218,8 @@ def run_directional():
         try:
             for warm_ref in ("open", "vwap"):
                 absolute_warm("pct", LEVEL, sorted(set(symbol_of.values())), ABS_DAYS, ref=warm_ref)
-            if USE_IV:
-                absolute_warm("iv", LEVEL, sorted({n[:-4] for n in symbol_of.values()}), ABS_DAYS)            # the IV is the underlying's
+            if USE_V:
+                absolute_warm("v", LEVEL, sorted({n[:-4] for n in symbol_of.values()}), ABS_DAYS, ref="open")      # the V is the underlying's, as its % change from the open
         except Exception as e:
             print(f"absolute(): the earlier days could not be preloaded ({e}); they are read at the first signal instead")
     for t in symbol_of:                                            # today's candles already built, over the history
@@ -256,11 +258,11 @@ def run_directional():
         return {1, 2} if (strong or weak) else set()
 
     def under_of(symbol):
-        return symbol[:-4]                                         # "SBIN FUT" -> "SBIN": the IV is the underlying's
+        return symbol[:-4]                                         # "SBIN FUT" -> "SBIN": the V is the underlying's
 
-    def ranked_sides(pct, iv, buy, sell):
-        """`pct`, `iv`: no-argument relative()/absolute() calls for pct_open and iv. BUY needs pct_open at least buy["pct_open"]; SELL needs it at or below sell["pct_open"].
-        IV, when USE_IV, is checked per side: BUY needs it at least buy["iv"]; SELL needs it at least sell["iv"] (its own threshold, or buy["iv"] when sell has none)."""
+    def ranked_sides(pct, v, buy, sell):
+        """`pct`, `v`: no-argument relative()/absolute() calls for pct_open and the straddle V % from open. BUY needs pct_open at least buy["pct_open"]; SELL needs it at or below sell["pct_open"].
+        V, when USE_V, is checked per side: BUY needs it at least buy["v"]; SELL needs it at least sell["v"] (its own threshold, or buy["v"] when sell has none)."""
         with exec_ctx:                                             # the call reads the candles table; a listener thread needs the terminal's query context for that
             result = pct()
         if result[1] < 0:                                          # (the second item is -1 when it cannot be told)
@@ -271,13 +273,13 @@ def run_directional():
         sides = sides_of(p >= buy["pct_open"], p <= sell["pct_open"])
         if not sides:
             return set()
-        if USE_IV:
+        if USE_V:
             with exec_ctx:
-                result = iv()
+                result = v()
             if result[1] < 0:                                      # cannot tell: no side
                 return set()
-            iv_p = result.pctile
-            sides = ({1} if 1 in sides and iv_p >= buy["iv"] else set()) | ({2} if 2 in sides and iv_p >= sell.get("iv", buy["iv"]) else set())
+            v_p = result.pctile
+            sides = ({1} if 1 in sides and v_p >= buy["v"] else set()) | ({2} if 2 in sides and v_p >= sell.get("v", buy["v"]) else set())
         return sides
 
     def basket_avg_sides(symbol):
@@ -292,19 +294,19 @@ def run_directional():
         return sides_of(avg >= BASKAVG_LONG, avg <= BASKAVG_SHORT)
 
     def relative_sides(symbol):
-        """Filter 2, relative(): the ranking among the OTHER symbols of ITS basket, for pct_open and iv (if USE_IV), against REL_BUY / REL_SELL."""
+        """Filter 2, relative(): the ranking among the OTHER symbols of ITS basket, for pct_open and the straddle V % from open (if USE_V), against REL_BUY / REL_SELL."""
         members = BASKETS[basket_of[symbol]]
         return ranked_sides(
             pct=lambda: relative("pct", LEVEL, symbol, members, ref="open"),
-            iv=lambda: relative("iv", LEVEL, under_of(symbol), [under_of(m) for m in members]),
+            v=lambda: relative("v", LEVEL, under_of(symbol), [under_of(m) for m in members], ref="open"),
             buy=REL_BUY, sell=REL_SELL,
         )
 
     def absolute_sides(symbol):
-        """Filter 3, absolute(): the ranking among the same minute of its previous ABS_DAYS trading days, for pct_open and iv (if USE_IV), against ABS_BUY / ABS_SELL."""
+        """Filter 3, absolute(): the ranking among the same minute of its previous ABS_DAYS trading days, for pct_open and the straddle V % from open (if USE_V), against ABS_BUY / ABS_SELL."""
         return ranked_sides(
             pct=lambda: absolute("pct", LEVEL, symbol, ABS_DAYS, ref="open"),
-            iv=lambda: absolute("iv", LEVEL, under_of(symbol), ABS_DAYS),
+            v=lambda: absolute("v", LEVEL, under_of(symbol), ABS_DAYS, ref="open"),
             buy=ABS_BUY, sell=ABS_SELL,
         )
 
@@ -375,18 +377,20 @@ def run_directional():
             leave(token, f"{why} (tick)")
 
     def on_tick(update, is_replay):
-        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python)."""
-        ch = update.added(["token", "ltp"])
-        if ch is None:
-            return
-        for tok, ltp in zip(ch["token"], ch["ltp"]):
-            tok = int(tok)
-            pos = position.get(tok)
-            if pos is None or pos["state"] != "open" or ltp <= 0:
+        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python).
+        fo_market_data is a last_by("PF") table: a token's first tick arrives as an added row, every one after that as a
+        modified row (same row, updated in place) -- both must be read or only the very first tick of each position is seen."""
+        for ch in (update.added(["token", "ltp"]), update.modified(["token", "ltp"])):
+            if ch is None:
                 continue
-            div = divisor_of(tok)
-            if div:
-                tick_exit(tok, pos, float(ltp) / float(div))
+            for tok, ltp in zip(ch["token"], ch["ltp"]):
+                tok = int(tok)
+                pos = position.get(tok)
+                if pos is None or pos["state"] != "open" or ltp <= 0:
+                    continue
+                div = divisor_of(tok)
+                if div:
+                    tick_exit(tok, pos, float(ltp) / float(div))
 
     tick_jobs = queue.Queue()                                      # (token, add?) jobs for the one worker thread: Deephaven refuses an input-table edit made from inside a listener or a callback
 
