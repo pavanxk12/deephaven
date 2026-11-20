@@ -10,8 +10,11 @@
              "pct_open" / "pct_vwap"   shorthands for series "pct" with ref "open" / "vwap"
              "volume"    relative volume (rvol): today's CUMULATIVE volume up to this minute, ranked against the same minute of the previous n days (no ref: it is
                          always the plain running total, never a percent change)
+             "turnover"  relative turnover: today's CUMULATIVE traded value up to this minute (sum of typical price (O+H+L+C)/4 x volume, bar by bar), ranked against the
+                         same minute of the previous n days (no ref: same running total, never a percent change). The volume-weighted sibling of "volume": a stock that
+                         is both busier AND moving (price up as well as volume up) stands out more here than in plain "volume".
     ref      "open"        the open of the period (the level's: day, week or month)
-             "vwap"        the VWAP since that open (typical price (H+L+C)/3 x volume), prices only
+             "vwap"        the VWAP since that open (typical price (O+H+L+C)/4 x volume), prices only
              "prev_close"  the last value of the previous trading day
              "10min"       N minutes ago ("1min" ... "389min"; a bare number is minutes too)
              "09:30"       a fixed time of the day, exchange time: the value at that minute (NaN until that time has come)
@@ -40,7 +43,7 @@ from datetime import date, datetime, timedelta
 
 import numpy as np
 
-SERIES = ("pct", "iv", "v", "pct_open", "pct_vwap", "volume")   # pct_open / pct_vwap are "pct" with ref="open" / "vwap"; "volume" is relative volume (rvol), no ref
+SERIES = ("pct", "iv", "v", "pct_open", "pct_vwap", "volume", "turnover")   # pct_open / pct_vwap are "pct" with ref="open" / "vwap"; "volume" and "turnover" take no ref
 LEVELS = ("intraday", "intraweek", "intramonth")
 NAN = float("nan")
 _FUT = re.compile(r"^(?P<und>.+?) (?P<exp>\d{2}[A-Z]{3}\d{2}) FUT$")
@@ -150,7 +153,7 @@ def build_day(slot: np.ndarray, o, h, l, c, v, slots: int, max_age: int) -> "Day
     raw[slot] = c                                                   # the last bar of a minute wins
     pv = np.zeros(slots)
     vol = np.zeros(slots)
-    np.add.at(pv, slot, (h + l + c) / 3.0 * v)
+    np.add.at(pv, slot, (o + h + l + c) / 4.0 * v)
     np.add.at(vol, slot, v)
     return Day(close=carry(raw, max_age).astype(np.float32), cum_pv=np.cumsum(pv).astype(np.float32), cum_v=np.cumsum(vol).astype(np.float32),
                open=float(o[0]), pv=float(pv.sum()), v=float(vol.sum()), last=float(c[-1]))
@@ -678,11 +681,11 @@ class AbsoluteService:
                 raise ValueError(f"{'an IV' if series == 'iv' else 'the straddle V'} has no volume, so no VWAP; use ref='open', 'prev_close', '10min' or 'HH:MM' "
                                   f"(or no ref for the {'IV' if series == 'iv' else 'V'} itself)")
             return series, spec
-        if series == "volume":
+        if series in ("volume", "turnover"):
             if ref is not None:
-                raise ValueError("series 'volume' has no reference point (it is always today's running total, ranked against the same minute of earlier days); call "
-                                  "absolute('volume', level, symbol, n) with no ref=")
-            return "volume", None
+                raise ValueError(f"series {series!r} has no reference point (it is always today's running total, ranked against the same minute of earlier days); call "
+                                  f"absolute({series!r}, level, symbol, n) with no ref=")
+            return series, None
         raise ValueError(f"series must be one of {SERIES}, got {series!r}")
 
     def _obj(self, kind: str, spec, d: str, today: str):
@@ -717,8 +720,8 @@ class AbsoluteService:
         """The series at slot m of day d, given that day's data (None = none): the IV itself (no reference) or the percent change of the value from its reference point."""
         if obj is None:
             return NAN
-        if kind == "volume":
-            v = float(obj.cum_v[m])
+        if kind in ("volume", "turnover"):
+            v = float(obj.cum_v[m] if kind == "volume" else obj.cum_pv[m])
             return v if v == v else NAN
         arr = obj.iv if kind in ("iv", "v") else obj.close
         v = float(arr[m])

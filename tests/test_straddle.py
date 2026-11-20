@@ -1,8 +1,9 @@
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from algo.series.straddle import SeriesDef, StraddleConfig, StraddleEngine, build_series
 
@@ -190,35 +191,124 @@ def test_the_engine_prices_the_atm_strike_from_the_spot():
     assert r["Fut"] == 1000.0 and r["ATMStrike"] == 1000.0 and r["V"] == 45.0
 
 
-# ---- IV = V / Synthetic * sqrt(max(dte, 1)) * 100 ------------------------------------------------------------------------------
-def test_iv_is_v_over_synthetic_times_root_of_the_days_left_times_100():
-    import math
+# ---- IV = whole-chain, CBOE-style VIX synthetic-forward IV ---------------------------------------------------------------------
+def feed_bidask(eng, quotes, key=("NIFTY", "2030-01-30")):
+    """quotes: {strike index: ((call_bid, call_ask), (put_bid, put_ask))}"""
+    d = eng.defs[key]
+    toks, bids, asks = [], [], []
+    for i, ((cb, ca), (pb, pa)) in quotes.items():
+        toks += [d.ce[i], d.pe[i]]
+        bids += [cb, pb]
+        asks += [ca, pa]
+    eng.set_bidasks(toks, bids, asks, NOW)
+
+
+def flat_chain(calls_puts):
+    """{strike index: (call_mid, put_mid)} -> tight (bid == ask == mid) quotes for feed_bidask."""
+    return {i: ((float(c), float(c)), (float(p), float(p))) for i, (c, p) in calls_puts.items()}
+
+
+def test_iv_is_nan_without_any_bidask():
     e = engine()
-    feed(e, 25000.0, {4: (120, 130), 5: (100, 90), 6: (140, 150)})
-    (row,) = e.sample(WHEN, NOW)                                                        # 2030-01-10, expiry 2030-01-30: 20 days
+    feed(e, 25000.0, {4: (120, 130), 5: (100, 90), 6: (140, 150)})         # last-trade prices only, no bid/ask fed
+    (row,) = e.sample(WHEN, NOW)
     r = dict(zip(StraddleEngine.COLUMNS, row))
     assert StraddleEngine.COLUMNS[-1] == "IV" and len(row) == len(StraddleEngine.COLUMNS)
-    assert r["IV"] == 190.0 / 25010.0 * math.sqrt(20) * 100
+    assert np.isnan(r["IV"])
 
 
-def test_on_the_expiry_day_the_days_left_count_as_one():
-    from algo.series.straddle import implied_vol
-    assert implied_vol(190.0, 25010.0, 0) == implied_vol(190.0, 25010.0, 1) == 190.0 / 25010.0 * 100
-    assert implied_vol(190.0, 25010.0, 4) == 190.0 / 25010.0 * 2 * 100
-    assert implied_vol(190.0, 25010.0, -3) == 190.0 / 25010.0 * 100                    # never below one day
+def test_iv_is_computed_once_the_chain_has_bidask():
+    e = engine()
+    feed(e, 25000.0, {5: (100, 90)})
+    feed_bidask(e, flat_chain({0: (520, 10), 1: (420, 15), 2: (320, 25), 3: (220, 45), 4: (120, 70),
+                                5: (95, 95), 6: (70, 120), 7: (45, 220), 8: (25, 320), 9: (15, 420), 10: (10, 520)}))
+    (row,) = e.sample(WHEN, NOW)
+    r = dict(zip(StraddleEngine.COLUMNS, row))
+    assert np.isfinite(r["IV"]) and r["IV"] > 0
+
+
+def test_iv_falls_as_expiry_approaches_with_the_same_quotes():
+    e = engine()
+    chain = flat_chain({0: (520, 10), 1: (420, 15), 2: (320, 25), 3: (220, 45), 4: (120, 70),
+                         5: (95, 95), 6: (70, 120), 7: (45, 220), 8: (25, 320), 9: (15, 420), 10: (10, 520)})
+    feed(e, 25000.0, {5: (100, 90)})
+    feed_bidask(e, chain)
+    first = dict(zip(StraddleEngine.COLUMNS, e.sample(WHEN, NOW)[0]))["IV"]
+
+    later = datetime(2030, 1, 29, 10, 0, 0, tzinfo=IST)                   # one day before expiry: less variance to annualise
+    for tok in list(e.px):
+        e.px[tok] = (e.px[tok][0], later.timestamp())
+    for tok in list(e.bidask):
+        b, a, _ = e.bidask[tok]
+        e.bidask[tok] = (b, a, later.timestamp())
+    last = dict(zip(StraddleEngine.COLUMNS, e.sample(later, later.timestamp())[0]))["IV"]
+    assert np.isfinite(first) and np.isfinite(last)
+
+
+def test_a_wide_spread_quote_is_spline_repaired_or_dropped():
+    from algo.series.straddle import repair_quotes
+    strikes = np.array([100.0, 110.0, 120.0, 130.0, 140.0])
+    bid = np.array([50.0, 40.0, 1.0, 20.0, 10.0])          # strike 120's spread is way too wide
+    ask = np.array([51.0, 41.0, 39.0, 21.0, 11.0])
+    mid = (bid + ask) / 2.0
+    out, keep = repair_quotes(strikes, bid, ask, mid, max_spread_pct=0.10, min_knots=3)
+    assert keep.tolist() == [True, True, True, True, True]                # inside the good knots' range: repaired, not dropped
+    assert out[2] != mid[2]
+
+
+def test_a_bad_quote_outside_the_good_range_is_dropped_not_repaired():
+    from algo.series.straddle import repair_quotes
+    strikes = np.array([100.0, 110.0, 120.0])
+    bid = np.array([1.0, 40.0, 30.0])                       # strike 100 (the edge) has the bad spread
+    ask = np.array([30.0, 41.0, 31.0])
+    mid = (bid + ask) / 2.0
+    out, keep = repair_quotes(strikes, bid, ask, mid, max_spread_pct=0.10, min_knots=2)
+    assert keep.tolist() == [False, True, True]
+
+
+def test_atm_strike_is_the_largest_at_or_below_the_forward():
+    from algo.series.straddle import atm_strike
+    strikes = np.array([24800.0, 24900.0, 25000.0, 25100.0])
+    assert atm_strike(strikes, 25050.0) == 25000.0
+    assert atm_strike(strikes, 24850.0) == 24800.0
+    assert atm_strike(strikes, 24000.0) == 24800.0                       # below every strike: falls back to the lowest
+
+
+def test_strike_weights_are_half_the_neighbour_gap_full_gap_at_the_ends():
+    from algo.series.straddle import strike_weights
+    w = strike_weights(np.array([100.0, 120.0, 150.0, 160.0]))
+    assert w.tolist() == [20.0, 25.0, 20.0, 10.0]
+
+
+def test_synthetic_forward_averages_the_n_tightest_call_put_gaps():
+    from algo.series.straddle import synthetic_forward
+    strikes = np.array([100.0, 110.0, 120.0])
+    call_mid = np.array([15.0, 8.0, 3.0])
+    put_mid = np.array([5.0, 8.0, 15.0])                                  # strike 110: C - P = 0, the tightest gap
+    f = synthetic_forward(strikes, call_mid, put_mid, r=0.0, T=1.0, n=1)
+    assert f == 110.0
+
+
+def test_vix_iv_matches_the_formula_computed_by_hand():
+    import math
+    from algo.series.straddle import strike_weights, vix_iv
+    strikes = np.array([100.0, 120.0])
+    q = np.array([5.0, 5.0])
+    w = strike_weights(strikes)
+    iv = vix_iv(strikes, q, w, r=0.0, T=1.0, forward=110.0, k0=100.0)
+    term = (20.0 / 100.0 ** 2 * 5.0) + (20.0 / 120.0 ** 2 * 5.0)
+    sigma2 = 2.0 * term - (110.0 / 100.0 - 1.0) ** 2
+    assert iv == pytest.approx(100.0 * math.sqrt(sigma2))
+
+
+def test_time_to_expiry_is_minutes_to_settle_over_minutes_in_a_year():
+    from datetime import time as dtime
+    from algo.series.straddle import time_to_expiry
+    now = datetime(2030, 1, 10, 15, 0, 0, tzinfo=IST)
+    t = time_to_expiry(now, date(2030, 1, 10), settle=dtime(15, 30))      # same day, 30 minutes left
+    assert t == pytest.approx(30.0 / 525_600.0)
 
 
 def test_iv_is_nan_when_the_synthetic_price_is_not_positive():
     from algo.series.straddle import implied_vol
     assert np.isnan(implied_vol(10.0, 0.0, 5)) and np.isnan(implied_vol(10.0, -5.0, 5)) and np.isnan(implied_vol(10.0, float("nan"), 5))
-
-
-def test_the_days_left_follow_the_sample_day_not_a_fixed_date():
-    e = engine()
-    feed(e, 25000.0, {4: (120, 130), 5: (100, 90), 6: (140, 150)})
-    first = dict(zip(StraddleEngine.COLUMNS, e.sample(WHEN, NOW)[0]))["IV"]
-    later = datetime(2030, 1, 29, 10, 0, 0, tzinfo=IST)                                  # one day before the expiry
-    for tok in list(e.px):
-        e.px[tok] = (e.px[tok][0], later.timestamp())
-    last = dict(zip(StraddleEngine.COLUMNS, e.sample(later, later.timestamp())[0]))["IV"]
-    assert last < first and abs(last - 190.0 / 25010.0 * 100) < 1e-9

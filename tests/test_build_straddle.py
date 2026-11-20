@@ -62,7 +62,7 @@ def test_a_day_gives_the_straddle_table_columns_with_iv_and_a_date(tmp_path, roo
     d = t.slice(0, 1).to_pylist()[0]
     assert (d["Symbol"], d["Expiry"], d["Date"], d["Fut"], d["ATMStrike"], d["MinStrike"], d["V"]) == ("NIFTY", "2026-01-27", "2026-01-05", 25000.0, 25000.0, 25000.0, 190.0)
     assert d["Synthetic"] == 25000 + 100 - 90 and d["Time"] == "09:16:02"                   # the 09:15 bar closes at 09:16; sampled 2 seconds after
-    assert d["IV"] == 190.0 / 25010.0 * math.sqrt(22) * 100                                   # 5 Jan to 27 Jan is 22 days
+    assert math.isnan(d["IV"])            # whole-chain VIX IV needs bid/ask depth, which this offline 1-minute OHLC history has none of
     assert t.num_rows == 11                                                                   # one point a minute: the bars 09:15 to 09:25 close at 09:16 to 09:26
 
 
@@ -92,7 +92,9 @@ def test_the_rows_are_the_ones_the_live_engine_makes_for_the_same_bars(tmp_path,
         want += [dict(zip(StraddleEngine.COLUMNS, r)) for r in eng.sample(when, when.timestamp())]
     assert len(got) == len(want) == 11
     for g, w in zip(got, want):
-        assert {k: v for k, v in g.items() if k != "Date"} == w
+        g = {k: v for k, v in g.items() if k != "Date"}
+        assert math.isnan(g["IV"]) and math.isnan(w["IV"])
+        assert {k: v for k, v in g.items() if k != "IV"} == {k: v for k, v in w.items() if k != "IV"}
 
 
 def test_a_zip_gives_the_same_table_as_the_csv(tmp_path, root):
@@ -104,7 +106,10 @@ def test_a_zip_gives_the_same_table_as_the_csv(tmp_path, root):
     a, b = tmp_path / "a", tmp_path / "b"
     tool.convert_file(csv, str(a), tool.Contracts(), CFG)
     tool.convert_file(str(z), str(b), tool.Contracts(), CFG)
-    assert pq.read_table(str(a / "straddle_2026-01-05.parquet")).equals(pq.read_table(str(b / "straddle_2026-01-05.parquet")))
+    ta = pq.read_table(str(a / "straddle_2026-01-05.parquet"))
+    tb = pq.read_table(str(b / "straddle_2026-01-05.parquet"))
+    assert ta.drop(["IV"]).equals(tb.drop(["IV"]))
+    assert all(v is None or math.isnan(v) for v in ta.column("IV").to_pylist() + tb.column("IV").to_pylist())
 
 
 def test_weekly_options_use_the_monthly_future_and_the_nearest_expiry_is_chosen(tmp_path):

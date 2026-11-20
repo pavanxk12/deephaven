@@ -10,6 +10,7 @@ import math
 import time
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from datetime import time as dtime
 
 import numpy as np
 import pandas as pd
@@ -30,6 +31,10 @@ class StraddleConfig:
     min_search: int = 2                         # search +/- this many strikes around the previous minimum
     max_age_s: float | None = 180               # ignore a price older than this (None = no guard); at least 3 sample periods
     offset_s: int = 2                           # sample this long after each sample boundary
+    risk_free_rate: float = 0.07                # R in the VIX-style IV below (annualised, continuously compounded)
+    vix_n_forward: int = 4                      # average the synthetic forward over this many least-|C-P| strikes (3-5)
+    vix_max_spread_pct: float = 0.30            # reject a quote whose (ask-bid)/mid exceeds this
+    vix_min_knots: int = 3                      # need at least this many good quotes to spline-repair a rejected one
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,103 @@ def implied_vol(v: float, synthetic: float, dte: int) -> float:
     if not synthetic > 0:
         return float("nan")
     return float(v / (synthetic * math.sqrt(max(dte, 1))) * 100.0)
+
+
+# ---- CBOE-style VIX synthetic-forward IV, computed over the whole option chain --------------------------------
+# F from matched call/put mid-prices nearest the money, K0 the strike at/below F, a strike-weighted variance over
+# OTM puts/calls either side of K0, with the chain's quotes cleaned up before any of that runs:
+#  - a quote whose (ask-bid)/mid spread is too wide, or missing, is replaced by a natural cubic spline through the
+#    surviving quotes (needs >= `vix_min_knots`), or dropped if it falls outside their strike range.
+# Pure numpy / stdlib math: no scipy dependency added for the spline.
+
+def time_to_expiry(now: datetime, expiry: date, settle: dtime = dtime(15, 30)) -> float:
+    """Years to expiry, minute-precision: (now -> `settle` on `expiry`) / 525,600. This is the same quantity as the
+    spec's (M_today + M_between + M_expiry_day) decomposition -- one timestamp difference covers all three terms,
+    same-day expiry included."""
+    close = datetime.combine(expiry, settle, tzinfo=now.tzinfo)
+    minutes = (close - now).total_seconds() / 60.0
+    return max(minutes, 1.0) / 525_600.0
+
+
+def _natural_cubic_spline(x: np.ndarray, y: np.ndarray):
+    """Natural cubic spline through sorted, distinct knots (x, y). Returns evaluate(query) -> values."""
+    n = len(x) - 1
+    h = np.diff(x)
+    alpha = np.zeros(n + 1)
+    alpha[1:n] = 3 * ((y[2:n + 1] - y[1:n]) / h[1:n] - (y[1:n] - y[:n - 1]) / h[:n - 1])
+    l = np.ones(n + 1)
+    mu = np.zeros(n + 1)
+    z = np.zeros(n + 1)
+    for i in range(1, n):
+        l[i] = 2 * (x[i + 1] - x[i - 1]) - h[i - 1] * mu[i - 1]
+        mu[i] = h[i] / l[i]
+        z[i] = (alpha[i] - h[i - 1] * z[i - 1]) / l[i]
+    c = np.zeros(n + 1)
+    b = np.zeros(n)
+    d = np.zeros(n)
+    for j in range(n - 1, -1, -1):
+        c[j] = z[j] - mu[j] * c[j + 1]
+        b[j] = (y[j + 1] - y[j]) / h[j] - h[j] * (c[j + 1] + 2 * c[j]) / 3
+        d[j] = (c[j + 1] - c[j]) / (3 * h[j])
+    a = y[:n]
+
+    def evaluate(xq: np.ndarray) -> np.ndarray:
+        xq = np.asarray(xq, dtype=np.float64)
+        idx = np.clip(np.searchsorted(x, xq, side="right") - 1, 0, n - 1)
+        dx = xq - x[idx]
+        return a[idx] + b[idx] * dx + c[idx] * dx ** 2 + d[idx] * dx ** 3
+
+    return evaluate
+
+
+def repair_quotes(strikes: np.ndarray, bid: np.ndarray, ask: np.ndarray, mid: np.ndarray,
+                   max_spread_pct: float, min_knots: int) -> tuple[np.ndarray, np.ndarray]:
+    """Reject a quote that is missing or whose (ask-bid)/mid exceeds `max_spread_pct`; replace a rejected one by
+    spline over the surviving ("good") knots when there are at least `min_knots`, else drop it (also dropped if
+    its strike falls outside the good knots' range, where the spline doesn't apply). Returns (repaired mid, keep)."""
+    good = (np.isfinite(mid) & (mid > 0) & np.isfinite(bid) & np.isfinite(ask)
+            & ((ask - bid) / np.maximum(mid, 1e-9) <= max_spread_pct))
+    out = mid.copy()
+    if good.sum() < min_knots:
+        return out, good
+    order = np.argsort(strikes[good])
+    spline = _natural_cubic_spline(strikes[good][order], mid[good][order])
+    lo, hi = strikes[good].min(), strikes[good].max()
+    repaired = ~good & (strikes >= lo) & (strikes <= hi)
+    out[repaired] = spline(strikes[repaired])
+    return out, good | repaired
+
+
+def synthetic_forward(strikes: np.ndarray, call_mid: np.ndarray, put_mid: np.ndarray, r: float, T: float, n: int) -> float:
+    """F, averaged over the `n` strikes with the smallest |C-P| gap: mean(Kj + e^(rT) * (C(Kj) - P(Kj)))."""
+    d = call_mid - put_mid
+    idx = np.argsort(np.abs(d))[:max(1, min(n, len(d)))]
+    return float(np.mean(strikes[idx] + math.exp(r * T) * d[idx]))
+
+
+def atm_strike(strikes: np.ndarray, forward: float) -> float:
+    """K0: the largest strike at or below the synthetic forward."""
+    below = strikes[strikes <= forward]
+    return float(below.max()) if below.size else float(strikes.min())
+
+
+def strike_weights(strikes: np.ndarray) -> np.ndarray:
+    """DeltaKi: half the gap to each neighbour, the gap itself at the two ends."""
+    n = len(strikes)
+    w = np.empty(n)
+    if n == 1:
+        return np.zeros(1)
+    w[0] = strikes[1] - strikes[0]
+    w[-1] = strikes[-1] - strikes[-2]
+    w[1:-1] = (strikes[2:] - strikes[:-2]) / 2.0
+    return w
+
+
+def vix_iv(strikes: np.ndarray, q: np.ndarray, weights: np.ndarray, r: float, T: float, forward: float, k0: float) -> float:
+    """100 * sqrt(sigma^2), the CBOE VIX formula: sigma^2 = (2/T) sum(DeltaKi/Ki^2 * e^(rT) * Q(Ki)) - (1/T)(F/K0 - 1)^2."""
+    term = np.sum((weights / strikes ** 2) * math.exp(r * T) * q)
+    sigma2 = (2.0 / T) * term - (1.0 / T) * (forward / k0 - 1.0) ** 2
+    return float(100.0 * math.sqrt(max(sigma2, 0.0)))
 
 
 def reference_future(fut_expiries: list, option_expiry) -> int:
@@ -134,6 +236,7 @@ class StraddleEngine:
     def __init__(self, defs: dict, cfg: StraddleConfig):
         self.defs, self.cfg = defs, cfg
         self.px: dict[int, tuple[float, float]] = {}        # token -> (price, timestamp)
+        self.bidask: dict[int, tuple[float, float, float]] = {}   # token -> (bid, ask, timestamp), for the VIX IV
         self._state: dict[tuple, _State] = {}
         self.needed = {t for d in defs.values() for t in (d.ref, *d.ce, *d.pe)}
         self._mask = np.zeros(max(self.needed, default=0) + 1, dtype=bool)         # dense lookup: is this token a leg of some series?
@@ -153,6 +256,16 @@ class StraddleEngine:
         ok[ok] &= self._mask[tokens[ok]]
         self.px.update(zip(tokens[ok].tolist(), zip(prices[ok].tolist(), itertools.repeat(ts))))
 
+    def set_bidasks(self, tokens, bids, asks, ts: float) -> None:
+        """Best bid/ask for many tokens at once, same filtering rules as `set_prices` (plus ask >= bid)."""
+        tokens = np.asarray(tokens, dtype=np.int64)
+        bids = np.asarray(bids, dtype=np.float64)
+        asks = np.asarray(asks, dtype=np.float64)
+        ok = (np.isfinite(bids) & (bids > 0) & np.isfinite(asks) & (asks >= bids)
+              & (tokens >= 0) & (tokens < len(self._mask)))
+        ok[ok] &= self._mask[tokens[ok]]
+        self.bidask.update(zip(tokens[ok].tolist(), zip(bids[ok].tolist(), asks[ok].tolist(), itertools.repeat(ts))))
+
     def sample(self, when: datetime, now_ts: float) -> list[tuple]:
         """Run every series once for time `when`. Returns the output rows (series that could not be computed are skipped)."""
         day, stamp = when.date(), when.strftime("%H:%M:%S")
@@ -162,7 +275,7 @@ class StraddleEngine:
             if st is None or st.day != day:
                 st = self._state[key] = _State(day)
             try:
-                row = self._sample_one(key, d, st, stamp, now_ts)
+                row = self._sample_one(key, d, st, stamp, now_ts, when)
             except Exception as e:                       # one broken series must not stop the others
                 _log.warning("%s failed: %r", key, e)
                 continue
@@ -178,7 +291,44 @@ class StraddleEngine:
             return None
         return v[0]
 
-    def _sample_one(self, key, d: SeriesDef, st: _State, stamp: str, now_ts: float):
+    def _ba(self, token: int, now_ts: float) -> tuple[float, float]:
+        v = self.bidask.get(token)
+        if v is None or (self.cfg.max_age_s is not None and now_ts - v[2] > self.cfg.max_age_s):
+            return float("nan"), float("nan")
+        return v[0], v[1]
+
+    def _vix_iv(self, d: SeriesDef, expiry: date, when: datetime, now_ts: float) -> float:
+        """The whole-chain, CBOE-style VIX IV for one series: see the functions above `reference_future`."""
+        cfg = self.cfg
+        strikes = d.strikes
+        ba = [self._ba(t, now_ts) for t in d.ce]
+        cbid, cask = (np.array(x) for x in zip(*ba)) if ba else (np.array([]), np.array([]))
+        ba = [self._ba(t, now_ts) for t in d.pe]
+        pbid, pask = (np.array(x) for x in zip(*ba)) if ba else (np.array([]), np.array([]))
+        cmid, pmid = (cbid + cask) / 2.0, (pbid + pask) / 2.0
+
+        fwd_ok = np.isfinite(cmid) & np.isfinite(pmid)
+        if not fwd_ok.any():
+            return float("nan")
+        T = time_to_expiry(when, expiry)
+        r = cfg.risk_free_rate
+        F = synthetic_forward(strikes[fwd_ok], cmid[fwd_ok], pmid[fwd_ok], r, T, cfg.vix_n_forward)
+        k0 = atm_strike(strikes, F)
+        i0 = int(np.argmin(np.abs(strikes - k0)))
+
+        q = np.where(strikes < k0, pmid, cmid)
+        qbid = np.where(strikes < k0, pbid, cbid)
+        qask = np.where(strikes < k0, pask, cask)
+        q[i0], qbid[i0], qask[i0] = (cmid[i0] + pmid[i0]) / 2.0, (cbid[i0] + pbid[i0]) / 2.0, (cask[i0] + pask[i0]) / 2.0
+
+        q, keep = repair_quotes(strikes, qbid, qask, q, cfg.vix_max_spread_pct, cfg.vix_min_knots)
+        if keep.sum() < 2:
+            return float("nan")
+        order = np.argsort(strikes[keep])
+        ks, qs = strikes[keep][order], q[keep][order]
+        return vix_iv(ks, qs, strike_weights(ks), r, T, F, k0)
+
+    def _sample_one(self, key, d: SeriesDef, st: _State, stamp: str, now_ts: float, when: datetime):
         cfg = self.cfg
         get = lambda tok: self._price(tok, now_ts)       # noqa: E731
         fut = get(d.ref)                                   # the future, or the spot when the symbol has no future
@@ -233,7 +383,7 @@ class StraddleEngine:
         st.altcum += alt_cost
 
         synth = get(d.ce[best_i]) - get(d.pe[best_i]) + float(strikes[best_i])
-        iv = implied_vol(best_v, synth, (date.fromisoformat(key[1]) - st.day).days)
+        iv = self._vix_iv(d, date.fromisoformat(key[1]), when, now_ts)
         return (stamp, key[0], key[1], float(fut),
                 float(strikes[atm]), float(strad(atm)), float(strikes[best_i]), float(best_v),
                 float(cost), float(st.cum), float(best_v + st.cum),
@@ -302,6 +452,11 @@ class Straddle(Plugin):
         self._writer = DynamicTableWriter(dict(zip(StraddleEngine.COLUMNS, (s, s, s, d, d, d, d, d, d, d, d, d, d, d, d, d))))
         app.publish("straddle_series", self._writer.table)
 
+        opt_tokens = {t for d in defs.values() for t in (*d.ce, *d.pe)}
+        divisor = getattr(app.master, "divisor_of", {})
+        self._scale_of = {t: 1.0 / divisor.get(t, 1.0) for t in opt_tokens}    # feed price x scale -> rupees, for the VIX IV's bid/ask
+        self.listen(app.table(mk.feed), self._on_feed, replay=False)
+
         self.listen(app.table("candles"), self._on_candles, replay=False)        # live prices first, as before the backfill
         self._backfill(app.table("candles"))
         self.spawn(self._loop)
@@ -320,6 +475,19 @@ class Straddle(Plugin):
         if ch is None:
             return
         self.engine.set_prices(ch["token"], ch["Close"], time.time())           # drops other tokens and unusable prices
+
+    def _on_feed(self, update, is_replay) -> None:
+        """Best bid/ask of the option legs, straight from the live feed (`candles` carries no depth): only for the
+        VIX IV, scaled to rupees per contract the same way `candles.py` scales `ltp` (1/Divisor, per token)."""
+        now = time.time()
+        for ch in (update.added(["token", "b0p", "a0p"]), update.modified(["token", "b0p", "a0p"])):
+            if ch is None:
+                continue
+            tok = np.asarray(ch["token"], dtype=np.int64)
+            scale = np.fromiter((self._scale_of.get(t, 1.0) for t in tok.tolist()), dtype=np.float64, count=len(tok))
+            bid = np.asarray(ch["b0p"], dtype=np.float64) * scale
+            ask = np.asarray(ch["a0p"], dtype=np.float64) * scale
+            self.engine.set_bidasks(tok, bid, ask, now)
 
     def _backfill(self, candles) -> None:
         """Replay the candles so far. The engine does the filtering (only the legs of our series), so only those rows are

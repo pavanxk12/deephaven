@@ -177,7 +177,7 @@ def folder_manifest(out_dir: str, src_dir: str, failed: list, holidays: list) ->
     for f in files:
         try:
             with open(f[:-len(".parquet")] + ".meta.json", encoding="utf-8") as m:
-                src = json.load(m).get("built_by", "unknown").split(";")[0]
+                src = (json.load(m).get("built_by") or "unknown").split(";")[0]
         except (OSError, ValueError):
             src = "unknown"
         sources.setdefault(src, []).append(os.path.basename(f)[8:18])

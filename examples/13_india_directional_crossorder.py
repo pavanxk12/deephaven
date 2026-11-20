@@ -71,11 +71,11 @@ def run_directional():
     }                                         # add/remove/comment out symbols or whole baskets here; empty = none
     EXCLUDE = []                             # optional: underlyings to leave out (applied across every basket)
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
-    BASKAVG_LONG = 0.1                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
-    BASKAVG_SHORT = -0.1                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
-    REL_BUY = {"pct_open": 80.0, "v": 60.0}         # relative(): BUY needs pct_open at least this; the straddle V % from open (if USE_V) needs to be at least this too
+    BASKAVG_LONG = 0.2                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
+    BASKAVG_SHORT = -0.2                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
+    REL_BUY = {"pct_open": 80.0, "v": 70.0}         # relative(): BUY needs pct_open at least this; the straddle V % from open (if USE_V) needs to be at least this too
     REL_SELL = {"pct_open": 20.0, "v": 80.0}        # relative(): SELL needs pct_open at or below this; the V % from open (if USE_V) needs to be at least this (its own threshold, not REL_BUY's)
-    ABS_BUY = {"pct_open": 80.0, "v": 60.0}         # absolute(): BUY needs pct_open at least this; the V % from open (if USE_V) needs to be at least this too
+    ABS_BUY = {"pct_open": 80.0, "v": 70.0}         # absolute(): BUY needs pct_open at least this; the V % from open (if USE_V) needs to be at least this too
     ABS_SELL = {"pct_open": 10.0, "v": 80.0}        # absolute(): SELL needs pct_open at or below this; the V % from open (if USE_V) needs to be at least this (its own threshold, not ABS_BUY's)
     DIRECTION_MATCH = True                   # True: a BUY needs the REL_BUY/ABS_BUY side everywhere, a SELL the REL_SELL/ABS_SELL side.
                                              # False: either side passes

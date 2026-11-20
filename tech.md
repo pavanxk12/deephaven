@@ -118,10 +118,16 @@ strike ...; `tokens_for(symbols, kind, expiries)` selects instruments. Cached as
 **Candles** (`algo/data/candles.py`). The listener gets each batch of changed feed rows; numpy cleans and scales the batch in one pass (drops NaN, inf,
 null, zero or negative prices, negative volume, unparseable times); a `CandleAggregator` keeps one open bar per token (~230 B) and emits **only closed
 bars** after a 10 s grace, on epoch-aligned buckets (30s / 1min / 5min / 15min). A bar is written as one row of numbers to a `DynamicTableWriter`; the
-`Symbol` text is joined from a small static table, not stored per row. Row = 56 bytes. A quiet token produces no row for that bar (no forward fill).
-Starting in the middle of a minute starts at the next full bar. Options to bound memory: `symbols=`, `kind="FUT"|"OPT"|"EQ"`, `expiries=1`
-(about 1.8 GB/day for everything on 1-minute bars; 0.7 GB with `expiries=1`; 14 MB futures only; a size estimate is logged at start).
-`candles_start` again restarts the table empty and **republishes** it; whoever `follow`s it moves to the new table.
+`Symbol` text is joined from a small static table, not stored per row. Row = `Minute, Symbol, token, Open, High, Low, Close, Volume, CVD` = 64 bytes.
+A quiet token produces no row for that bar (no forward fill). Starting in the middle of a minute starts at the next full bar. Options to bound memory:
+`symbols=`, `kind="FUT"|"OPT"|"EQ"`, `expiries=1` (about 1.8 GB/day for everything on 1-minute bars; 0.7 GB with `expiries=1`; 14 MB futures only; a
+size estimate is logged at start). `candles_start` again restarts the table empty and **republishes** it; whoever `follow`s it moves to the new table.
+
+`CVD` is the day-anchored cumulative volume delta: a running tick-rule total of `ltq` (the size of each individual trade) per token, added when a
+trade prints above the previous trade's price, subtracted when it prints below, credited to the last known direction when it prints unchanged.
+It exists because the feed's own `tbq`/`tsq` (total buy/sell quantity) report 0 on this feed, so there is no real buy/sell tag to use instead.
+It is computed inline in the same per-tick state machine that already tracks OHLC (no new listener, no new table), and is naturally anchored to the
+day because a fresh `Candles` instance is built each morning by `day_auto` -- there is no separate reset.
 
 **Straddle** (`algo/series/straddle.py`). For each underlying and expiry it uses the future that goes with that expiry (nearest future on or after it;
 spot if no future exists, e.g. US) and builds V / D series from the candles of the future and the options, one point per minute (per candle if candles
