@@ -87,12 +87,12 @@ Today's own file is never part of its own history. A week or month that opened o
 
 ## 4. The series and the reference point
 
-A series is **a value measured from a reference point you choose**. `series="pct"` is the percent change of the price from `ref`; `series="iv"` is the IV itself, or with a `ref` its percent change; `pct_open` and `pct_vwap` are shorthands for `pct` with `ref="open"` / `"vwap"`.
+A series is **a value measured from a reference point you choose**. `series="pct"` is the percent change of the price from `ref`; `series="iv"` is the IV itself, or with a `ref` its percent change; `pct_open` and `pct_vwap` are shorthands for `pct` with `ref="open"` / `"vwap"`. `series="volume"` and `series="turnover"` take no `ref`: each is always today's running total so far (cumulative volume, or cumulative traded value = typical price x volume), ranked against the same minute of the earlier days -- `"turnover"` is the volume-weighted sibling of `"volume"`, so a stock that is both busier AND moving stands out more there than in plain `"volume"`.
 
 | `ref` | meaning | what it needs besides the day itself |
 |---|---|---|
 | `"open"` (default) | the open of the period: the first bar's open of the day, the week or the month (for an IV, its first value) | for a week or month, the earlier days of that period |
-| `"vwap"` | `sum(typical price x volume) / sum(volume)` since the period's open (prices only) | the same |
+| `"vwap"` | `sum(typical price x volume) / sum(volume)` since the period's open (prices only; typical price = OHLC4, `(O+H+L+C)/4`) | the same |
 | `"prev_close"` | the last bar's close (the last IV) of the previous trading day | that previous day |
 | `"10min"` | the carried value 10 minutes earlier in the same day (1 to 389; a bare number is minutes) | nothing |
 | `"09:30"` | the carried value at that fixed minute of the same day (exchange time) | nothing |
@@ -100,10 +100,11 @@ A series is **a value measured from a reference point you choose**. `series="pct
 `parse_ref` reads the text once and refuses what makes no sense (a time outside the session, `"375min"`, an unknown word, `"vwap"` for an IV); a reference never stands for a number that does not exist: before the session has that many minutes, or before the fixed time has come, the value is NaN.
 A reference is part of the call, not of the data: the same cached day arrays serve every choice, and the list of days a call needs (`_needed_days`, `_ref_days`) follows from it, so `absolute_warm` with the same `ref` reads exactly those days.
 
-Per (symbol, day) the service keeps a `Day`: `close` (carried over minutes, float32 per slot), `cum_pv` (running sum of `(H+L+C)/3 * volume`, float32), `cum_v` (running volume, float32), plus the day's `open` (first bar's open), `last` (the last bar's close), total `pv` and total `v`. An `IvDay` is one float32 array per slot. About 4.7 KB per symbol per day (0.11 MB for 22 days).
+Per (symbol, day) the service keeps a `Day`: `close` (carried over minutes, float32 per slot), `cum_pv` (running sum of OHLC4 typical price `(O+H+L+C)/4 * volume`, float32), `cum_v` (running volume, float32), plus the day's `open` (first bar's open), `last` (the last bar's close), total `pv` and total `v`. An `IvDay` is one float32 array per slot. About 4.7 KB per symbol per day (0.11 MB for 22 days). This one cached `Day` object serves `"pct"`, `"volume"` and `"turnover"` alike (keyed by `(symbol, day)`, not by series), so asking for more than one of them costs nothing extra.
 
-* **`pct`** `= (price - reference) / reference * 100`, price = the carried close at the slot. For `ref="open"` the reference is the open of the period's first bar (a week's or month's: the first day's open); for `"vwap"` it is (sum of `pv` over the period's earlier days + the day's `cum_pv` at the slot) / (the same for volume), typical price (H+L+C)/3 times volume.
+* **`pct`** `= (price - reference) / reference * 100`, price = the carried close at the slot. For `ref="open"` the reference is the open of the period's first bar (a week's or month's: the first day's open); for `"vwap"` it is (sum of `pv` over the period's earlier days + the day's `cum_pv` at the slot) / (the same for volume), OHLC4 typical price `(O+H+L+C)/4` times volume.
 * **`iv`** = the IV of the symbol's **nearest expiry** that day (`min(Expiry)`), carried at most 3 slots. For a future or a contract the underlying is used. With a `ref` it is the percent change of the IV from that reference (the IV day keeps its first and last value for `"open"` and `"prev_close"`).
+* **`volume`** `= cum_v` at the slot (today's running volume so far); **`turnover`** `= cum_pv` at the slot (today's running traded value so far). Neither takes a `ref`: it is always the running total itself, ranked (via `.pctile` / `idx`) against the same minute of the earlier days, never a percent change.
 * The percent is computed as `(price - anchor) / anchor` after converting float32 to float64, which is exact for round cases; storing float32 costs at most about 1e-6 percent.
 
 ---

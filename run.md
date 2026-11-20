@@ -183,12 +183,14 @@ absolute_settings(memory_mb=300)                              # the cache limit 
 * `hist` is the n past values at the same session minute (oldest first; NaN where that day had no value). `idx` is how many of them are below the value now:
   0 = lowest, n_valid = highest, -1 = cannot tell (no value now, or fewer than half of n past values; `absolute_settings(min_valid=...)`).
 * **series and the reference point.** `pct` is the percent change of the price from a **reference point you choose with `ref=`** (the default is `"open"`), so one function covers every
-  case and nothing has to be written again; `iv` is the `IV` of the nearest expiry in `straddle_series` (with `ref=` it is the percent change of the IV from that point). The choices:
+  case and nothing has to be written again; `iv` is the `IV` of the nearest expiry in `straddle_series` (with `ref=` it is the percent change of the IV from that point). `volume` and `turnover`
+  take **no** `ref=`: each is always today's running total so far -- `volume` is cumulative volume, `turnover` is cumulative traded value (OHLC4 typical price x volume, bar by bar) -- ranked
+  against the same minute of the earlier days; `turnover` is the volume-weighted sibling of `volume`, so a stock that is both busier AND moving stands out more there. The `ref=` choices:
 
   | `ref` | the price (or IV) is measured from |
   |---|---|
   | `"open"` | the open of the period: the day's (`intraday`), the week's (`intraweek`) or the month's (`intramonth`) |
-  | `"vwap"` | the VWAP since that open ((H+L+C)/3 x volume), prices only |
+  | `"vwap"` | the VWAP since that open (OHLC4 typical price, (O+H+L+C)/4, x volume), prices only |
   | `"prev_close"` | the last value of the previous trading day |
   | `"10min"` (any `"1min"` to `"389min"`; a bare number is minutes too) | the value that many minutes earlier (NaN before the session has that many minutes) |
   | `"09:30"` (any time inside the session, exchange time) | the value at that minute of the same day (NaN until that time has come) |
@@ -217,7 +219,7 @@ absolute_settings(memory_mb=300)                              # the cache limit 
 
 ## 4d. relative(): where is a symbol now compared with a basket of other symbols (optional)
 
-Also a plain function that computes when called. The same three series and levels as `absolute()`, but the comparison is across symbols, now:
+Also a plain function that computes when called. The same series (`pct`, `iv`, `volume`, `turnover`) and levels as `absolute()`, but the comparison is across symbols, now:
 
 ```python
 values, idx = relative("pct", "intraday", "HDFCBANK", ref="10min")      # % change over the last 10 minutes: HDFCBANK against the other symbols of the basket it is defined in (baskets.txt), now
