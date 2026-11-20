@@ -68,6 +68,7 @@ def run_directional_1min():
         "consumer":["ITC","NESTLEIND","TITAN","HINDUNILVR","ETERNAL"],
         "energy":["ONGC","BPCL","RELIANCE","NTPC","POWERGRID"],
         "metals":["HINDALCO","JSWSTEEL","TATASTEEL","COALINDIA","NATIONALUM"],
+        "realty":["DLF","LODHA","GODREJPROP","PHOENIXLTD","OBEROIRLTY"],
     }                                         # add/remove/comment out symbols or whole baskets here; empty = none
     EXCLUDE = []                             # optional: underlyings to leave out (applied across every basket)
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
