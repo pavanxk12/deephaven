@@ -257,12 +257,14 @@ def run_nifty_500_directional():
             print(f"basket {name!r} was not saved ({e}); the ranking still works from BASKETS")
 
     symbol_of = {}                                                 # token -> the basket entry it trades for
+    _master_eqs = current().master.spot_of                        # underlying -> CASH equity token; NOT contract(name), which gives the nearest FUTURE
+                                                                    # first for a bare underlying name (most of these stocks have one) and would silently trade futures
     for name in basket_of:
-        info = contract(name, show=False)                          # the plain cash equity contract
-        if info is None:
-            print(f"{name}: no such contract, left out of the trading (it still counts in the basket)")
+        token = _master_eqs.get(name)
+        if token is None:
+            print(f"{name}: no cash contract in the master, left out of the trading (it still counts in the basket)")
             continue
-        symbol_of[int(info["token"])] = name
+        symbol_of[int(token)] = name
     pf_track(STRATEGY, list(symbol_of), slots=100)                 # the portfolios it had before (a restart or a paste again); every trade takes the next free slot
     with contextlib.redirect_stdout(io.StringIO()):
         had = algo_portfolios(STRATEGY)
@@ -290,7 +292,8 @@ def run_nifty_500_directional():
         if r[1] < 0:                                                 # (the second item is -1 when it cannot be told)
             count("RTURNOVER cannot be told")
             return False
-        valid = r.hist[np.isfinite(r.hist)]
+        hist = r[0]                                                  # Absolute is a tuple (hist, idx); hist/idx are not attributes, only tuple positions
+        valid = hist[np.isfinite(hist)]
         avg = float(np.mean(valid)) if valid.size else 0.0
         if avg <= 0:
             count("RTURNOVER cannot be told")
