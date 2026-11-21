@@ -65,6 +65,7 @@ public:
     void unpauseAll();                                       // current portfolios only; a retired one stays paused
     void exitAll(bool pause = true);                         // square up every portfolio
     std::vector<std::future<Reply>> unsubscribeAll(bool pause = true);  // stop signals, square up + unsubscribe each
+    Job unsubscribeJob(int64_t pf, bool pause = true);  // one PF's pause -> squareup -> (settle) -> unsubscribe (for the Guard)
 
     // ---- lookups ------------------------------------------------------------------------------------------------
     std::optional<int64_t> user() const;                    // cfg.user, else the book's user

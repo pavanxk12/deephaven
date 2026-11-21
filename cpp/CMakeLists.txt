@@ -39,7 +39,7 @@ target_link_libraries(algo_comms PUBLIC algo_core)
 
 # strategy layer: registry/book/bridge/guard. registry+book link only core; bridge+guard also use comms (the send
 # service), as the Python package's imports do.
-add_library(algo_strategy STATIC strategy/registry.cpp strategy/book.cpp strategy/bridge.cpp)
+add_library(algo_strategy STATIC strategy/registry.cpp strategy/book.cpp strategy/bridge.cpp strategy/guard.cpp)
 target_link_libraries(algo_strategy PUBLIC algo_core algo_comms)
 
 add_executable(candles_replay tools/candles_replay.cpp)

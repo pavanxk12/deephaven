@@ -240,20 +240,23 @@ std::vector<std::future<Reply>> Bridge::unsubscribeAll(bool pause) {
     for (auto& [t, cb] : cbs) cb();                          // strategies stop producing signals
     const auto u = user();
     std::vector<std::future<Reply>> futures;
-    for (int64_t pf : book_->currentPfs()) {
-        futures.push_back(nats_->submit(pf, [this, pf, pause](Call& call) -> Reply {
-            auto opt = subscribedOption(pf);
-            if (!opt) return Reply{true, "ok", pf, "", {}, 0};   // nothing to unsubscribe
-            if (pause) { Reply r = pauseStep(call, pf, "Pause"); if (!r.ok) return r; }
-            Reply sq = call("squareup", {});
-            if (!sq.ok) return sq;
-            if (cfg_.squareup_settle_s > 0)
-                std::this_thread::sleep_for(std::chrono::duration<double>(cfg_.squareup_settle_s));  // let the close fill first
-            return call("unsubscribe", sub(*opt));
-        }, u, client_, "unsubscribe"));
-    }
+    for (int64_t pf : book_->currentPfs())
+        futures.push_back(nats_->submit(pf, unsubscribeJob(pf, pause), u, client_, "unsubscribe"));
     for (int64_t t : std::vector<int64_t>(book_->tracked.begin(), book_->tracked.end())) book_->setLive(t, std::nullopt);
     return futures;
+}
+
+Job Bridge::unsubscribeJob(int64_t pf, bool pause) {
+    return [this, pf, pause](Call& call) -> Reply {
+        auto opt = subscribedOption(pf);
+        if (!opt) return Reply{true, "ok", pf, "", {}, 0};   // nothing to unsubscribe
+        if (pause) { Reply r = pauseStep(call, pf, "Pause"); if (!r.ok) return r; }
+        Reply sq = call("squareup", {});
+        if (!sq.ok) return sq;
+        if (cfg_.squareup_settle_s > 0)
+            std::this_thread::sleep_for(std::chrono::duration<double>(cfg_.squareup_settle_s));  // let the close fill first
+        return call("unsubscribe", sub(*opt));
+    };
 }
 
 // ---- the pf-state listener --------------------------------------------------------------------------------------

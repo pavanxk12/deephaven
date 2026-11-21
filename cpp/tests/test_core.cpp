@@ -26,6 +26,7 @@
 #include "comms/nats_service.h"
 #include "strategy/book.h"
 #include "strategy/bridge.h"
+#include "strategy/guard.h"
 #include "strategy/registry.h"
 #include "core/tz.h"
 #include "data/ltt_parser.h"
@@ -887,6 +888,74 @@ static void testBridge() {
     }
 }
 
+static void testGuard() {
+    SECTION("guard");
+
+    // ---- a turnover breach switches the strategy's sending OFF and latches the limit ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        Registry reg;
+        Portfolios book("m", "s", 1001, &reg, 3, "rsi");
+        BridgeConfig bc; bc.user = 3; bc.squareup_settle_s = 0;
+        Bridge br(bc, "rsi");
+        br.bind(svc.get(), &book);
+        br.sendOn();
+        Limits lim;
+        Guard guard(lim, svc.get(), &reg, [&](const std::string& s) -> Bridge* { return s == "rsi" ? &br : nullptr; });
+
+        lim.setLimit("rsi", "turnover", 1'000'000.0);
+        CHECK(br.sending());
+        guard.on_values("rsi", 2'000'000.0, std::nullopt);   // over the turnover limit
+        CHECK(lim.get("rsi").turnover_hit && !br.sending()); // latched + sending switched off
+        CHECK(!svc->events().empty());                       // a nats_events row was noted
+        svc->stop();
+    }
+
+    // ---- an M2M breach squares up + unsubscribes the strategy's subscribed portfolios ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        Registry reg;
+        Portfolios book("m", "s", 1001, &reg, 3, "rsi");
+        BridgeConfig bc; bc.user = 3; bc.squareup_settle_s = 0;
+        Bridge br(bc, "rsi");
+        br.bind(svc.get(), &book);
+        br.sendOn();
+        Limits lim;
+        Guard guard(lim, svc.get(), &reg, [&](const std::string& s) -> Bridge* { return s == "rsi" ? &br : nullptr; });
+
+        // one subscribed portfolio owned by "rsi"
+        reg.registerPf(3, 1001, "rsi", "", "rsi", "RELIANCE");
+        book.track({500});
+        book.pf_map[500] = 1001;
+        book.subscribe(1001, 900);                            // the book knows the option it trades
+        CHECK(svc->subscribe(1001, 900, {}, 3).get().ok);     // the service confirms -> pf state subscribed
+        const std::size_t before = wire->count();
+
+        lim.setLimit("rsi", "m2m", -50'000.0);
+        guard.on_values("rsi", std::nullopt, -60'000.0);      // below the M2M limit -> breach
+        CHECK(lim.get("rsi").m2m_hit && !br.sending());
+        CHECK(waitUntil([&] { return wire->count() >= before + 3; }));
+        auto s = wire->seq(1001);
+        svc->stop();
+        CHECK(s.size() >= 4);                                 // subscribe + the three breach steps
+        CHECK(s[s.size() - 3] == "pause_unpause:Pause" && s[s.size() - 2] == "squareup" && s.back() == "unsubscribe");
+    }
+
+    // ---- set_limit reports a bad value and a still-blocked strategy ----
+    {
+        Limits lim;
+        Guard guard(lim, nullptr, nullptr, {});
+        CHECK(guard.set_limit("x", "turnover", -5.0).find("0 up") != std::string::npos);   // bad value message
+        lim.setLimit("x", "turnover", 1'000.0);
+        lim.update("x", 2'000.0, std::nullopt);               // already past -> latched
+        const std::string msg = guard.set_limit("x", "turnover", 1'500.0);   // still below 2000 seen -> still blocked
+        CHECK(msg.find("still blocked") != std::string::npos);
+        CHECK(guard.set_limit("x", "turnover", 3'000.0).empty());            // now above seen -> cleared, no message
+    }
+}
+
 int main() {
     testIni();
     testMarkets();
@@ -904,6 +973,7 @@ int main() {
     testBook();
     testNats();
     testBridge();
+    testGuard();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
