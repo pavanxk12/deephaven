@@ -15,6 +15,7 @@
 #include "core/app.h"
 #include "core/ini.h"
 #include "core/market.h"
+#include "core/pfstate.h"
 #include "core/sql.h"
 #include "core/statedb.h"
 #include <fstream>
@@ -346,6 +347,68 @@ static void testStateDb() {
     CHECK(st && !st->turnover.has_value() && st->m2m && *st->m2m == -50'000.0 && st->m2m_hit && !st->turnover_hit);
 }
 
+static void testPfStates() {
+    SECTION("pf states");
+    PfStates ps;
+
+    // a listener records every change
+    int hits = 0;
+    int64_t last_user = 0, last_pf = 0;
+    auto tok = ps.onChange([&](int64_t u, int64_t p, const PfState&) { ++hits; last_user = u; last_pf = p; });
+
+    // subscribe stamps the option (from TOKEN), clears squared, marks subscribed
+    PfPayload sub; sub.token = 900111;
+    auto st = ps.record(3, 1001, "subscribe", sub, "nifty_rsi");
+    CHECK(st && st->subscribed && st->option == 900111 && !st->squared && st->by == "nifty_rsi" && st->cmd == "subscribe");
+    CHECK(hits == 1 && last_user == 3 && last_pf == 1001);
+
+    // squareup then apply toggles `squared`; an empty `by` becomes "operator"
+    CHECK(ps.record(3, 1001, "squareup", {}, "")->squared == true);
+    auto applied = ps.record(3, 1001, "apply", {}, "");
+    CHECK(applied && !applied->squared && applied->by == "operator");
+
+    // pause / resume via the Action field
+    PfPayload pause; pause.action = "Pause";
+    CHECK(ps.record(3, 1001, "pause_unpause", pause, "operator")->paused == true);
+    PfPayload resume; resume.action = "Resume";
+    CHECK(ps.record(3, 1001, "pause_unpause", resume, "operator")->paused == false);
+
+    // unsubscribe keeps the option but clears the flag; T1 (churn) overrides the option
+    PfPayload unsub; unsub.t1 = 900222;
+    auto un = ps.record(3, 1001, "unsubscribe", unsub, "nifty_rsi");
+    CHECK(un && !un->subscribed && un->option == 900222);
+
+    // an unrecognised command changes nothing and notifies nobody
+    const int before = hits;
+    CHECK(!ps.record(3, 1001, "reconcile", {}, "x").has_value());
+    CHECK(hits == before);
+
+    // adopt only fills an unseen portfolio, never overwrites
+    ps.adopt(3, 1001, 123456);                               // 1001 already seen -> ignored
+    CHECK(ps.get(3, 1001)->option == 900222);
+    ps.adopt(5, 7000, 555, true);                            // new -> created, paused
+    auto a = ps.get(5, 7000);
+    CHECK(a && a->subscribed && a->option == 555 && a->paused && a->cmd == "adopted");
+
+    // items filters by user; size counts all
+    CHECK(ps.items(3).size() == 1 && ps.items().size() == 2);
+
+    // by_option: a subscribed portfolio wins over an unsubscribed one on the same option token
+    ps.record(9, 8001, "subscribe", [] { PfPayload p; p.token = 777; return p; }(), "a");
+    ps.record(9, 8002, "unsubscribe", [] { PfPayload p; p.token = 777; return p; }(), "a");  // same option, not subscribed
+    auto bo = ps.byOption();
+    CHECK(bo.count(777) && std::get<1>(bo[777]) == 8001);   // the subscribed one (pf 8001) wins
+
+    // removing the listener stops notifications
+    ps.removeListener(tok);
+    const int frozen = hits;
+    ps.record(3, 1001, "squareup", {}, "op");
+    CHECK(hits == frozen);
+
+    ps.forget(3);
+    CHECK(!ps.get(3, 1001).has_value() && ps.get(5, 7000).has_value());
+}
+
 int main() {
     testIni();
     testMarkets();
@@ -357,6 +420,7 @@ int main() {
     testMirror();
     testAppPlugin();
     testStateDb();
+    testPfStates();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

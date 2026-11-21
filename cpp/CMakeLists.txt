@@ -22,7 +22,8 @@ find_package(PostgreSQL REQUIRED)
 # core now owns the SQL seam (sql.cpp) and the state store (statedb.cpp), so it links sqlite3 + libpq; PUBLIC so data
 # (master.cpp) and the executables get them too.
 add_library(algo_core STATIC core/ini.cpp core/tz.cpp core/market.cpp core/mirror_ring.cpp core/process_config.cpp
-                             core/event_bus.cpp core/plugin.cpp core/app.cpp core/sql.cpp core/statedb.cpp)
+                             core/event_bus.cpp core/plugin.cpp core/app.cpp core/sql.cpp core/statedb.cpp
+                             core/pfstate.cpp)
 target_include_directories(algo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(algo_core PUBLIC SQLite::SQLite3 PostgreSQL::PostgreSQL)
 if(UNIX AND NOT APPLE)
