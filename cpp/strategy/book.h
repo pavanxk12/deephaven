@@ -77,6 +77,9 @@ public:
     void    revert(int64_t token, int64_t old_pf, int64_t new_pf);
 
     // ---- mutations ----------------------------------------------------------------------------------------------
+    std::optional<int64_t> userId() const { return user_; }   // the user this book's numbers belong to (if any)
+    bool isPaused(int64_t pf) const { std::lock_guard<std::recursive_mutex> g(lock_); return paused.count(pf) != 0; }
+
     void subscribe(int64_t pf, int64_t option_token);
     void setPaused(int64_t pf, bool paused_on);
     void setAllow(int64_t token, bool on);

@@ -73,7 +73,7 @@ void NatsService::connect() {
 }
 
 void NatsService::stop() {
-    if (stopped_.exchange(true) && !transport_ && workflows_.empty()) return;
+    if (stopped_.exchange(true)) return;         // runs once; a later call (e.g. the destructor) is a no-op
     closing_ = true;
     {
         std::lock_guard<std::mutex> g(mu_);      // whatever is still waiting is told it will not run
@@ -92,7 +92,9 @@ void NatsService::stop() {
     }
     for (auto& t : workflows_) if (t.joinable()) t.join();
     workflows_.clear();
-    if (transport_) { try { transport_->close(); } catch (...) {} transport_.reset(); }
+    // Close the transport but keep the object: it is freed when the service is destroyed, so a caller that held a
+    // raw pointer to it (a test's fake wire, or anyone reading counters) stays valid until then.
+    if (transport_) { try { transport_->close(); } catch (...) {} }
 }
 
 // ---- the six commands -------------------------------------------------------------------------------------------
@@ -208,14 +210,16 @@ void NatsService::drain(std::pair<int64_t, int64_t> key) {
             running_++;
         }
         Reply result;
+        std::exception_ptr ex;
         try {
             Call call(this, key.second, w.user, w.client);
-            result = w.job(call);
-        } catch (const std::exception& e) {
-            result = Reply{false, "error", key.second, "", {{"error", e.what()}}, w.user};
+            result = w.job(call);                           // a multi-step job may THROW (a Bridge need() abort)
+        } catch (...) {
+            ex = std::current_exception();                  // propagate it so lane().get() re-throws into the workflow
         }
         running_--;
-        w.promise.set_value(result);
+        if (ex) w.promise.set_exception(ex);
+        else w.promise.set_value(result);
     }
 }
 

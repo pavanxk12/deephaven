@@ -33,13 +33,14 @@ endif()
 add_library(algo_data STATIC data/ltt_parser.cpp data/token_index.cpp data/candle_aggregator.cpp data/master.cpp)
 target_link_libraries(algo_data PUBLIC algo_core)
 
-# strategy layer: registry/book/bridge/guard; links only core (the Python package's import rules)
-add_library(algo_strategy STATIC strategy/registry.cpp strategy/book.cpp)
-target_link_libraries(algo_strategy PUBLIC algo_core)
-
 # comms layer: the NATS service; links only core
 add_library(algo_comms STATIC comms/nats_service.cpp)
 target_link_libraries(algo_comms PUBLIC algo_core)
+
+# strategy layer: registry/book/bridge/guard. registry+book link only core; bridge+guard also use comms (the send
+# service), as the Python package's imports do.
+add_library(algo_strategy STATIC strategy/registry.cpp strategy/book.cpp strategy/bridge.cpp)
+target_link_libraries(algo_strategy PUBLIC algo_core algo_comms)
 
 add_executable(candles_replay tools/candles_replay.cpp)
 target_link_libraries(candles_replay PRIVATE algo_data)

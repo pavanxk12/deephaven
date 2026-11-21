@@ -25,6 +25,7 @@
 #include "core/spsc_ring.h"
 #include "comms/nats_service.h"
 #include "strategy/book.h"
+#include "strategy/bridge.h"
 #include "strategy/registry.h"
 #include "core/tz.h"
 #include "data/ltt_parser.h"
@@ -598,12 +599,14 @@ namespace {
 // Fake transport: records every request, can be slow, can time out on a given label. The service's own tests drive
 // it the way tests/test_nats_service.py drives its Wire.
 struct FakeWire : Transport {
+    struct Rec { std::string subject, cmd, label; Payload payload; };
     mutable std::mutex m;
-    std::vector<std::pair<std::string, Payload>> sent;      // (subject, stamped payload)
+    std::vector<Rec> sent;
     int now = 0, peak = 0;
     double delay_s = 0.0;
     std::string status = "ok";
     std::string timeout_on;                                 // label "cmd" or "cmd:Action" to time out
+    std::string fail_on;                                    // label to answer with a non-ok status ("rejected")
     bool conn = true;
 
     bool isConnected() const override { return conn; }
@@ -611,13 +614,26 @@ struct FakeWire : Transport {
         std::string label = cmd;
         auto it = payload.find("Action");
         if (it != payload.end() && std::holds_alternative<std::string>(it->second)) label += ":" + std::get<std::string>(it->second);
-        { std::lock_guard<std::mutex> g(m); ++now; peak = std::max(peak, now); sent.emplace_back(subject, payload); }
+        { std::lock_guard<std::mutex> g(m); ++now; peak = std::max(peak, now); sent.push_back({subject, cmd, label, payload}); }
         if (delay_s > 0) std::this_thread::sleep_for(std::chrono::duration<double>(delay_s));
         { std::lock_guard<std::mutex> g(m); --now; }
         if (!timeout_on.empty() && label == timeout_on) throw NatsTimeout();
-        return Response{status, {}};
+        return Response{(!fail_on.empty() && label == fail_on) ? "rejected" : status, {}};
+    }
+    std::size_t count() const { std::lock_guard<std::mutex> g(m); return sent.size(); }
+    std::vector<std::string> seq(int64_t pf) const {        // the command labels seen for one portfolio, in order
+        std::lock_guard<std::mutex> g(m);
+        std::vector<std::string> out;
+        for (const auto& r : sent) if (r.subject == "cmd.hft." + std::to_string(pf)) out.push_back(r.label);
+        return out;
     }
 };
+
+template <class F> bool waitUntil(F pred, double secs = 3.0) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(secs);
+    while (std::chrono::steady_clock::now() < end) { if (pred()) return true; std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    return pred();
+}
 
 // Helper: a service wired to a fresh FakeWire the test keeps a raw pointer to (the service owns it after connect).
 struct Svc {
@@ -657,8 +673,8 @@ static void testNats() {
         // each portfolio's commands arrived in order
         for (int pf = 1; pf <= 6; ++pf) {
             std::vector<int64_t> seen;
-            for (auto& [subj, p] : wire->sent)
-                if (subj == "cmd.hft." + std::to_string(pf)) seen.push_back(std::get<int64_t>(p.at("n")));
+            for (auto& r : wire->sent)
+                if (r.subject == "cmd.hft." + std::to_string(pf)) seen.push_back(std::get<int64_t>(r.payload.at("n")));
             std::vector<int64_t> want(20); for (int i = 0; i < 20; ++i) want[i] = i;
             CHECK(seen == want);
         }
@@ -743,7 +759,7 @@ static void testNats() {
             return call("apply", {{"maxqty", int64_t{50}}});
         }, 3).get();
         CHECK(r.ok && r.cmd == "apply");
-        CHECK(wire->sent.size() == 2 && std::get<std::string>(wire->sent[0].second.at("Action")) == "Pause");
+        CHECK(wire->sent.size() == 2 && std::get<std::string>(wire->sent[0].payload.at("Action")) == "Pause");
         svc->stop();
     }
 
@@ -768,6 +784,109 @@ static void testNats() {
     }
 }
 
+static void testBridge() {
+    SECTION("bridge");
+
+    // ---- a fresh-PF swap: subscribe -> pause -> apply -> unpause, and the book is brought in line ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        Registry reg;
+        Portfolios book("m", "s", 1001, &reg, 3, "bk");
+        book.track({500});
+        auto a = book.assign(500, 900, "R", "rsi");          // pf 1001, not yet subscribed
+        BridgeConfig bc; bc.user = 3;
+        Bridge br(bc, "rsi");
+        br.bind(svc.get(), &book);
+        CHECK(br.sendOn());
+        CHECK(br.swap(a.pf, 500, 900, {{"n", int64_t{1}}}, std::nullopt, std::nullopt, std::nullopt));
+        CHECK(waitUntil([&] { return wire->seq(a.pf).size() == 4; }));
+        svc->stop();                                          // join the workflow before reading the book
+        const std::vector<std::string> want{"subscribe", "pause_unpause:Pause", "apply", "pause_unpause:UnPause"};
+        CHECK(wire->seq(a.pf) == want);
+        CHECK(book.subscribed.at(a.pf) == 900 && book.caps.at(a.pf) == 5);   // add_qty default
+    }
+
+    // ---- a swap whose apply is rejected: left paused, no unpause, bookkeeping rolled back ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        wire->fail_on = "apply";
+        Registry reg;
+        Portfolios book("m", "s", 1001, &reg, 3, "bk");
+        book.track({600});
+        auto a = book.assign(600, 950, "R", "rsi");
+        BridgeConfig bc; bc.user = 3;
+        Bridge br(bc, "rsi");
+        br.bind(svc.get(), &book);
+        br.sendOn();
+        book.setLive(600, std::string("CALL"), 950);
+        CHECK(br.swap(a.pf, 600, 950, {{"n", int64_t{1}}}, std::string("CALL"), 950, std::nullopt));
+        CHECK(waitUntil([&] { return wire->seq(a.pf).size() == 3; }));       // subscribe, pause, apply(fail)
+        svc->stop();
+        CHECK((wire->seq(a.pf) == std::vector<std::string>{"subscribe", "pause_unpause:Pause", "apply"}));
+        CHECK(book.last_fail.count(600) == 1);                               // a later update may retry
+        CHECK(book.live.at(600) == std::optional<std::string>("CALL"));      // prev leg restored
+        CHECK(book.caps.at(a.pf) == 0);                                      // cap not advanced (apply failed)
+    }
+
+    // ---- the send switch gates the workflow (off -> dropped) ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        Registry reg;
+        Portfolios book("m", "s", 1001, &reg, 3, "bk");
+        book.track({700});
+        auto a = book.assign(700, 980, "R", "rsi");
+        BridgeConfig bc; bc.user = 3;
+        Bridge br(bc, "rsi");
+        br.bind(svc.get(), &book);
+        CHECK(!br.swap(a.pf, 700, 980, {}, std::nullopt, std::nullopt, std::nullopt));   // not enabled -> dropped
+        br.sendOn();
+        CHECK(br.swap(a.pf, 700, 980, {}, std::nullopt, std::nullopt, std::nullopt));
+        CHECK(waitUntil([&] { return wire->seq(a.pf).size() == 4; }));
+        svc->stop();
+    }
+
+    // ---- the pf-state listener brings the book in line with a console pause ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        Registry reg;
+        Portfolios book("m", "s", 1001, &reg, 3, "bk");
+        book.track({800});
+        auto a = book.assign(800, 990, "R", "rsi");
+        book.subscribe(a.pf, 990);                            // so token_of/subscribed knows it is ours
+        BridgeConfig bc; bc.user = 3;
+        Bridge br(bc, "rsi");
+        br.bind(svc.get(), &book);
+        br.sendOn();
+        // the "console" (a different client, user 3) pauses the portfolio
+        CHECK(svc->pause(a.pf, 3).get().ok);
+        CHECK(waitUntil([&] { return book.isPaused(a.pf); }));      // listener applied it to the book
+        svc->stop();
+    }
+
+    // ---- an operator pause returns the command's future and the listener updates the book ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        Registry reg;
+        Portfolios book("m", "s", 1001, &reg, 3, "bk");
+        book.track({850});
+        auto a = book.assign(850, 995, "R", "rsi");
+        book.subscribe(a.pf, 995);
+        BridgeConfig bc; bc.user = 3;
+        Bridge br(bc, "rsi");
+        br.bind(svc.get(), &book);
+        br.sendOn();
+        auto fut = br.pausePf(a.pf);
+        CHECK(fut.has_value() && fut->get().ok);
+        CHECK(waitUntil([&] { return book.isPaused(a.pf); }));      // brought in line via the listener
+        svc->stop();
+    }
+}
+
 int main() {
     testIni();
     testMarkets();
@@ -784,6 +903,7 @@ int main() {
     testRegistry();
     testBook();
     testNats();
+    testBridge();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
