@@ -15,6 +15,8 @@
 #include "core/app.h"
 #include "core/ini.h"
 #include "core/market.h"
+#include "core/sql.h"
+#include "core/statedb.h"
 #include <fstream>
 #include "core/mirror_ring.h"
 #include "core/seqlock.h"
@@ -296,6 +298,54 @@ static void testAppPlugin() {
     CHECK(!app.has("p2") && !app.has("p3"));
 }
 
+static void testStateDb() {
+    SECTION("statedb");
+    // One shared in-memory SQLite connection, handed out once (the happy path never triggers the reconnect retry).
+    auto db = std::make_shared<std::unique_ptr<SqlConn>>(makeSqliteConn(":memory:"));
+    StateDB store([db]() { return std::move(*db); });
+
+    // ---- registry: upsert replaces, load is ordered by (user, pf) ----
+    store.savePortfolio({3, 1002, "nifty_rsi_book", "n2", "nifty_rsi", "2026-11-21", ""});
+    store.savePortfolio({3, 1001, "nifty_rsi_book", "n1", "nifty_rsi", "2026-11-21", "first"});
+    store.savePortfolio({1, 5000, "straddle_book", "s", "straddle", "2026-11-20", ""});
+    store.savePortfolio({3, 1001, "nifty_rsi_book", "n1b", "nifty_rsi", "2026-11-21", "renamed"});  // upsert same key
+    auto pfs = store.loadPortfolios();
+    CHECK(pfs.size() == 3);                                                        // the upsert did not add a 4th
+    CHECK(pfs[0].user == 1 && pfs[0].pf == 5000);                                  // ordered: user 1 first
+    CHECK(pfs[1].user == 3 && pfs[1].pf == 1001 && pfs[1].name == "n1b" && pfs[1].note == "renamed");
+    CHECK(pfs[2].user == 3 && pfs[2].pf == 1002);
+
+    // ---- bulk import ----
+    store.savePortfolios({{7, 2001, "b", "a", "x", "c", ""}, {7, 2002, "b", "a2", "x", "c", ""}});
+    CHECK(store.loadPortfolios().size() == 5);
+
+    // ---- a book's int maps: nullopt until it has rows, then replace-all ----
+    CHECK(!store.loadInts(StateDB::BookTable::Map, "nifty_rsi_book").has_value());
+    store.saveInts(StateDB::BookTable::Map, "nifty_rsi_book", {{111, 1001}, {222, 1002}});
+    store.saveInts(StateDB::BookTable::Sub, "nifty_rsi_book", {{1001, 900111}});
+    store.saveInts(StateDB::BookTable::Map, "other_book", {{333, 5000}});          // a second book is independent
+    auto m = store.loadInts(StateDB::BookTable::Map, "nifty_rsi_book");
+    CHECK(m && m->size() == 2 && m->at(111) == 1001 && m->at(222) == 1002);
+    auto sub = store.loadInts(StateDB::BookTable::Sub, "nifty_rsi_book");
+    CHECK(sub && sub->size() == 1 && sub->at(1001) == 900111);
+    store.saveInts(StateDB::BookTable::Map, "nifty_rsi_book", {{111, 1009}});      // replace-all drops 222
+    m = store.loadInts(StateDB::BookTable::Map, "nifty_rsi_book");
+    CHECK(m && m->size() == 1 && m->at(111) == 1009);
+    CHECK(store.loadInts(StateDB::BookTable::Map, "other_book")->at(333) == 5000); // untouched by the other book
+
+    // ---- limits: null vs value, latch flags, upsert ----
+    store.saveLimits({{"nifty_rsi", 5'000'000.0, std::nullopt, false, false},
+                      {"straddle", std::nullopt, -50'000.0, false, true}});
+    store.saveLimits({{"nifty_rsi", 6'000'000.0, std::nullopt, true, false}});     // upsert one
+    auto lims = store.loadLimits();
+    CHECK(lims.size() == 2);
+    const Limit* nr = nullptr;
+    const Limit* st = nullptr;
+    for (const auto& l : lims) { if (l.strategy == "nifty_rsi") nr = &l; else if (l.strategy == "straddle") st = &l; }
+    CHECK(nr && nr->turnover && *nr->turnover == 6'000'000.0 && !nr->m2m.has_value() && nr->turnover_hit && !nr->m2m_hit);
+    CHECK(st && !st->turnover.has_value() && st->m2m && *st->m2m == -50'000.0 && st->m2m_hit && !st->turnover_hit);
+}
+
 int main() {
     testIni();
     testMarkets();
@@ -306,6 +356,7 @@ int main() {
     testSeqlock();
     testMirror();
     testAppPlugin();
+    testStateDb();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

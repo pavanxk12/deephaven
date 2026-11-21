@@ -15,19 +15,22 @@ if(ALGO_TSAN)
   add_link_options(-fsanitize=thread)
 endif()
 
-# core knows nothing of the others; data uses core (the import rules of the Python package, enforced by link deps)
+find_package(SQLite3 REQUIRED)
+find_package(PostgreSQL REQUIRED)
+
+# core knows nothing of the others; data uses core (the import rules of the Python package, enforced by link deps).
+# core now owns the SQL seam (sql.cpp) and the state store (statedb.cpp), so it links sqlite3 + libpq; PUBLIC so data
+# (master.cpp) and the executables get them too.
 add_library(algo_core STATIC core/ini.cpp core/tz.cpp core/market.cpp core/mirror_ring.cpp core/process_config.cpp
-                             core/event_bus.cpp core/plugin.cpp core/app.cpp)
+                             core/event_bus.cpp core/plugin.cpp core/app.cpp core/sql.cpp core/statedb.cpp)
 target_include_directories(algo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(algo_core PUBLIC SQLite::SQLite3 PostgreSQL::PostgreSQL)
 if(UNIX AND NOT APPLE)
   target_link_libraries(algo_core PUBLIC rt pthread)
 endif()
 
-find_package(SQLite3 REQUIRED)
-find_package(PostgreSQL REQUIRED)
-
 add_library(algo_data STATIC data/ltt_parser.cpp data/token_index.cpp data/candle_aggregator.cpp data/master.cpp)
-target_link_libraries(algo_data PUBLIC algo_core PRIVATE SQLite::SQLite3 PostgreSQL::PostgreSQL)
+target_link_libraries(algo_data PUBLIC algo_core)
 
 add_executable(candles_replay tools/candles_replay.cpp)
 target_link_libraries(candles_replay PRIVATE algo_data)
