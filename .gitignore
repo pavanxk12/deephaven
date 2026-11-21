@@ -9,3 +9,6 @@ history/
 
 # C++ build output
 cpp/build/
+
+# real contract files pulled from a server for the master parity test (large binary, not source)
+cpp/tests/parity/data/

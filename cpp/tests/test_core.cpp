@@ -1,13 +1,18 @@
 // Unit tests for cpp/core and cpp/data pieces that need no exchange: INI, time zones, LTT parsing, token index,
 // SPSC ring, seqlock, double-mapped broadcast ring. No framework: CHECK counts failures, main returns non-zero on any.
+#include <any>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "core/app.h"
 #include "core/ini.h"
 #include "core/market.h"
 #include <fstream>
@@ -221,6 +226,76 @@ static void testMarkets() {
     CHECK(!Market::load("build/typo.ini", typo, e2) && !e2.empty() && e2.back().find("bar_grace") != std::string::npos);
 }
 
+namespace {
+struct CountingPlugin : Plugin {
+    int& starts; int& stops; bool fail_start;
+    CountingPlugin(std::string n, int& s, int& st, bool fail = false) : Plugin(std::move(n)), starts(s), stops(st), fail_start(fail) {}
+    void start() override { ++starts; if (fail_start) throw std::runtime_error("boom"); }
+    void onStop() override { ++stops; }
+};
+struct NeedsP1 : Plugin {
+    int& s;
+    explicit NeedsP1(int& s_) : Plugin("p2"), s(s_) {}
+    const std::vector<std::string>& needs() const override { static const std::vector<std::string> v{"p1"}; return v; }
+    void start() override { ++s; }
+};
+struct FollowP : Plugin {
+    int& seen;
+    explicit FollowP(int& s_) : Plugin("p3"), seen(s_) {}
+    void start() override { follow("tbl", [this](const std::any& v) { seen = std::any_cast<int>(v); }); }
+};
+struct ThreadPlugin : Plugin {
+    std::atomic<int>& ticks;
+    explicit ThreadPlugin(std::atomic<int>& t) : Plugin("thr"), ticks(t) {}
+    void start() override { spawn([this]() { while (!halted()) { ++ticks; std::this_thread::sleep_for(std::chrono::milliseconds(1)); } }); }
+};
+}  // namespace
+
+static void testAppPlugin() {
+    SECTION("app / plugin / event bus");
+    Market mk; std::vector<std::string> errs;
+    CHECK(Market::load("config/markets/NSE.ini", mk, errs));
+    App app(mk, ProcessConfig{});
+
+    int starts = 0, stops = 0;
+    app.run(std::make_unique<CountingPlugin>("p1", starts, stops));
+    CHECK(starts == 1 && stops == 0 && app.has("p1"));
+    app.run(std::make_unique<CountingPlugin>("p1", starts, stops));                 // re-run: stops the old one first
+    CHECK(starts == 2 && stops == 1);
+
+    int s2 = 0;
+    app.run(std::make_unique<NeedsP1>(s2));
+    CHECK(s2 == 1);
+    app.stop("p1");
+    CHECK(!app.has("p1"));
+    bool threw = false;
+    try { app.run(std::make_unique<NeedsP1>(s2)); } catch (const MissingDependency&) { threw = true; }
+    CHECK(threw && s2 == 1);                                                        // start() never ran: the need check failed first
+
+    app.publish("tbl", 1);
+    int seen = -1;
+    app.run(std::make_unique<FollowP>(seen));
+    CHECK(seen == -1);           // follow() does not replay the current value, only a later republish (matches Python's on_publish)
+    app.publish("tbl", 42);
+    CHECK(seen == 42);
+
+    bool threw2 = false;
+    try { app.run(std::make_unique<CountingPlugin>("bad", starts, stops, true)); } catch (...) { threw2 = true; }
+    CHECK(threw2 && !app.has("bad") && stops == 3);                                 // a throwing start() is still torn down (its own onStop runs)
+
+    std::atomic<int> ticks{0};
+    app.run(std::make_unique<ThreadPlugin>(ticks));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(ticks.load() > 0);
+    app.stop("thr");
+    const int after_stop = ticks.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(ticks.load() == after_stop);                                             // the thread actually stopped, not just detached
+
+    app.stopAll();
+    CHECK(!app.has("p2") && !app.has("p3"));
+}
+
 int main() {
     testIni();
     testMarkets();
@@ -230,6 +305,7 @@ int main() {
     testSpsc();
     testSeqlock();
     testMirror();
+    testAppPlugin();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
