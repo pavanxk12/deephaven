@@ -23,6 +23,7 @@
 #include "core/mirror_ring.h"
 #include "core/seqlock.h"
 #include "core/spsc_ring.h"
+#include "comms/nats_service.h"
 #include "strategy/book.h"
 #include "strategy/registry.h"
 #include "core/tz.h"
@@ -593,6 +594,180 @@ static void testBook() {
     CHECK(bp2.pf_map.at(500) == 1001 && bp2.subscribed.at(1001) == 900);
 }
 
+namespace {
+// Fake transport: records every request, can be slow, can time out on a given label. The service's own tests drive
+// it the way tests/test_nats_service.py drives its Wire.
+struct FakeWire : Transport {
+    mutable std::mutex m;
+    std::vector<std::pair<std::string, Payload>> sent;      // (subject, stamped payload)
+    int now = 0, peak = 0;
+    double delay_s = 0.0;
+    std::string status = "ok";
+    std::string timeout_on;                                 // label "cmd" or "cmd:Action" to time out
+    bool conn = true;
+
+    bool isConnected() const override { return conn; }
+    Response request(const std::string& subject, const std::string& cmd, const Payload& payload, double) override {
+        std::string label = cmd;
+        auto it = payload.find("Action");
+        if (it != payload.end() && std::holds_alternative<std::string>(it->second)) label += ":" + std::get<std::string>(it->second);
+        { std::lock_guard<std::mutex> g(m); ++now; peak = std::max(peak, now); sent.emplace_back(subject, payload); }
+        if (delay_s > 0) std::this_thread::sleep_for(std::chrono::duration<double>(delay_s));
+        { std::lock_guard<std::mutex> g(m); --now; }
+        if (!timeout_on.empty() && label == timeout_on) throw NatsTimeout();
+        return Response{status, {}};
+    }
+};
+
+// Helper: a service wired to a fresh FakeWire the test keeps a raw pointer to (the service owns it after connect).
+struct Svc {
+    std::unique_ptr<NatsService> svc;
+    FakeWire* wire;
+};
+Svc makeSvc(NatsConfig cfg, double delay_s = 0.0, std::string status = "ok", std::string timeout_on = "") {
+    auto wire = std::make_unique<FakeWire>();
+    wire->delay_s = delay_s; wire->status = std::move(status); wire->timeout_on = std::move(timeout_on);
+    auto holder = std::make_shared<std::unique_ptr<Transport>>(std::move(wire));
+    FakeWire* w = static_cast<FakeWire*>(holder->get());
+    auto svc = std::make_unique<NatsService>(std::move(cfg), [holder] { return std::move(*holder); });
+    svc->connect();
+    return {std::move(svc), w};
+}
+}  // namespace
+
+static void testNats() {
+    SECTION("nats service");
+
+    // ---- ordering per portfolio, overlap across portfolios, counts ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg, 0.001);
+        std::vector<std::future<Reply>> futs;
+        std::mutex fm;
+        std::vector<std::thread> ths;
+        for (int pf = 1; pf <= 6; ++pf)
+            ths.emplace_back([&, pf] {
+                for (int i = 0; i < 20; ++i) {
+                    auto f = svc->send(pf, i % 2 ? "apply" : "squareup", {{"n", int64_t{i}}});
+                    std::lock_guard<std::mutex> g(fm); futs.push_back(std::move(f));
+                }
+            });
+        for (auto& t : ths) t.join();
+        for (auto& f : futs) f.get();
+        // each portfolio's commands arrived in order
+        for (int pf = 1; pf <= 6; ++pf) {
+            std::vector<int64_t> seen;
+            for (auto& [subj, p] : wire->sent)
+                if (subj == "cmd.hft." + std::to_string(pf)) seen.push_back(std::get<int64_t>(p.at("n")));
+            std::vector<int64_t> want(20); for (int i = 0; i < 20; ++i) want[i] = i;
+            CHECK(seen == want);
+        }
+        CHECK(wire->peak > 1);                               // different portfolios overlapped
+        CHECK(svc->counts().ok == 120 && svc->queued() == 0 && svc->inFlight() == 0);
+        svc->stop();
+    }
+
+    // ---- the in-flight cap holds across all portfolios ----
+    {
+        NatsConfig cfg; cfg.send_on = true; cfg.max_in_flight = 3;
+        auto [svc, wire] = makeSvc(cfg, 0.01);
+        std::vector<std::future<Reply>> futs;
+        for (int pf = 1; pf <= 30; ++pf) futs.push_back(svc->pause(pf));
+        for (auto& f : futs) f.get();
+        CHECK(wire->peak > 1 && wire->peak <= 3 && wire->sent.size() == 30);
+        svc->stop();
+    }
+
+    // ---- the switches: off -> refused, then on -> sent ----
+    {
+        NatsConfig cfg; cfg.send_on = false;
+        auto [svc, wire] = makeSvc(cfg);
+        CHECK(svc->send(1, "squareup").get().status == "off");
+        CHECK(svc->sendOn());
+        CHECK(svc->send(1, "squareup").get().ok);
+        // a client's own switch
+        CHECK(svc->send(1, "squareup", {}, std::nullopt, "rsi").get().status == "off");  // client not enabled
+        CHECK(svc->enable("rsi"));
+        CHECK(svc->send(1, "squareup", {}, std::nullopt, "rsi").get().ok);
+        svc->stop();
+    }
+
+    // ---- dry run: nothing sent, status "dry" ----
+    {
+        NatsConfig cfg; cfg.dry_run = true; cfg.send_on = true;
+        NatsService svc(cfg);                                // no factory needed in a dry run
+        svc.connect();
+        CHECK(svc.send(1, "squareup").get().status == "dry");
+        CHECK(svc.state() == "dry");
+        svc.stop();
+    }
+
+    // ---- users: no_user / user_not_allowed / ok ----
+    {
+        NatsConfig cfg; cfg.send_on = true; cfg.users = {3, 4};
+        auto [svc, wire] = makeSvc(cfg);
+        CHECK(svc->send(1, "squareup").get().status == "no_user");      // two users, none named
+        CHECK(svc->send(1, "squareup", {}, 9).get().status == "user_not_allowed");
+        CHECK(svc->send(1, "squareup", {}, 3).get().ok);
+        svc->stop();
+    }
+
+    // ---- blocks ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        svc->block(3, {5});
+        CHECK(svc->send(5, "squareup", {}, 3).get().status == "blocked");
+        CHECK(svc->send(6, "squareup", {}, 3).get().ok);               // a different pf is fine
+        svc->unblock(3, {5});
+        CHECK(svc->send(5, "squareup", {}, 3).get().ok);
+        svc->stop();
+    }
+
+    // ---- a confirmed command updates the shared pf-state ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        CHECK(svc->subscribe(1001, 900, {}, 3).get().ok);
+        auto st = svc->pfState(1001, 3);
+        CHECK(st && st->subscribed && st->option == 900);
+        svc->stop();
+    }
+
+    // ---- a multi-step job runs its steps in order on one lane ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        auto r = svc->submit(2000, [](Call& call) {
+            call("pause_unpause", {{"Action", std::string("Pause")}});
+            return call("apply", {{"maxqty", int64_t{50}}});
+        }, 3).get();
+        CHECK(r.ok && r.cmd == "apply");
+        CHECK(wire->sent.size() == 2 && std::get<std::string>(wire->sent[0].second.at("Action")) == "Pause");
+        svc->stop();
+    }
+
+    // ---- a cross-portfolio workflow via go() + lane() ----
+    {
+        NatsConfig cfg; cfg.send_on = true;
+        auto [svc, wire] = makeSvc(cfg);
+        std::promise<void> done;
+        NatsService* s = svc.get();
+        bool started = svc->go([s, &done] {
+            s->lane(10, [](Call& c) { return c("squareup", {}); }, 3);
+            s->lane(11, [](Call& c) { return c("squareup", {}); }, 3);
+            done.set_value();
+        });
+        CHECK(started);
+        done.get_future().wait_for(std::chrono::seconds(5));
+        CHECK(wire->sent.size() == 2);
+        // go() is dropped while sending is off
+        svc->sendOff();
+        CHECK(!svc->go([] {}));
+        svc->stop();
+    }
+}
+
 int main() {
     testIni();
     testMarkets();
@@ -608,6 +783,7 @@ int main() {
     testLimits();
     testRegistry();
     testBook();
+    testNats();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

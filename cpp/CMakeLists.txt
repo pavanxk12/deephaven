@@ -37,6 +37,10 @@ target_link_libraries(algo_data PUBLIC algo_core)
 add_library(algo_strategy STATIC strategy/registry.cpp strategy/book.cpp)
 target_link_libraries(algo_strategy PUBLIC algo_core)
 
+# comms layer: the NATS service; links only core
+add_library(algo_comms STATIC comms/nats_service.cpp)
+target_link_libraries(algo_comms PUBLIC algo_core)
+
 add_executable(candles_replay tools/candles_replay.cpp)
 target_link_libraries(candles_replay PRIVATE algo_data)
 
@@ -48,7 +52,7 @@ target_link_libraries(master_build PRIVATE algo_data)
 
 enable_testing()
 add_executable(test_core tests/test_core.cpp)
-target_link_libraries(test_core PRIVATE algo_data algo_strategy)
+target_link_libraries(test_core PRIVATE algo_data algo_strategy algo_comms)
 add_test(NAME test_core COMMAND test_core WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME candles_parity
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/parity/candles_parity.py --bin $<TARGET_FILE:candles_replay>
