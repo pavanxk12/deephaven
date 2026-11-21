@@ -6,6 +6,7 @@ B        := build
 
 CORE := core/ini.cpp core/tz.cpp core/market.cpp core/mirror_ring.cpp core/process_config.cpp core/event_bus.cpp core/plugin.cpp core/app.cpp core/sql.cpp core/statedb.cpp core/pfstate.cpp core/limits.cpp
 DATA := data/ltt_parser.cpp data/token_index.cpp data/candle_aggregator.cpp data/master.cpp
+STRATEGY := strategy/registry.cpp
 # libpq's header lives under a "postgresql" subdir on Debian/Ubuntu (/usr/include/postgresql/libpq-fe.h), not on the
 # plain include path; sqlite3.h usually is on the plain path already, so only the extra -I is needed here.
 MASTER_INC  := -I/usr/include/postgresql -I/usr/local/include/postgresql
@@ -37,8 +38,8 @@ sdk-check: $(B)/libNiftySmaCross.so $(B)/libBasketRsiSingle.so
 $(B):
 	mkdir -p $(B)
 
-$(B)/test_core: $(CORE) $(DATA) tests/test_core.cpp $(wildcard core/*.h data/*.h) | $(B)
-	$(CXX) $(CXXFLAGS) $(INC) $(MASTER_INC) $(CORE) $(DATA) tests/test_core.cpp $(MASTER_LIBS) -o $@
+$(B)/test_core: $(CORE) $(DATA) $(STRATEGY) tests/test_core.cpp $(wildcard core/*.h data/*.h strategy/*.h) | $(B)
+	$(CXX) $(CXXFLAGS) $(INC) $(MASTER_INC) $(CORE) $(DATA) $(STRATEGY) tests/test_core.cpp $(MASTER_LIBS) -o $@
 
 $(B)/candles_replay: $(CORE) $(DATA) tools/candles_replay.cpp $(wildcard core/*.h data/*.h) | $(B)
 	$(CXX) $(CXXFLAGS) $(INC) $(MASTER_INC) $(CORE) $(DATA) tools/candles_replay.cpp $(MASTER_LIBS) -o $@
@@ -49,8 +50,8 @@ $(B)/master_dump: $(CORE) $(DATA) tools/master_dump.cpp $(wildcard core/*.h data
 $(B)/master_build: $(CORE) $(DATA) tools/master_build.cpp $(wildcard core/*.h data/*.h) | $(B)
 	$(CXX) $(CXXFLAGS) $(INC) $(MASTER_INC) $(CORE) $(DATA) tools/master_build.cpp $(MASTER_LIBS) -o $@
 
-$(B)/test_core_tsan: $(CORE) $(DATA) tests/test_core.cpp | $(B)
-	$(CXX) -std=c++20 -O1 -g -pthread -fsanitize=thread $(INC) $(MASTER_INC) $(CORE) $(DATA) tests/test_core.cpp $(MASTER_LIBS) -o $@
+$(B)/test_core_tsan: $(CORE) $(DATA) $(STRATEGY) tests/test_core.cpp | $(B)
+	$(CXX) -std=c++20 -O1 -g -pthread -fsanitize=thread $(INC) $(MASTER_INC) $(CORE) $(DATA) $(STRATEGY) tests/test_core.cpp $(MASTER_LIBS) -o $@
 
 test: $(B)/test_core
 	./$(B)/test_core

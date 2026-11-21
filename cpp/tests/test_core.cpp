@@ -23,6 +23,7 @@
 #include "core/mirror_ring.h"
 #include "core/seqlock.h"
 #include "core/spsc_ring.h"
+#include "strategy/registry.h"
 #include "core/tz.h"
 #include "data/ltt_parser.h"
 #include "data/token_index.h"
@@ -467,6 +468,66 @@ static void testLimits() {
     lim.removeListener(tok);
 }
 
+static void testRegistry() {
+    SECTION("registry");
+    Registry reg;                                             // in-memory
+
+    int rows = 0;
+    auto tok = reg.onChange([&](int64_t, int64_t, const RegRec&) { ++rows; });
+
+    // allocate runs a strategy's numbers on from the start, stepping over numbers held by others
+    const int64_t a = reg.create(3, "rsi_stocks", "RELIANCE");    // first for this owner -> 1001
+    const int64_t b = reg.create(3, "rsi_stocks", "TCS");         // next -> 1002
+    CHECK(a == 1001 && b == 1002 && rows == 2);
+    // a different owner starting at the same point skips the taken numbers
+    const int64_t c = reg.allocate(3, "straddle", 1001, "", "straddle", "NIFTY");
+    CHECK(c == 1003);                                              // 1001/1002 taken by rsi_stocks -> 1003
+    // its own next one runs on from its highest
+    CHECK(reg.allocate(3, "straddle", 1001) == 1004);
+
+    // another user is independent
+    CHECK(reg.create(4, "rsi_stocks", "INFY") == 1001);
+
+    // get / owner_of / count
+    auto rec = reg.get(3, 1001);
+    CHECK(rec && rec->owner == "rsi_stocks" && rec->name == "RELIANCE" && !rec->created.empty());
+    CHECK(reg.ownerOf(3, 1003) == "straddle");
+    CHECK(reg.count().first == 2 && reg.count().second == 5);      // 2 users; user 3 has 4 (1001-1004), user 4 has 1
+
+    // registerPf: free -> registered; same owner unchanged -> exists; changed -> updated; other owner -> taken
+    Claim r1 = reg.registerPf(9, 2001, "console");
+    CHECK(r1 && r1.status == "registered");
+    Claim r2 = reg.registerPf(9, 2001, "console");
+    CHECK(r2 && r2.status == "exists");
+    Claim r3 = reg.registerPf(9, 2001, "console", "", "", "RELIANCE");  // sets the name
+    CHECK(r3 && r3.status == "updated" && reg.get(9, 2001)->name == "RELIANCE");
+    Claim r4 = reg.registerPf(9, 2001, "someone_else");
+    CHECK(!r4 && r4.status == "taken" && r4.held_by == "console");
+
+    // bad inputs throw
+    bool threw = false;
+    try { reg.allocate(0, "x"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+    threw = false;
+    try { reg.create(3, "", "X"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+
+    // portfolios(user) is sorted and filtered
+    auto p3 = reg.portfolios(3);
+    CHECK(p3.size() == 4 && p3.front().pf == 1001 && p3.back().pf == 1004);
+
+    // persistence: numbers survive a reload from StateDB, and allocation continues past them
+    auto holder = std::make_shared<std::unique_ptr<SqlConn>>(makeSqliteConn(":memory:"));
+    StateDB db([holder] { return std::move(*holder); });
+    Registry rp(&db);
+    CHECK(rp.create(7, "algo_x", "A") == 1001 && rp.create(7, "algo_x", "B") == 1002);
+    Registry reloaded(&db);
+    CHECK(reloaded.get(7, 1001) && reloaded.get(7, 1001)->name == "A");
+    CHECK(reloaded.create(7, "algo_x", "C") == 1003);             // continues from the persisted highest
+
+    reg.removeListener(tok);
+}
+
 int main() {
     testIni();
     testMarkets();
@@ -480,6 +541,7 @@ int main() {
     testStateDb();
     testPfStates();
     testLimits();
+    testRegistry();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
