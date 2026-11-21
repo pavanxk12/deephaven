@@ -14,6 +14,7 @@
 
 #include "core/app.h"
 #include "core/ini.h"
+#include "core/limits.h"
 #include "core/market.h"
 #include "core/pfstate.h"
 #include "core/sql.h"
@@ -409,6 +410,63 @@ static void testPfStates() {
     CHECK(!ps.get(3, 1001).has_value() && ps.get(5, 7000).has_value());
 }
 
+static void testLimits() {
+    SECTION("limits");
+    Limits lim;                                               // in-memory (no StateDB)
+    int changes = 0;
+    auto tok = lim.onChange([&](const std::string&) { ++changes; });
+
+    // bad inputs throw
+    bool threw = false;
+    try { lim.setLimit("s", "bogus", 1.0); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+    threw = false;
+    try { lim.setLimit("s", "turnover", -5.0); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+
+    // turnover: breaches at >= limit, then latches
+    lim.setLimit("nifty", "turnover", 1'000'000.0);
+    CHECK(lim.get("nifty").turnover == 1'000'000.0 && !lim.get("nifty").turnover_hit);
+    CHECK(lim.update("nifty", 999'999.0, std::nullopt).empty());
+    auto n2 = lim.update("nifty", 1'000'000.0, std::nullopt);
+    CHECK(n2.size() == 1 && n2[0] == "turnover" && lim.get("nifty").turnover_hit);
+    lim.update("nifty", 500'000.0, std::nullopt);             // a later lower value stays latched
+    CHECK(lim.get("nifty").turnover_hit);
+    CHECK(lim.setLimit("nifty", "turnover", 2'000'000.0).empty() && !lim.get("nifty").turnover_hit);  // raising lifts it
+
+    // m2m: breaches at <= limit; the sign counts
+    lim.setLimit("straddle", "m2m", -50'000.0);
+    CHECK(lim.update("straddle", std::nullopt, -49'999.0).empty());   // above the limit, ok
+    auto m1 = lim.update("straddle", std::nullopt, -50'000.0);        // at the limit, breach
+    CHECK(m1.size() == 1 && m1[0] == "m2m" && lim.get("straddle").m2m_hit);
+
+    // a missing value (Deephaven double null) never breaches
+    lim.setLimit("x", "m2m", -1'000.0);
+    CHECK(lim.update("x", std::nullopt, -1.0e308).empty() && !lim.get("x").m2m_hit);
+
+    // blocked() text
+    CHECK(lim.blocked("nifty").empty());
+    CHECK(lim.blocked("straddle").find("M2M limit -50,000 reached") != std::string::npos);
+
+    // 0 clears a limit; names() is sorted
+    lim.setLimit("nifty", "turnover", 0.0);
+    CHECK(!lim.get("nifty").turnover.has_value());
+    CHECK(changes > 0);
+
+    // persistence through StateDB: the latch survives a reload
+    auto holder = std::make_shared<std::unique_ptr<SqlConn>>(makeSqliteConn(":memory:"));
+    StateDB db([holder] { return std::move(*holder); });
+    Limits lp(&db);
+    lp.setLimit("persisted", "turnover", 700'000.0);
+    lp.update("persisted", 800'000.0, std::nullopt);          // breach -> saved to the table
+    CHECK(lp.get("persisted").turnover_hit);
+    Limits reloaded(&db);
+    auto r = reloaded.get("persisted");
+    CHECK(r.turnover == 700'000.0 && r.turnover_hit);
+
+    lim.removeListener(tok);
+}
+
 int main() {
     testIni();
     testMarkets();
@@ -421,6 +479,7 @@ int main() {
     testAppPlugin();
     testStateDb();
     testPfStates();
+    testLimits();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

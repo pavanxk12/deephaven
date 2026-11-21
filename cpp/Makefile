@@ -4,7 +4,7 @@ CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -pthread
 INC      := -I.
 B        := build
 
-CORE := core/ini.cpp core/tz.cpp core/market.cpp core/mirror_ring.cpp core/process_config.cpp core/event_bus.cpp core/plugin.cpp core/app.cpp core/sql.cpp core/statedb.cpp core/pfstate.cpp
+CORE := core/ini.cpp core/tz.cpp core/market.cpp core/mirror_ring.cpp core/process_config.cpp core/event_bus.cpp core/plugin.cpp core/app.cpp core/sql.cpp core/statedb.cpp core/pfstate.cpp core/limits.cpp
 DATA := data/ltt_parser.cpp data/token_index.cpp data/candle_aggregator.cpp data/master.cpp
 # libpq's header lives under a "postgresql" subdir on Debian/Ubuntu (/usr/include/postgresql/libpq-fe.h), not on the
 # plain include path; sqlite3.h usually is on the plain path already, so only the extra -I is needed here.
