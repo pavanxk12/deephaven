@@ -23,6 +23,7 @@
 #include "core/mirror_ring.h"
 #include "core/seqlock.h"
 #include "core/spsc_ring.h"
+#include "strategy/book.h"
 #include "strategy/registry.h"
 #include "core/tz.h"
 #include "data/ltt_parser.h"
@@ -528,6 +529,70 @@ static void testRegistry() {
     reg.removeListener(tok);
 }
 
+static void testBook() {
+    SECTION("book");
+    Registry reg;                                             // in-memory numbering
+    Portfolios b("m", "s", 1001, &reg, 3, "book_rsi");        // user 3, no StateDB
+
+    b.track({500});
+    CHECK(b.tracked.count(500) && b.allow.at(500) == true);
+
+    // first signal: a new PF from the registry
+    auto a1 = b.assign(500, 900, "RELIANCE", "rsi");
+    CHECK(a1.pf == 1001 && !a1.old_pf.has_value() && a1.created);
+    b.subscribe(1001, 900);
+
+    // same option kept, no new number
+    auto a2 = b.assign(500, 900);
+    CHECK(a2.pf == 1001 && !a2.created && !a2.old_pf.has_value());
+
+    // a different option: the stock moves to a new PF, the old one retires
+    auto a3 = b.assign(500, 901, "RELIANCE", "rsi");
+    CHECK(a3.pf == 1002 && a3.old_pf == 1001 && a3.created);
+    b.subscribe(1002, 901);
+
+    CHECK(b.currentPfMap().size() == 1 && b.currentPfMap().at(500) == 1002);
+    CHECK(b.tokenOfPf(1002) == 500);
+    CHECK((b.allPfs() == std::vector<int64_t>{1001, 1002}));
+    CHECK(b.pfOf(500) == 1002 && !b.pfOf(999).has_value());
+
+    // revert: a new PF that never reached the bridge goes back to the old one
+    auto a4 = b.assign(500, 902);
+    CHECK(a4.pf == 1003 && a4.old_pf == 1002);
+    b.revert(500, 1002, 1003);
+    CHECK(b.pfOf(500) == 1002 && (b.allPfs() == std::vector<int64_t>{1001, 1002}));
+
+    // pf_for_row / owner_of: exact subscription wins; else the current PF of the same stock
+    auto sym = [](int64_t t) -> std::string {
+        switch (t) { case 500: return "RELIANCE FUT"; case 900: return "RELIANCE 2500 CE"; case 901: return "RELIANCE 2600 CE"; }
+        return "X";
+    };
+    CHECK(b.pfForRow(901, sym) == 1002);                      // exact subscription to 901
+    CHECK(b.pfForRow(900, sym) == 1001);                      // 900 still subscribed by the retired 1001
+    CHECK(b.ownerOf(500, sym) == 500);                        // the future itself is current
+    CHECK(b.ownerOf(900, sym) == 500);                        // old leg -> same stock's current future
+
+    // claim_existing: a number already held by someone else for this user is refused
+    Registry reg2;
+    reg2.registerPf(5, 2001, "other_book");
+    Portfolios bc("m2", "s2", 1001, &reg2, 5, "my_book");
+    bc.pf_map[600] = 2001;                                     // a number this book's file already held
+    auto refused = bc.claimExisting();
+    CHECK(refused.size() == 1 && refused[0].held_by == "other_book");
+
+    // persistence: pf_map and subscribed survive a reload from StateDB
+    auto holder = std::make_shared<std::unique_ptr<SqlConn>>(makeSqliteConn(":memory:"));
+    StateDB db([holder] { return std::move(*holder); });
+    Registry rp(&db);
+    Portfolios bp("pm", "ps", 1001, &rp, 7, "bk", &db);
+    bp.track({500});
+    auto ap = bp.assign(500, 900, "R", "rsi");
+    bp.subscribe(ap.pf, 900);
+    CHECK(ap.pf == 1001);
+    Portfolios bp2("pm", "ps", 1001, &rp, 7, "bk", &db);
+    CHECK(bp2.pf_map.at(500) == 1001 && bp2.subscribed.at(1001) == 900);
+}
+
 int main() {
     testIni();
     testMarkets();
@@ -542,6 +607,7 @@ int main() {
     testPfStates();
     testLimits();
     testRegistry();
+    testBook();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

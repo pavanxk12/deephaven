@@ -34,7 +34,7 @@ add_library(algo_data STATIC data/ltt_parser.cpp data/token_index.cpp data/candl
 target_link_libraries(algo_data PUBLIC algo_core)
 
 # strategy layer: registry/book/bridge/guard; links only core (the Python package's import rules)
-add_library(algo_strategy STATIC strategy/registry.cpp)
+add_library(algo_strategy STATIC strategy/registry.cpp strategy/book.cpp)
 target_link_libraries(algo_strategy PUBLIC algo_core)
 
 add_executable(candles_replay tools/candles_replay.cpp)
