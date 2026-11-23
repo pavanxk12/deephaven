@@ -11,15 +11,20 @@
 #                     come first, then today's candles. So the RSI at 09:35 is computed through yesterday's prices, overnight gap included. No files = it says so and starts from today.
 #   The exit          the script's own target and stop-loss on the price: +TARGET_PCT in its favour, or -STOP_PCT against it (checked on every 1-minute close). TRAIL_TRIGGER_PCT /
 #                     PROFIT_LOCK_PCT (both None, or both set): once the move reaches TRAIL_TRIGGER_PCT the stop shifts, for the rest of that position's life, from -STOP_PCT to PROFIT_LOCK_PCT.
-#                     The engine's CrossOrder has no target or stop and reads its parameters ONCE per portfolio, so an exit is the portfolio's `squareup` command.
 #   One entry         ONE_ENTRY_PER_STOCK = True: a stock is entered ONCE. After its take-profit, stop-loss or any other exit it is not entered again (until the script is pasted again).
 #   The time exit     EXIT_AT (15:55 New York time, 5 minutes before the 16:00 close): the automation is stopped the way algo_stop does it: every portfolio is paused and squared up, a minute
 #                     later unsubscribed (so the plugin can close first), and the script stops. No entry is made from then on. It is checked on every batch of 1-minute candles, so it
 #                     starts within a minute of EXIT_AT. It refuses while sending is OFF (it says so; then run meanrevert_stop() by hand).
-#   The order         a NEW portfolio for every trade: ONE `subscribe` that carries the fields, as for 07 (the engine knows the strategy as "CrossOrder"; SIDE 1 = buy, 2 = sell):
-#                     {"strategyname": "CrossOrder", "TOKEN": <contract>, "SIDE": 1|2, "QTY": n lots, "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}
-#                     The NATS service adds USERIDENTIFIER and user_id. The book gives the portfolio numbers; each stock may use up to 100 a day.
-#                     CHECK on the US server before real money: the strategy name "CrossOrder", SERVERCODE and ACCOUNT are India's values.
+#   The order         ENGINE["strategyname"] = "LimitOrder" (the engine plugin that rests a limit order and MODIFYs it in place on later params, never CrossOrder's immediate fill):
+#                     {"strategyname": "LimitOrder", "TOKEN": <contract>, "SIDE": 1|2, "QTY": n lots, "PRICE": <int>, "SERVERCODE": ..., "ACCOUNT": "PRO", "ALGOID": "1", "MAX_TRIES": 5}
+#   The spread gate   ENTRY and EXIT both wait for the live spread (SPREAD_MAX, from fo_market_data's b0p/a0p/ltp) to tighten before sending anything -- see spread_ok()/the
+#                     pending_entry/pending_exit state machine below. An ENTRY that never tightens within SPREAD_WAIT_S is dropped (no trade); an EXIT fires anyway once it times out
+#                     (a stop-loss/target must never just hang unsent). Once resting, an order is "chased": every CHASE_EVERY_S, if the spread is still OK and the best price has moved,
+#                     an "apply" (not a new subscribe) re-prices it in place, up to CHASE_TRIES times; after that it is paused (cancelled) and, for an entry, unsubscribed -- nothing more.
+#                     An EXIT is a brand-new portfolio (opposite side, NOT the original entry's `squareup`): the original entry pf is left open, now offset by this new one. Its QTY is
+#                     the REAL filled amount read from the `orders_trade` table (token, buy_sell, fill_quantity, fill_price, PF), never the original target -- so a partially filled
+#                     entry is still closed exactly, not over- or under-closed. The book gives the portfolio numbers; each stock may use up to 100 a day.
+#                     CHECK on the US server before real money: SERVERCODE and ACCOUNT are India's values.
 #
 # EVERYTHING is inside the function run_meanrevert() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of
 # names shared by every script you paste, so top-level `rsi` or `closes` would overwrite another running script's. The only names left in the terminal start with meanrevert:
@@ -45,6 +50,7 @@ def run_meanrevert():
     from algo import current
     from algo.comms.nats_service import NO_SERVICE
     from algo.core.timeframe import parse_timeframe
+    from algo.ui.filters import PF_PER_USER             # orders_trade's own PF column is wire-level: USER * PF_PER_USER + the book's pf (31002 = user 3, book pf 1002)
 
     # =============================== USER INPUT ===============================
     USER = 3
@@ -76,7 +82,7 @@ def run_meanrevert():
     QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
     ENTRY_VALUE = 5000                       # None: every entry is QTY lots. A number (dollars): the quantity at entry is int(ENTRY_VALUE / the last 1-minute close), QTY is then not used;
                                              # if one share costs more than ENTRY_VALUE the quantity would be 0 and that entry is skipped (it says so)
-    ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1","MAX_TRIES":5}      # "CrossOrder" is the engine's name for the CrossOrder plugin
+    ENGINE = {"strategyname": "LimitOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1","MAX_TRIES":5}      # "CrossOrder" is the engine's name for the CrossOrder plugin
     WINDOW = (dtime(10, 0), dtime(15, 0))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
     EXIT_AT = dtime(15, 45)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
     MAX_PORTFOLIOS = 28                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
@@ -85,7 +91,15 @@ def run_meanrevert():
                                              # the wait lets the plugin send and fill its closing order first. None = never (the slot is then held until the stop at the end of the day)
     TICK_EXITS = True                        # True: target and stop-loss are also checked on every price tick of the live feed (FEED_TABLE) for the open positions only, not just on each 1-minute close.
                                              # The candle check stays as the backup, and is used alone if the tick listener cannot be set up (it says so). Needs TARGET_PCT or STOP_PCT.
-    FEED_TABLE = "fo_market_data"            # the live feed: columns token and ltp (raw price; the contract's own divisor from the master turns it into the price)
+    FEED_TABLE = "fo_market_data"            # the live feed: columns token, ltp, b0p (best bid), a0p (best ask) (raw price; the contract's own divisor from the master turns it into the price)
+    SPREAD_MAX = 0.30                        # entry and exit both wait for the live spread (best ask - ltp for a BUY-side order, ltp - best bid for a SELL-side order) to be at
+                                             # most this (in price units, after the divisor) before the LimitOrder is actually sent, instead of firing it the instant the signal passes.
+    SPREAD_WAIT_S = 60                       # how long an entry may wait for SPREAD_MAX before it is given up on (no trade this signal). An EXIT instead falls back to firing anyway
+                                             # at the best price seen once this runs out: a stop-loss/target must not just hang unsent.
+    CHASE_TRIES = 3                          # once a LimitOrder is resting, up to this many times it is re-priced ("apply", not a new subscribe) to the current best price, each time
+                                             # the spread is still SPREAD_MAX-ok AND the price has moved since the last one sent. After CHASE_TRIES it is cancelled (paused) and,
+                                             # for an entry, unsubscribed -- nothing more is tried for that signal.
+    CHASE_EVERY_S = 3                        # how often (seconds) a resting order's chase re-checks the best price
     FAIL_COOLDOWN_S = 30
     RETRY_RANKING_S = 20                     # a ranking read that fails (a rare clash with the update cycle: "Previous values requested or inconsistent") is tried again on the next candle batches
                                              # for this many seconds instead of giving up on that stock for the whole bar. 0 = no retry
@@ -95,10 +109,12 @@ def run_meanrevert():
             and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and (ENTRY_VALUE is None or ENTRY_VALUE > 0) and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
             and ((TRAIL_TRIGGER_PCT is None) == (PROFIT_LOCK_PCT is None)) and (TRAIL_TRIGGER_PCT is None or TRAIL_TRIGGER_PCT > 0)
             and (TRAIL_STEP_PCT is None or (TRAIL_TRIGGER_PCT is not None and TRAIL_STEP_PCT > 0))
-            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
+            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)
+            and SPREAD_MAX > 0 and SPREAD_WAIT_S >= 0 and isinstance(CHASE_TRIES, int) and CHASE_TRIES >= 0 and CHASE_EVERY_S > 0):
         raise ValueError("every (low, high) band in REL_ZONE/ABS_ZONE must be inside 0 to 100 with low below high, TARGET_PCT and STOP_PCT above 0, "
                          "TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
                          "QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, every basket needs at least 3 symbols, "
+                         "SPREAD_MAX above 0, SPREAD_WAIT_S 0 or more, CHASE_TRIES a whole number 0 or more, CHASE_EVERY_S above 0, "
                          "and TRAIL_STEP_PCT (if set) needs TRAIL_TRIGGER_PCT set too and must be above 0")
     BAR_S = parse_timeframe(RSI_BAR)                               # 300; refuses a size that does not line up with the clock
     basket_of = {}                                                 # symbol -> the name of its basket
@@ -137,8 +153,15 @@ def run_meanrevert():
     next_slot = {t: (int(had[had["instrument"] == t]["slot"].max()) + 1 if had is not None and (had["instrument"] == t).any() else 0) for t in symbol_of}
 
     bars = {t: {} for t in symbol_of}                              # token -> {5-minute bar number: the last 1-minute close inside it}: what the RSI is computed from
-    last_px = {}                                                   # token -> the latest 1-minute close
-    position = {}                                                  # token -> {side, entry, qty, pf, state}   state: entering | open | exiting
+    last_px = {}                                                   # token -> the latest 1-minute close (candle)
+    last_tick = {}                                                 # token -> the latest ltp from fo_market_data (tick, not candle): what spread_ok() compares bid/ask against
+    best = {}                                                      # token -> (bid, ask), the latest best quotes from fo_market_data's b0p/a0p
+    filled = {}                                                    # pf -> cumulative fill_quantity from orders_trade, for every pf this script holds: the REAL filled size
+    position = {}                                                  # token -> {side, entry, qty, pf, state}   state: entering | open | exiting (qty is the TARGET; filled[pf] is the real size)
+    pending_entry = {}                                             # token -> {side, deadline}: a signal passed, waiting for SPREAD_MAX before the LimitOrder is actually sent
+    pending_exit = {}                                              # token -> {why, qty, deadline}: an exit was triggered, waiting for SPREAD_MAX (falls back to firing anyway past the deadline);
+                                                                   # qty is the real filled amount of the entry pf at the moment it was armed, not the original target
+    chase = {}                                                     # pf -> {token, side, qty, price, tries, kind}: a resting LimitOrder being re-priced ("entry" or "exit")
     traded_in_zone = {}                                            # token -> the zone it was traded in: no second trade until the RSI has left it
     entered = set()                                                # tokens already entered by this script: with ONE_ENTRY_PER_STOCK they are not entered again
     last_fail = {}
@@ -294,17 +317,38 @@ def run_meanrevert():
     def past_exit():
         return datetime.now(ZoneInfo("America/New_York")).time() >= EXIT_AT
 
-    def cross_order(token, side, qty):
-        return {**ENGINE, "TOKEN": int(token), "SIDE": int(side), "QTY": int(qty)}
+    def limit_order(token, side, qty, price):
+        return {**ENGINE, "TOKEN": int(token), "SIDE": int(side), "QTY": int(qty), "PRICE": int(price)}
 
-    def send_entry(pf, token, side, qty):
-        """The one subscribe that starts the strategy: exactly its own fields, sent as they are (not the churning subscribe defaults). A Future with the reply."""
+    def send_place(pf, token, side, qty, price):
+        """The one subscribe that starts a LimitOrder plugin instance: its own fields, sent as they are. A Future with the reply (an ACK that the order is working, not a fill)."""
         svc = current().get("nats") or NO_SERVICE
-        return svc.send(pf, "subscribe", cross_order(token, side, qty), user=USER, client=STRATEGY)       # honours this strategy's own switch
+        return svc.send(pf, "subscribe", limit_order(token, side, qty, price), user=USER, client=STRATEGY)       # honours this strategy's own switch
 
-    def send_exit(pf):
+    def send_modify(pf, qty, price):
+        """Re-price the resting order in place: the plugin's onParamsUpdate MODIFYs it (no cancel/restart). qty is always the ORIGINAL target -- the plugin works out the
+        remaining amount itself from its own fill count. Used only while chasing."""
         svc = current().get("nats") or NO_SERVICE
-        return svc.squareup(pf, user=USER, client=STRATEGY)                              # the plugin's SquareUpEvent closes the position
+        return svc.send(pf, "apply", {"QTY": int(qty), "PRICE": int(price), "MAX_TRIES": ENGINE["MAX_TRIES"]}, user=USER, client=STRATEGY)
+
+    def send_cancel(pf):
+        """Cancel a resting order: the plugin's only cancel path (PauseUnPauseEvent). Used only once CHASE_TRIES is used up."""
+        svc = current().get("nats") or NO_SERVICE
+        return svc.pause(pf, user=USER, client=STRATEGY)
+
+    def best_price(token, order_side):
+        b, a = best.get(token, (0, 0))
+        return a if order_side == 1 else b
+
+    def spread_ok(token, order_side):
+        """True once the live spread is tight enough to fire THIS side of an order: best ask vs ltp for a BUY leg, ltp vs best bid for a SELL leg (today's divisor applied).
+        False (keep waiting) while there is no live quote yet."""
+        ref = best_price(token, order_side)
+        ltp = last_tick.get(token, 0)
+        div = divisor_of(token)
+        if ref <= 0 or ltp <= 0 or not div:
+            return False
+        return abs(ref - ltp) / float(div) <= SPREAD_MAX
 
     live = set()                                                   # portfolios this script holds in the engine: open positions, and closed ones waiting for their unsubscribe
     at_limit_said = []                                             # the "at the limit" message is printed once until a slot frees
@@ -350,23 +394,196 @@ def run_meanrevert():
         why = exit_reason(pos, move)
         if why is not None:
             last_px[token] = px
-            leave(token, f"{why} (tick)")
+            arm_exit(token, f"{why} (tick)")
+
+    def chase_check(pf):
+        """One CHASE_EVERY_S check of a resting order: re-price it (an "apply") if the spread is still ok AND the price moved since the last one sent; cancel (and, for an
+        entry, unsubscribe) once CHASE_TRIES is used up. Exit-side chasing is symmetric here, but the engine's LimitOrder plugin only actually MODIFYs an ENTRY order --
+        an exit's "apply" calls are harmless no-ops there (SquareUpEvent orders are never modified), kept only so an exit is cancelled the same way after CHASE_TRIES."""
+        c = chase.get(pf)
+        if c is None:
+            return
+        if filled.get(pf, 0) >= c["qty"]:
+            chase.pop(pf, None)                                     # fully filled: nothing left to re-price or cancel
+            maybe_untrack(c["token"])
+            return
+        if c["tries"] >= CHASE_TRIES:
+            chase.pop(pf, None)
+            send_cancel(pf)
+            got = filled.get(pf, 0)
+            print(f"{symbol_of[c['token']]}: {c['kind']} chase used up {CHASE_TRIES} tries, PF {pf} cancelled (filled {got} of {c['qty']})")
+            if c["kind"] == "entry":
+                if got > 0:                                        # partially filled before the cancel: keep tracking it as an open position of that size, don't orphan it
+                    pos = position.get(c["token"])
+                    if pos is not None:
+                        pos["qty"] = got
+                        pos["state"] = "open"
+                else:
+                    release(pf, c["token"])
+                    entered.discard(c["token"])
+                    last_fail[c["token"]] = time.time()
+                    position.pop(c["token"], None)
+                    maybe_untrack(c["token"])
+            return
+        if not spread_ok(c["token"], c["side"]):
+            return                                                # spread went bad again: wait, this check doesn't count as a try
+        price = best_price(c["token"], c["side"])
+        if price == c["price"]:
+            return                                                # unchanged: wait, doesn't count as a try either
+        send_modify(pf, c["qty"], price)
+        c["price"] = price
+        c["tries"] += 1
+
+    def maybe_untrack(token):
+        """Stop following a token's ticks once nothing still needs them: no pending entry/exit, no open position, no live chase."""
+        if token in pending_entry or token in pending_exit or token in position:
+            return
+        if any(c["token"] == token for c in chase.values()):
+            return
+        tick_track(token, False)
+
+    def fire_entry(token):
+        """The signal's spread finally tightened (or was already tight): send the real entry now. True when sent."""
+        side = pending_entry.pop(token, {}).get("side")
+        if side is None:
+            return False
+        if len(live) >= MAX_PORTFOLIOS:
+            if not at_limit_said:
+                at_limit_said.append(True)
+                print(f"{STRATEGY}: {len(live)} portfolios held (MAX_PORTFOLIOS {MAX_PORTFOLIOS}); no new entry until an exit has been unsubscribed")
+            maybe_untrack(token)
+            return False
+        if next_slot[token] >= 100:
+            print(f"{symbol_of[token]}: all 100 portfolios of the day are used, no trade")
+            maybe_untrack(token)
+            return False
+        qty = QTY if ENTRY_VALUE is None else int(ENTRY_VALUE / last_px[token])         # by value: whole units for ENTRY_VALUE at the last close
+        if qty < 1:
+            print(f"{symbol_of[token]}: ENTRY_VALUE {ENTRY_VALUE:g} buys less than one unit at {last_px[token]:g}, no trade")
+            maybe_untrack(token)
+            return False
+        a = pf_assign(STRATEGY, token, token, name=symbol_of[token], slot=next_slot[token])       # the BOOK gives a NEW portfolio number (None while OFF or unticked)
+        if not a:
+            maybe_untrack(token)
+            return False
+        next_slot[token] += 1
+        pf = a["pf"]
+        price = best_price(token, side)
+        live.add(pf)
+        entered.add(token)
+        position[token] = {"side": side, "entry": last_px[token], "qty": qty, "pf": pf, "state": "entering", "trailing": False, "lock": None}
+        chase[pf] = {"token": token, "side": side, "qty": qty, "price": price, "tries": 0, "kind": "entry"}
+        print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {qty} lot(s) at {price} (LimitOrder) on PF {pf}")
+        send_place(pf, token, side, qty, price).add_done_callback(lambda f: settled(token, f))
+        return True
+
+    def arm_entry(token, side):
+        if token in pending_entry or token in position:
+            return
+        pending_entry[token] = {"side": side, "deadline": time.time() + SPREAD_WAIT_S}
+        tick_track(token, True)
+
+    def fire_exit(token, qty, forced=False):
+        """The exit's spread tightened, or it timed out and must fire anyway: open a NEW portfolio (opposite side), never the original entry's squareup."""
+        pos = position.get(token)
+        if pos is None:
+            return
+        closing_side = 2 if pos["side"] == 1 else 1
+        price = best_price(token, closing_side)
+        if price <= 0:
+            pending_exit[token] = {"why": "no quote yet", "qty": qty, "deadline": time.time() + SPREAD_WAIT_S}      # can't even force it without a quote: try again shortly
+            return
+        a = pf_assign(STRATEGY, token, token, name=symbol_of[token], slot=next_slot[token])
+        if not a:
+            pending_exit[token] = {"why": "no portfolio yet", "qty": qty, "deadline": time.time() + SPREAD_WAIT_S}
+            return
+        next_slot[token] += 1
+        pf = a["pf"]
+        live.add(pf)
+        pos["state"] = "exiting"
+        chase[pf] = {"token": token, "side": closing_side, "qty": qty, "price": price, "tries": 0, "kind": "exit"}
+        print(f"{symbol_of[token]}: closing {qty} on NEW PF {pf} at {price}{' (forced, spread never tightened)' if forced else ''}")
+        send_place(pf, token, closing_side, qty, price).add_done_callback(lambda f: settled_exit(token, pf, f))
+
+    def arm_exit(token, why):
+        if token in pending_exit:
+            return
+        pos = position.get(token)
+        if pos is None or pos["state"] != "open":
+            return
+        qty_open = filled.get(pos["pf"], 0)
+        if qty_open <= 0:
+            print(f"{symbol_of[token]}: {why}, but PF {pos['pf']} shows no confirmed fill yet; nothing to close")
+            position.pop(token, None)
+            maybe_untrack(token)
+            return
+        pending_exit[token] = {"why": why, "qty": qty_open, "deadline": time.time() + SPREAD_WAIT_S}
+        print(f"{symbol_of[token]}: {why}, waiting up to {SPREAD_WAIT_S}s for the spread before closing {qty_open}")
+
+    def on_trade(update, is_replay):
+        """orders_trade: token, buy_sell, fill_quantity, fill_price, response_order_number, PF, activity_time. Its PF is wire-level (USER * PF_PER_USER + the book's pf,
+        e.g. 31002 for user 3's book pf 1002) -- converted back to the book's own pf before matching, since `live`/`chase`/`filled` are all keyed by the book's pf everywhere
+        else. Only this strategy's own live pfs are kept."""
+        ch = update.added(["PF", "fill_quantity"])
+        if ch is None:
+            return
+        for wire_pf, qty in zip(ch["PF"], ch["fill_quantity"]):
+            pf = int(wire_pf) - USER * PF_PER_USER
+            if pf in live:
+                filled[pf] = filled.get(pf, 0) + int(qty)
+
+    def start_trade_listener():
+        """watch() checks app.tables/app.ns, which orders_trade may never be registered in even once it exists as a bare console
+        global (the same gap tick_start() already works around for FEED_TABLE via globals().get(...)) -- so this reads it the same
+        direct way instead of going through watch()."""
+        from deephaven.table_listener import listen
+        table = globals().get("orders_trade")
+        if table is None:
+            return None
+        old = current().shared.setdefault("trade_handles", {}).pop(STRATEGY, None)
+        if old is not None:
+            old.stop()
+        handle = listen(table, on_trade, do_replay=False)
+        current().shared["trade_handles"][STRATEGY] = handle
+        return handle
 
     def on_tick(update, is_replay):
-        """Every price tick of a token with an open position (the engine filters the feed; the other ticks never reach Python).
-        fo_market_data is a last_by("PF") table: a token's first tick arrives as an added row, every one after that as a
-        modified row (same row, updated in place) -- both must be read or only the very first tick of each position is seen."""
-        for ch in (update.added(["token", "ltp"]), update.modified(["token", "ltp"])):
+        """Every price tick of a token being followed (an open position, a pending entry, or a chasing order; the engine filters the feed, other ticks never reach Python).
+        fo_market_data is a last_by("PF") table: a token's first tick arrives as an added row, every one after that as a modified row (same row, updated in place) -- both
+        must be read or only the very first tick of each position is seen."""
+        for ch in (update.added(["token", "ltp", "b0p", "a0p"]), update.modified(["token", "ltp", "b0p", "a0p"])):
             if ch is None:
                 continue
-            for tok, ltp in zip(ch["token"], ch["ltp"]):
+            for tok, ltp, b, a in zip(ch["token"], ch["ltp"], ch["b0p"], ch["a0p"]):
                 tok = int(tok)
+                if ltp > 0:
+                    last_tick[tok] = float(ltp)
+                if b > 0 and a > 0:
+                    best[tok] = (float(b), float(a))
+                pe = pending_entry.get(tok)
+                if pe is not None:
+                    if spread_ok(tok, pe["side"]):
+                        fire_entry(tok)
+                    elif time.time() >= pe["deadline"]:
+                        pending_entry.pop(tok, None)
+                        count("entry spread never tightened")
+                        maybe_untrack(tok)
                 pos = position.get(tok)
-                if pos is None or pos["state"] != "open" or ltp <= 0:
-                    continue
-                div = divisor_of(tok)
-                if div:
-                    tick_exit(tok, pos, float(ltp) / float(div))
+                if pos is not None and pos["state"] == "open" and ltp > 0:
+                    div = divisor_of(tok)
+                    if div:
+                        tick_exit(tok, pos, float(ltp) / float(div))
+                px = pending_exit.get(tok)
+                if px is not None:
+                    closing_side = 2 if pos["side"] == 1 else 1 if pos is not None else None
+                    if closing_side is not None and spread_ok(tok, closing_side):
+                        pending_exit.pop(tok, None)
+                        fire_exit(tok, px["qty"])
+                    elif time.time() >= px["deadline"]:
+                        pending_exit.pop(tok, None)
+                        fire_exit(tok, px["qty"], forced=True)
+        for pf in list(chase):
+            chase_check(pf)
 
     tick_jobs = queue.Queue()                                      # (token, add?) jobs for the one worker thread: Deephaven refuses an input-table edit made from inside a listener or a callback
 
@@ -393,8 +610,8 @@ def run_meanrevert():
             tick_jobs.put((int(token), bool(on)))
 
     def tick_start():
-        if not TICK_EXITS or (TARGET_PCT is None and STOP_PCT is None):
-            return
+        """Ticks are no longer optional (TICK_EXITS only adds the candle-close target/stop check on top): every entry and exit waits for the spread and chases its order on
+        them, so without this the whole spread-gate/chase machinery has nothing driving it."""
         try:
             feed = globals().get(FEED_TABLE)
             if feed is None:
@@ -402,7 +619,7 @@ def run_meanrevert():
             from deephaven import dtypes, input_table
             from deephaven.table_listener import listen
             keys = input_table(col_defs={"token": dtypes.int32}, key_cols="token")
-            ticks = feed.where_in(keys, "token").where("ltp > 0").view(["token", "ltp"])           # in the engine: only the open positions' ticks come through
+            ticks = feed.where_in(keys, "token").where("ltp > 0").view(["token", "ltp", "b0p", "a0p"])    # only the followed tokens' ticks come through
             old = current().shared.setdefault("tick_handles", {}).pop(STRATEGY, None)
             if old is not None:
                 old.stop()                                                                      # pasted again: the old listener goes
@@ -414,75 +631,55 @@ def run_meanrevert():
             current().shared["tick_workers"][STRATEGY] = tick_jobs
             tick_state[:] = [keys, handle]
             threading.Thread(target=tick_worker, name=f"{STRATEGY}-tick-keys", daemon=True).start()
-            print(f"{STRATEGY}: target and stop-loss are checked on every price tick of {FEED_TABLE} (and on each candle as the backup)")
+            print(f"{STRATEGY}: spread gate / chase / {'tick exits, ' if TICK_EXITS else ''}live on {FEED_TABLE} (candle close is the backup)")
         except Exception as e:
             tick_state.clear()
-            print(f"{STRATEGY}: tick exits not available ({e}); target and stop-loss are checked on each 1-minute candle")
+            print(f"{STRATEGY}: live ticks not available ({e}); spread gate / chase cannot run, only the candle-close checks will")
 
-    def settled(token, what, future):
-        """The bridge answered (called from the NATS thread)."""
+
+    def settled(token, future):
+        """The entry's own pf answered (called from the NATS thread)."""
         try:
             ok = bool(future.result().ok)
             why = "" if ok else future.result().status
         except Exception as e:
             ok, why = False, repr(e)
         pos = position.get(token)
-        if what == "enter":
-            if ok and pos is not None:
-                pos["state"] = "open"
-            else:
-                if pos is not None:
-                    live.discard(pos["pf"])
-                position.pop(token, None)
-                tick_track(token, False)
-                last_fail[token] = time.time()
-                entered.discard(token)                                 # nothing was opened: this stock may still be entered
-                print(f"{symbol_of[token]}: entry FAILED ({why}); nothing is open")
-        elif ok:
+        if ok and pos is not None:
+            pos["state"] = "open"
+        else:
+            if pos is not None:
+                live.discard(pos["pf"])
+                chase.pop(pos["pf"], None)
             position.pop(token, None)
-            tick_track(token, False)
-            if pos is not None and UNSUB_AFTER_S is not None:
-                timer = threading.Timer(UNSUB_AFTER_S, release, (pos["pf"], token))        # the slot is freed a little later, not at once: the plugin may still be filling its closing order
+            maybe_untrack(token)
+            last_fail[token] = time.time()
+            entered.discard(token)                                 # nothing was opened: this stock may still be entered
+            print(f"{symbol_of[token]}: entry FAILED ({why}); nothing is open")
+
+    def settled_exit(token, pf, future):
+        """The exit's own pf answered (called from the NATS thread)."""
+        try:
+            ok = bool(future.result().ok)
+            why = "" if ok else future.result().status
+        except Exception as e:
+            ok, why = False, repr(e)
+        if ok:
+            position.pop(token, None)                              # ack, not fill (the same approximation already used for entries): treated as closed from here
+            maybe_untrack(token)
+            if UNSUB_AFTER_S is not None:
+                timer = threading.Timer(UNSUB_AFTER_S, release, (pf, token))        # the slot is freed a little later: the plugin may still be filling it
                 timer.daemon = True
                 timer.start()
-        elif pos is not None:
-            pos["state"] = "open"
-            last_fail[token] = time.time()
-            print(f"{symbol_of[token]}: exit FAILED ({why}); the position is still open, it is tried again")
-
-    def enter(token, side):
-        """Send the entry. True when it was sent; False when it was not (the limit, no portfolio number, all 100 of the day used): the caller may try again at the next signal."""
-        if len(live) >= MAX_PORTFOLIOS:
-            if not at_limit_said:
-                at_limit_said.append(True)
-                print(f"{STRATEGY}: {len(live)} portfolios held (MAX_PORTFOLIOS {MAX_PORTFOLIOS}); no new entry until an exit has been unsubscribed")
-            return False
-        if next_slot[token] >= 100:
-            print(f"{symbol_of[token]}: all 100 portfolios of the day are used, no trade")
-            return False
-        qty = QTY if ENTRY_VALUE is None else int(ENTRY_VALUE / last_px[token])         # by value: whole units for ENTRY_VALUE at the last close
-        if qty < 1:
-            print(f"{symbol_of[token]}: ENTRY_VALUE {ENTRY_VALUE:g} buys less than one unit at {last_px[token]:g}, no trade")
-            return False
-        a = pf_assign(STRATEGY, token, token, name=symbol_of[token], slot=next_slot[token])       # the BOOK gives a NEW portfolio number (None while OFF or unticked)
-        if not a:
-            return False
-        next_slot[token] += 1
-        live.add(a["pf"])
-        entered.add(token)
-        position[token] = {"side": side, "entry": last_px[token], "qty": qty, "pf": a["pf"], "state": "entering", "trailing": False, "lock": None}
-        tick_track(token, True)
-        print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {qty} lot(s) at {last_px[token]:g} on PF {a['pf']}")
-        send_entry(a["pf"], token, side, qty).add_done_callback(lambda f: settled(token, "enter", f))
-        return True
-
-    def leave(token, why):
-        pos = position.get(token)
-        if pos is None or pos["state"] != "open":
-            return
-        pos["state"] = "exiting"
-        print(f"{symbol_of[token]}: {why}, closing at {last_px[token]:g}")
-        send_exit(pos["pf"]).add_done_callback(lambda f: settled(token, "exit", f))
+            else:
+                live.discard(pf)
+        else:
+            live.discard(pf)
+            chase.pop(pf, None)
+            pos = position.get(token)
+            if pos is not None:
+                pos["state"] = "open"
+            print(f"{symbol_of[token]}: exit FAILED ({why}); still open, will retry on the next signal")
 
     def step(token, entry_ok=True):
         """One new 1-minute close of a traded stock: manage its position, or look for an entry (only when `entry_ok`: with ACT_ON_BAR_END that is the candle that ends a bar)."""
@@ -493,9 +690,9 @@ def run_meanrevert():
                 move = 100.0 * (1 if pos["side"] == 1 else -1) * (px / pos["entry"] - 1.0)         # % in the position's favour (negative = against it)
                 why = exit_reason(pos, move)
                 if why is not None:
-                    leave(token, why)
+                    arm_exit(token, why)
             return
-        if not entry_ok or (ONE_ENTRY_PER_STOCK and token in entered):
+        if token in pending_entry or not entry_ok or (ONE_ENTRY_PER_STOCK and token in entered):
             return
         zone = zone_of(rsi(closes(token)))
         if zone is None:
@@ -518,9 +715,10 @@ def run_meanrevert():
             count("refused by own days")
         elif not middle:
             count("refused by basket")
-        elif enter(token, zone_side[zone]):
-            count("entered")
+        else:
             traded_in_zone[token] = zone
+            arm_entry(token, zone_side[zone])
+            count("armed")
 
     stopping = []                                                  # set once the time exit has started the stop
 
@@ -550,29 +748,38 @@ def run_meanrevert():
                 retry.pop(tok, None)                               # waited long enough: given up on this bar
             elif tok in retry:
                 step(tok, True)
+        if trade_listener[0] is None:                               # orders_trade was not there yet when this script started: keep trying every candle batch, not just once
+            trade_listener[0] = start_trade_listener()
+            if trade_listener[0] is not None:
+                print(f"{STRATEGY}: orders_trade is up now -- real fill tracking is live")
         if past_exit() and not stopping:                           # the time exit: stop the whole automation, once (in its own thread: the stop waits for its commands)
             stopping.append(True)
             threading.Thread(target=time_stop, name=f"{STRATEGY}-time-exit", daemon=True).start()
 
     # ---- by hand ---------------------------------------------------------------------------------------------------------------------
     def exit_all():
-        """Close every open position now (the squareup of each portfolio)."""
+        """Close every open position now (arms the spread-gated exit for each, same as a normal exit signal -- it is not instant)."""
         for token in list(position):
-            leave(token, "exit_all")
+            arm_exit(token, "exit_all")
 
     def status():
         print(f"{STRATEGY}: sending {'ON' if algo_sending(STRATEGY) else 'OFF'}, {len(position)} open position(s), baskets {', '.join(f'{n} ({len(m)})' for n, m in BASKETS.items())}")
         for token, p in position.items():
-            print(f"   {symbol_of[token]:8} {'LONG' if p['side'] == 1 else 'SHORT'} {p['qty']} lot(s) entry {p['entry']:g} now {last_px.get(token, float('nan')):g} PF {p['pf']} {p['state']}")
+            print(f"   {symbol_of[token]:8} {'LONG' if p['side'] == 1 else 'SHORT'} {p['qty']} lot(s) entry {p['entry']:g} now {last_px.get(token, float('nan')):g} "
+                  f"PF {p['pf']} filled {filled.get(p['pf'], 0)} {p['state']}")
         ready = sum(1 for t in symbol_of if rsi(closes(t)) is not None)
         print(f"   RSI is ready for {ready} of {len(symbol_of)} stocks ({RSI_BAR} bars, {RSI_N + 1} needed)")
+        print(f"   waiting on spread: {len(pending_entry)} entr{'y' if len(pending_entry) == 1 else 'ies'}, {len(pending_exit)} exit(s); chasing: {len(chase)} order(s)")
         print("   signals: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none yet"))
 
     tick_start()
     listener = watch("candles", on_candle, owner=STRATEGY)         # follows the table if candles are restarted; pasting again replaces this listener
+    trade_listener = [start_trade_listener()]                      # [handle], mutable so on_candle can retry it later if it was not there yet when this started
 
     def stop():
         listener.stop()
+        if trade_listener[0] is not None:
+            trade_listener[0].stop()
         if tick_state:
             tick_state[1].stop()
             tick_jobs.put(None)
