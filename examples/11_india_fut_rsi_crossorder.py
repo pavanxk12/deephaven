@@ -71,7 +71,7 @@ def run_meanrevert():
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
     REL_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # relative(): pct_open's percentile among the basket must land inside this (low, high) band (Q2 to Q3);
                                               # pct_vwap's percentile among the basket must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD) -- same extreme test as ABS_ZONE
-    USE_BASKET_AVG = False                   # True: also require the BASKET's own average % from the open (all its members, now) to confirm the direction -- BASKET_AVG_PCT on the SAME
+    USE_BASKET_AVG = True                   # True: also require the BASKET's own average % from the open (all its members, now) to confirm the direction -- BASKET_AVG_PCT on the SAME
                                               # side (not the opposite): a BUY needs the average ABOVE +BASKET_AVG_PCT, a SELL needs it BELOW -BASKET_AVG_PCT (the whole basket is already moving that way)
     BASKET_AVG_PCT = 0.1                     # e.g. 0.1: BUY needs the basket average % from the open above +0.1, SELL needs it below -0.1
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off

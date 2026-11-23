@@ -29,20 +29,21 @@ FAIL_COOLDOWN_S = 30
 WINDOW = (dtime(9, 20), dtime(15, 20))          # TRADE_START, TRADE_END (India time)
 SUBSCRIBE = {"strategyname": "Churning", "maxloss": -2000, "stoploss": -2000, "max_unhedge": 10, "gtw": 26286}
 
-UNDERLYINGS = {                   # name -> its own settings; add or remove underlyings here
-    "NIFTY": dict(
-        N_STRIKES=1, STRIKE_MODE="OTM", STRIKE_GAP=1,
-        RSI_BAR="5min", RSI_N=9, RSI_HIGH=70, RSI_LOW=30, RSI_LIVE=True,
-        SIZING=dict(ival_pct=0.01, range_pct=0.2, trp_pct=0.01, jval_frac=0.75, sval_mult=5,
-                    jqty1=1, jqty2=1, target=6000, stoploss=-2000, maxloss=-2000, max_unhedge=10, PRNT=1),
-    ),
-    "BANKNIFTY": dict(
-        N_STRIKES=1, STRIKE_MODE="OTM", STRIKE_GAP=1,
-        RSI_BAR="5min", RSI_N=9, RSI_HIGH=70, RSI_LOW=30, RSI_LIVE=True,
-        SIZING=dict(ival_pct=0.01, range_pct=0.2, trp_pct=0.01, jval_frac=0.75, sval_mult=5,
-                    jqty1=1, jqty2=1, target=6000, stoploss=-2000, maxloss=-2000, max_unhedge=10, PRNT=1),
-    ),
-}
+_COMMON = dict(
+    N_STRIKES=1, STRIKE_MODE="OTM", STRIKE_GAP=1,
+    RSI_BAR="5min", RSI_N=9, RSI_HIGH=70, RSI_LOW=30, RSI_LIVE=True,
+    SIZING=dict(ival_pct=0.01, range_pct=0.2, trp_pct=0.01, jval_frac=0.75, sval_mult=5,
+                jqty1=1, jqty2=1, target=6000, stoploss=-2000, maxloss=-2000, max_unhedge=10, PRNT=1),
+)
+NIFTY_50 = [                      # the 50 NIFTY 50 index constituents (stock futures; no index futures here)
+    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV",
+    "BEL", "BHARTIARTL", "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK",
+    "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "ITC", "INDUSINDBK", "INFY", "JSWSTEEL",
+    "JIOFIN", "KOTAKBANK", "LT", "M&M", "MARUTI", "NTPC", "NESTLEIND", "ONGC", "POWERGRID", "RELIANCE", "SBILIFE",
+    "SHRIRAMFIN", "SBIN", "SUNPHARMA", "TCS", "TATACONSUM", "TMPV", "TATASTEEL", "TECHM", "TITAN",
+    "TRENT", "ULTRACEMCO", "WIPRO",
+]
+UNDERLYINGS = {name: dict(_COMMON) for name in NIFTY_50}      # add or remove underlyings here
 # ==========================================================================
 for name, cfg in UNDERLYINGS.items():
     if not (cfg["N_STRIKES"] >= 1 and cfg["STRIKE_GAP"] >= 1 and cfg["STRIKE_MODE"] in ("OTM", "ITM", "BOTH") and cfg["N_STRIKES"] < 100):

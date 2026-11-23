@@ -19,6 +19,8 @@
 #                                   SELL needs it below EXTREME[0] on both, on the same side as filter 2.
 #                     4. RVOL       today's cumulative volume so far (absolute("volume", ...)) must be at least RVOL_MIN_MULT times the AVERAGE of the same point in the session over the
 #                                   previous ABS_DAYS days. Not directional (no side of its own): a gate on both BUY and SELL alike. Off when RVOL_MIN_MULT is None, or ABS_DAYS is 0.
+#                     5. TURNOVER   today's cumulative traded VALUE (price x volume, dollars) so far must be at least TURNOVER_MIN. A flat floor, not a ranking: it screens out stocks too
+#                                   thin to trade in size, regardless of what the other filters say. Not directional. Off when TURNOVER_MIN is None.
 #                     Each filter runs only for the stocks that passed the one before it. With fewer than half of the days in the files absolute() cannot tell and there is no trade.
 #                     A trade needs the sides of 0 and 1 (and 2, and 3 when ABS_DAYS > 0) to agree on exactly one side.
 #                     USE_IV = False: no IV filter (the US has no straddle series; True would make every entry say "cannot tell").
@@ -79,13 +81,15 @@ def run_directional():
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
     RVOL_MIN_MULT = 1.2                      # filter 4: today's cumulative volume so far must be at least this many times the AVERAGE of the same point in the session over the
                                              # previous ABS_DAYS days (relative volume). None = off; has no effect while ABS_DAYS is 0 (no history to average)
+    TURNOVER_MIN = 100_000_000                # filter 5: today's cumulative traded VALUE (price x volume, dollars) so far must be at least this. A flat floor, not a ranking against
+                                             # earlier days or other stocks: it only screens out stocks too thin to trade in size. None = off
     SIGNAL_BAR = "1min"                      # the bar filter 0 (TODAY) checks today's highest/lowest close on (made from the 1-minute candles)
     ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the candle that ends a SIGNAL_BAR bar. With SIGNAL_BAR "1min" every candle ends a bar, so this fires every minute.
                                              # Take-profit and stop-loss are still checked on every 1-minute close either way. False: look for an entry on every 1-minute candle (same effect here)
-    TARGET_PCT, STOP_PCT = 4.0, 0.75
-    TRAIL_TRIGGER_PCT = 1.25                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
-    PROFIT_LOCK_PCT = 0.8                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
-    TRAIL_STEP_PCT = 0.4                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
+    TARGET_PCT, STOP_PCT = None, 1.0
+    TRAIL_TRIGGER_PCT = 1.0                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
+    PROFIT_LOCK_PCT = 0.5                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
+    TRAIL_STEP_PCT = 0.75                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
                                              # move - TRAIL_STEP_PCT (never lowered), so once the move is up X% the lock is up (X - TRAIL_STEP_PCT)% -- it never gives back more than TRAIL_STEP_PCT
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
@@ -111,10 +115,11 @@ def run_directional():
             and ((TRAIL_TRIGGER_PCT is None) == (PROFIT_LOCK_PCT is None)) and (TRAIL_TRIGGER_PCT is None or TRAIL_TRIGGER_PCT > 0)
             and (TRAIL_STEP_PCT is None or (TRAIL_TRIGGER_PCT is not None and TRAIL_STEP_PCT > 0))
             and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and (RVOL_MIN_MULT is None or RVOL_MIN_MULT > 0)
+            and (TURNOVER_MIN is None or TURNOVER_MIN > 0)
             and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)):
         raise ValueError("BASKAVG_SHORT below BASKAVG_LONG; every SELL threshold must be below its BUY threshold, both inside 0 to 100, for pct_open, pct_vwap and iv in REL_BUY/REL_SELL/ABS_BUY/ABS_SELL, "
                          "TARGET_PCT and STOP_PCT above 0, TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
-                         "QTY at least 1, ABS_DAYS 0 to 400, RVOL_MIN_MULT None or above 0, EXIT_AT after the window opens, every basket needs at least 3 symbols, "
+                         "QTY at least 1, ABS_DAYS 0 to 400, RVOL_MIN_MULT None or above 0, TURNOVER_MIN None or above 0, EXIT_AT after the window opens, every basket needs at least 3 symbols, "
                          "and TRAIL_STEP_PCT (if set) needs TRAIL_TRIGGER_PCT set too and must be above 0")
     BAR_S = parse_timeframe(SIGNAL_BAR)                               # 60; refuses a size that does not line up with the clock
     basket_of = {}                                                 # symbol -> the name of its basket
@@ -281,6 +286,13 @@ def run_directional():
             return False
         avg = float(np.mean(result[0][np.isfinite(result[0])]))
         return avg > 0 and result.now >= RVOL_MIN_MULT * avg
+
+    def turnover_ok(symbol):
+        """Filter 5: today's cumulative traded VALUE (price x volume, dollars) so far must be at least TURNOVER_MIN. A flat floor, not a ranking: `now` is set regardless of
+        whether absolute() could rank it against earlier days, so this works even on a stock with no (or too few) saved days."""
+        with exec_ctx:                                             # the call reads the candles table; a listener thread needs the terminal's query context for that
+            result = absolute("turnover", LEVEL, symbol, max(ABS_DAYS, 1))
+        return result.now >= TURNOVER_MIN
 
     # ---- the orders (mocked when DRY_RUN) ------------------------------------------------------------------------------------------------------------------
     def in_window():
@@ -541,6 +553,9 @@ def run_directional():
                 return
             if RVOL_MIN_MULT is not None and ABS_DAYS > 0 and not rvol_ok(symbol_of[token]):      # 4. rvol: enough volume behind the move (not directional)
                 count("refused by rvol")
+                return
+            if TURNOVER_MIN is not None and not turnover_ok(symbol_of[token]):                    # 5. turnover: a flat dollar floor on today's traded value (not directional)
+                count("refused by turnover")
                 return
             side = next(iter(sides))
         except Exception as e:
