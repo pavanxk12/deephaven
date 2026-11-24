@@ -12,3 +12,6 @@ cpp/build/
 
 # real contract files pulled from a server for the master parity test (large binary, not source)
 cpp/tests/parity/data/
+
+# server logins and other local settings at the repo root never go in git (cpp/config/*.ini are the real config)
+/*.ini

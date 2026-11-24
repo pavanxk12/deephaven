@@ -21,7 +21,7 @@
 static int g_fail = 0, g_pass = 0;
 #define CHECK(c) do { if (c) ++g_pass; else { ++g_fail; std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 
-struct Activation { int32_t pf, old_pf, option, slot; AlgoLeg leg; AlgoParams params; };
+struct Activation { int32_t pf, old_pf, pf_token, slot; AlgoLeg leg; AlgoParams params; };
 
 struct MockHost {
     algo::Ini ini;
@@ -32,7 +32,7 @@ struct MockHost {
     int64_t option_ltp = 12000;                       // 120.00 rupees in paise
     std::vector<AlgoBar> today;                       // future bars so far (for bars())
     // book
-    struct Slot { int32_t pf = 0, option = 0; AlgoLeg leg = AlgoLeg::NONE; };
+    struct Slot { int32_t pf = 0, pf_token = 0; AlgoLeg leg = AlgoLeg::NONE; };
     std::map<std::pair<int32_t, int32_t>, Slot> book;
     std::set<int32_t> unticked;                        // slots the operator unticked
     int32_t next_pf = 1001;
@@ -68,7 +68,8 @@ static uint32_t settingFill(void* c, const char* section, AlgoParams* out) noexc
 }
 
 // ---- contracts and market ------------------------------------------------------------------------------
-static int32_t hFind(void* c, const char* name) noexcept { return std::strcmp(name, "NIFTY") == 0 ? H(c).future : 0; }
+static int32_t hFind(void*, const char*) noexcept { return 0; }
+static int32_t hFindFut(void* c, const char* und, int32_t e) noexcept { return (std::strcmp(und, "NIFTY") == 0 && e == 0) ? H(c).future : 0; }
 static bool hInfo(void* c, int32_t t, AlgoContract* o) noexcept {
     *o = AlgoContract{};
     o->token = t; o->tick = 5; o->lot_size = 75; o->divisor = 100; o->expiry = 20261027;
@@ -112,13 +113,13 @@ static uint32_t hBasket(void*, const char*, int32_t*, uint32_t) noexcept { retur
 
 // ---- book --------------------------------------------------------------------------------------------------
 static void hTrack(void*, const int32_t*, uint32_t, uint32_t) noexcept {}
-static AlgoStatus hAssign(void* c, int32_t instr, int32_t option, const char*, int32_t slot, AlgoAssignment* a) noexcept {
+static AlgoStatus hAssign(void* c, int32_t token, int32_t pf_token, const char*, int32_t slot, AlgoAssignment* a) noexcept {
     auto& h = H(c);
     if (h.unticked.count(slot)) return AlgoStatus::NOT_ALLOWED;
-    auto& s = h.book[{instr, slot}];
+    auto& s = h.book[{token, slot}];
     *a = AlgoAssignment{};
-    a->user = 3; a->instrument = instr; a->option = option; a->slot = static_cast<int16_t>(slot);
-    if (s.pf && s.option == option) { a->pf = s.pf; return AlgoStatus::OK; }
+    a->user = 3; a->token = token; a->pf_token = pf_token; a->slot = static_cast<int16_t>(slot);
+    if (s.pf && s.pf_token == pf_token) { a->pf = s.pf; return AlgoStatus::OK; }
     a->old_pf = s.pf;
     a->pf = h.next_pf++;
     a->is_new = 1;
@@ -127,13 +128,13 @@ static AlgoStatus hAssign(void* c, int32_t instr, int32_t option, const char*, i
 static int64_t hActivate(void* c, const AlgoAssignment* a, AlgoLeg leg, const AlgoParams* p) noexcept {
     auto& h = H(c);
     if (!h.sending) return -static_cast<int64_t>(AlgoStatus::OFF);
-    h.activations.push_back({a->pf, a->old_pf, a->option, a->slot, leg, *p});
-    auto& s = h.book[{a->instrument, a->slot}];
-    s.pf = a->pf; s.option = a->option; s.leg = leg;
+    h.activations.push_back({a->pf, a->old_pf, a->pf_token, a->slot, leg, *p});
+    auto& s = h.book[{a->token, a->slot}];
+    s.pf = a->pf; s.pf_token = a->pf_token; s.leg = leg;
     return h.next_job++;
 }
-static AlgoLeg hLeg(void* c, int32_t instr, int32_t slot) noexcept { auto it = H(c).book.find({instr, slot}); return it == H(c).book.end() ? AlgoLeg::NONE : it->second.leg; }
-static void hMark(void* c, int32_t instr, AlgoLeg l, int32_t, int32_t slot) noexcept { H(c).book[{instr, slot}].leg = l; }
+static AlgoLeg hLeg(void* c, int32_t token, int32_t slot) noexcept { auto it = H(c).book.find({token, slot}); return it == H(c).book.end() ? AlgoLeg::NONE : it->second.leg; }
+static void hMark(void* c, int32_t token, AlgoLeg l, int32_t, int32_t slot) noexcept { H(c).book[{token, slot}].leg = l; }
 static bool hAllowed(void* c, int32_t, int32_t slot) noexcept { return !H(c).unticked.count(slot); }
 static bool hCooling(void*, int32_t, int32_t, int32_t) noexcept { return false; }
 static int32_t hNewPf(void* c, const char*) noexcept { return H(c).next_pf++; }
@@ -159,7 +160,7 @@ static void hName(void*, char* b, int32_t n) noexcept { std::snprintf(b, static_
 static AlgoHostAPI makeApi() {
     AlgoHostAPI a{};
     a.api_version = ALGO_SDK_API_VERSION; a.struct_size = sizeof(AlgoHostAPI);
-    a.find = hFind; a.info = hInfo; a.expiries = hExpiries; a.strikes = hStrikes; a.nearest = hNearest;
+    a.find = hFind; a.find_fut = hFindFut; a.info = hInfo; a.expiries = hExpiries; a.strikes = hStrikes; a.nearest = hNearest;
     a.quote = hQuote; a.bars = hBars; a.day_bars = hDayBars; a.watch_quotes = hWatch;
     a.want = hWant; a.analytics = hAnalytics; a.absolute = hAbsolute; a.relative = hRelative; a.basket = hBasket;
     a.track = hTrack; a.assign = hAssign; a.activate = hActivate; a.leg = hLeg; a.mark = hMark; a.allowed = hAllowed;
@@ -214,7 +215,7 @@ int main(int argc, char** argv) {
     auto feed = [&](int n, int64_t step) {
         for (int i = 0; i < n; ++i) {
             AlgoBar bs[2] = {bar(px += step), AlgoBar{}};
-            bs[1].token = 205; bs[1].close = 11111;                      // an option bar in the same batch: ignored by the signal
+            bs[1].token = 205; bs[1].close = 11111;                      // an pf_token bar in the same batch: ignored by the signal
             AlgoBarBatch batch{bs, 2, 60, bs[0].start_minute, 0};
             s->onBars(batch);
         }
@@ -240,7 +241,7 @@ int main(int argc, char** argv) {
     auto* sl = param(p, "stoploss");
     CHECK(sl && sl->type == AlgoParams::T_INT && sl->i == -400);
     std::set<int32_t> opts;
-    for (auto& a : host.activations) opts.insert(a.option);
+    for (auto& a : host.activations) opts.insert(a.pf_token);
     CHECK(opts.size() == 5);
 
     std::printf("more up bars: same side, nothing new\n");

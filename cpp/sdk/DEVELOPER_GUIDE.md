@@ -1,6 +1,6 @@
 # algod: Strategy Plugin Developer Guide
 
-**SDK version:** 1 (`ALGO_SDK_API_VERSION`)
+**SDK version:** 2 (`ALGO_SDK_API_VERSION`)
 **Audience:** quant developers writing signal strategies for algod, the C++ port of the Deephaven `algo` stack
 **Headers:** `sdk/AlgoSDK.h` (the interface, the only one you need) and `sdk/AlgoUtil.h` (optional helpers)
 
@@ -219,25 +219,49 @@ running are listed in `[live]` (`keys = signal.fast, signal.slow`). The API's `c
 
 ## 6. Contracts
 
-From today's master, an immutable snapshot. Lookups are lock-free, but they are searches, so **do them in `onStart`
-and keep the tokens**.
+From today's master, an immutable snapshot built once by algod's Master service. Every answer comes from it: name an
+underlying and ask for its future, cash, options, chain, ATM/OTM/ITM, a strike by value, the next strike, the CE/PE
+pair. Lookups are lock-free but they are searches, so **do them in `onStart` (or when a signal fires) and keep the
+tokens**; never per tick.
 
 ```cpp
-int32_t fut = find("NIFTY");                 // a bare name = its nearest future ("RELIANCE" = cash; a full symbol; "48704")
+int32_t fut  = findFut("NIFTY");                     // its nearest unexpired future
+int32_t fut2 = findFut("NIFTY", 1);                  // the next-month future (0 = nearest, 1 = next ...)
+int32_t spot = findSpot("RELIANCE");                 // its cash stock (or the index, for NIFTY)
+int32_t tok  = find("NIFTY 24NOV26 25000 CE");       // EXACTLY the contract named (any case / spacing), or "41003"
+
 AlgoContract c;
-info(fut, c);                                // token, future/spot/alt tokens, lot, expiry yyyymmdd, strike, tick, divisor,
-                                             // kind (FUT/OPT/EQ/INDEX), opt_type (CE/PE), symbol, underlying
-int32_t exp[8];
-uint32_t ne = expiries("NIFTY", AlgoKind::OPT, exp, 8);                  // dates that have not passed, nearest first
-int32_t tok[64]; int64_t k[64];
-uint32_t ns = strikes("NIFTY", 0, AlgoOptType::CE, tok, k, 64);           // the chain of the nearest expiry
-int32_t near5[5];
-uint32_t nn = nearest("NIFTY", c_ltp, AlgoOptType::PE, 0, 5, near5);      // the 5 strikes nearest a price (minor units)
+info(tok, c);   // kind (FUT / OPT / EQ / INDEX), opt_type (CE / PE), expiry yyyymmdd, strike, tick, lot, divisor,
+                // future_token (an option's = nearest expiring on/after it), spot_token (cash / index), alt_token (the
+                // paired PE / CE at the same strike), symbol, underlying
+
+int32_t ex[8];
+uint32_t ne = expiries("NIFTY", AlgoKind::OPT, ex, 8);              // option expiries that have not passed, nearest first
+int32_t toks[64]; int64_t ks[64];
+uint32_t ns = strikes("NIFTY", 0, AlgoOptType::CE, toks, ks, 64);   // the chain of the nearest expiry, ascending strikes
+
+const int64_t px = lastPrice(fut);                                  // the future's LTP, in its minor units
+int32_t near3[3];
+nearest("NIFTY", px, AlgoOptType::CE, 0, 3, near3);                 // the 3 strikes nearest the price
+int32_t a  = atm("NIFTY", px, AlgoOptType::CE);                     // the strike nearest the price
+int32_t o1 = otm("NIFTY", px, AlgoOptType::CE, 0, 1);               // 1 strike OTM (above ATM for a CE, below for a PE)
+int32_t i2 = itm("NIFTY", px, AlgoOptType::PE, 0, 2);               // 2 strikes ITM (above ATM for a PE)
+int32_t k  = findOpt("NIFTY", 0, AlgoOptType::PE, 2505000);         // the 25050 PE by exact strike
+int32_t up = nextStrike(a);  int32_t dn = prevStrike(a, 2);         // along the same expiry and type
 ```
 
-Prices, strikes and ticks are **int64 minor units** (paise for NSE; for other contracts the units of its own `divisor`).
+| rule | meaning |
+|---|---|
+| `expiry_index` | 0 = the nearest expiry that has **not passed** (today counts), 1 = the next; futures and options each have their own list |
+| ties | `nearest` and `atm` take the **lower** strike when two are equally near |
+| OTM / ITM | OTM is above ATM for a CE and below it for a PE; ITM the other way; `steps` strikes away |
+| price units | **the underlying's reference instrument's minor units**: its nearest future, else its cash. That's exactly what `quote()` / `bars()` give for it (NIFTY future LTP in paise) |
+| strike units | **the option's own minor units**: NSE 25000 CE = `2500000` (`strikes()` out, `option()` in, `AlgoContract.strike`) |
+| not found | every call returns 0 (or count 0): an unknown name, a past-the-end index or step, a null context |
+| `find` never guesses | `find("RELIANCE")` is the cash stock and `find("NIFTY")` the index, because those are the instruments with that name. For a future ask `findFut`, for an option `findOpt` / `atm` / `nearest` |
 
----
+The kind of a token (FUT / OPT / EQ / INDEX) lives **only** in the master. Tokens are unique across kinds (the contract
+file's key), so a strategy stores plain tokens and asks `info()` when it needs the kind.
 
 ## 7. Market data: bars and quotes
 
@@ -311,8 +335,9 @@ if (analytics(hOpen_, token, a) && a.rel_idx >= 0 && a.rel_pctile > 75) { /* str
 
 ## 9. Portfolios: the book and `activate`
 
-The churning style (`05`, `06`, `11` ...): a signal instrument (a future) has one portfolio per **slot** (strike
-1, 2 ...), and the portfolio follows the signal.
+The churning style (`05`, `06`, `11` ...): a tracked **token** (the signal, any kind: a future, a stock, an index) has
+one portfolio per **slot** (strike 1, 2 ...), and the portfolio follows the signal. Every token is just a token: its kind
+(FUT / OPT / EQ), expiry and strike come from the master (`info(token)`), never from the book.
 
 ```cpp
 track(&future_, 1, nStrikes_);                       // onStart: re-adopt the portfolios held before a restart
@@ -334,10 +359,10 @@ If any step is not `ok`, the sequence stops, the portfolio stays paused, the boo
 
 | call | meaning |
 |---|---|
-| `leg(instr, slot)` | the leg this slot runs now (`NONE` after an operator squareup) |
-| `allowed(instr, slot)` | false while the operator has unticked it (`assign` then returns `NOT_ALLOWED`) |
-| `cooling(instr, seconds, slot)` | true for `seconds` after a failed activation of that slot |
-| `mark(instr, leg, option, slot)` | set the leg by hand (e.g. reset after your own exit) |
+| `leg(token, slot)` | the leg this slot runs now (`NONE` after an operator squareup) |
+| `allowed(token, slot)` | false while the operator has unticked it (`assign` then returns `NOT_ALLOWED`) |
+| `cooling(token, seconds, slot)` | true for `seconds` after a failed activation of that slot |
+| `mark(token, leg, pf_token, slot)` | set the leg by hand (e.g. reset after your own exit) |
 
 ---
 
@@ -478,7 +503,9 @@ The same actions are API functions (`algo_start`, `algo_stop`, `algo_status`, `n
 | the `SETTINGS` block | `config/strategies/<name>.ini`, read in `onStart` |
 | `algo_start(USER, STRATEGY, add_qty=, subscribe={...})` | `[host]` and `[subscribe]` sections; algod does it before `onStart` |
 | `nats_connect`, `registry_connect` | nothing: algod checks before it starts you |
-| `contract(x)["token"]`, `nearest_strikes(...)`, `strikes(...)` | `find(x)`, `nearest(...)`, `strikes(...)`, `info(token, c)` |
+| `contract("NIFTY")["token"]` (a bare name: its nearest future) | `findFut("NIFTY")`: explicit now; `findSpot` for the cash / index |
+| `contract("NIFTY 27OCT26 25000 CE")`, `contract(48704)` | `find("NIFTY 27OCT26 25000 CE")`, `find("48704")` |
+| `nearest_strikes(...)`, `strikes(...)` | `nearest(...)`, `strikes(...)`, `atm` / `otm` / `itm`, `findOpt`, `info(token, c)` |
 | `last_candles(x, n)` | `bars(token, n, out)` |
 | `watch("candles", on_candle)` | `onBars(batch)` |
 | `update.added(["token", "Close"])` | `batch.bars[i].token`, `.close` |
@@ -540,6 +567,6 @@ idea of `07_basket_rsi_crossorder.py`, single order, with a relative filter).
 | `AlgoQuote` | token, idx, ltp, bid, ask, bid_qty, ask_qty, ltq, cum_volume, ltt_ns |
 | `AlgoContract` | token, future/spot/alt token, lot_size, expiry, strike, tick, divisor, kind, opt_type, symbol, underlying |
 | `AlgoAnalytics` | now, abs_idx / n_valid / pctile, rel_idx / n_valid / pctile, minute_of_day |
-| `AlgoAssignment` | user, pf, old_pf, instrument, option, slot, is_new |
-| `AlgoPfState` | user, pf, option, subscribed, paused, squared, by_operator, cmd, at_ns, by |
+| `AlgoAssignment` | user, pf, old_pf, token (tracked), pf_token (what the PF trades), slot, is_new |
+| `AlgoPfState` | user, pf, pf_token, subscribed, paused, squared, by_operator, cmd, at_ns, by |
 | `AlgoCmdResult` | job_id, user, pf, status, cmd, detail |

@@ -24,14 +24,14 @@
 #include <cstdlib>
 #include <cstring>
 
-static constexpr uint32_t ALGO_SDK_API_VERSION = 1;
+static constexpr uint32_t ALGO_SDK_API_VERSION = 2;   // 2: find (exact) / find_fut / find_spot / find_opt / moneyness / step_strike, INDEX
 
 #define ALGO_EXPORT __attribute__((visibility("default")))
 
 // ---------------------------------------------------------------------------
 // Enums (one byte each, packed into structs)
 // ---------------------------------------------------------------------------
-enum class AlgoKind    : uint8_t { UNKNOWN = 0, FUT = 1, OPT = 2, EQ = 3, INDEX = 4 };
+enum class AlgoKind    : uint8_t { UNKNOWN = 0, FUT = 1, OPT = 2, EQ = 3, INDEX = 4 };   // from the master, by token
 enum class AlgoOptType : uint8_t { NONE = 0, CE = 1, PE = 2 };
 enum class AlgoLeg     : uint8_t { NONE = 0, CALL = 1, PUT = 2, BUY = 3, SELL = 4 };
 enum class AlgoLogLevel: uint8_t { DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3 };
@@ -127,8 +127,8 @@ struct AlgoBarBatch {
 // A contract from the master. Filled by copy (cold data: look it up in onStart and keep what you need).
 struct AlgoContract {
     int32_t     token         = 0;
-    int32_t     future_token  = 0;    // the future that goes with it (0 if none)
-    int32_t     spot_token    = 0;    // the cash / index instrument (0 if none)
+    int32_t     future_token  = 0;    // the future that goes with it: an option's = nearest expiring on/after it; a future's = itself; 0 if none
+    int32_t     spot_token    = 0;    // the cash / index instrument of the underlying (0 if none)
     int32_t     alt_token     = 0;    // the paired CE <-> PE at the same strike and expiry (0 if none)
     int32_t     lot_size      = 0;
     int32_t     expiry        = 0;    // yyyymmdd, 0 for equities
@@ -157,13 +157,13 @@ struct AlgoAnalytics {
     int32_t _pad         = 0;
 };
 
-// What the book answered for (instrument, option, slot): the portfolio to use, and the one to retire if it moved.
+// What the book answered for (token, pf_token, slot): the portfolio to use, and the one to retire if it moved.
 struct AlgoAssignment {
     int32_t user       = 0;
     int32_t pf         = 0;        // the portfolio number (without the user prefix; the engine sees user*10000+pf)
     int32_t old_pf     = 0;        // 0, or the portfolio this replaces (pfActivate retires it first)
-    int32_t instrument = 0;        // the signal instrument (e.g. the future)
-    int32_t option     = 0;        // the contract this portfolio trades
+    int32_t token      = 0;        // the tracked token (the signal), any kind: future, equity, option, index
+    int32_t pf_token   = 0;        // the token this portfolio trades
     int16_t slot       = 0;
     uint8_t is_new     = 0;        // 1 = a new portfolio number was taken
     uint8_t _r         = 0;
@@ -173,7 +173,7 @@ struct AlgoAssignment {
 struct AlgoPfState {
     int32_t user       = 0;
     int32_t pf         = 0;
-    int32_t option     = 0;
+    int32_t pf_token   = 0;        // the token it is subscribed to
     uint8_t subscribed = 0;
     uint8_t paused     = 0;
     uint8_t squared    = 0;        // a squareup went through and nothing was applied since
@@ -300,11 +300,20 @@ struct AlgoHostAPI {
     uint32_t struct_size = sizeof(AlgoHostAPI);
 
     // contracts (immutable snapshot of today's master: lock-free, but not free -> prefer onStart)
-    int32_t  (*find)(void*, const char* name) noexcept;                                         // "NIFTY" = nearest future, "RELIANCE" = cash, a full symbol, or "48704"
+    //   underlying: "NIFTY", "RELIANCE" ...       expiry_index: 0 = the nearest that has not passed, 1 = the next ...
+    //   price (nearest / moneyness): minor units of the underlying's REFERENCE instrument -- its nearest future, else its
+    //     cash instrument -- i.e. exactly what quote() / bars() give for that instrument (NIFTY fut LTP in paise)
+    //   strike (strikes out / option in / AlgoContract.strike): the OPTION's own minor units (NSE 25000 CE = 2500000)
+    int32_t  (*find)(void*, const char* name) noexcept;          // EXACTLY the contract named: "41003", "RELIANCE" (cash), "NIFTY 24NOV26 25000 CE"
+    int32_t  (*find_fut)(void*, const char* underlying, int32_t expiry_index) noexcept;    // its future: 0 = nearest unexpired, 1 = next ...
+    int32_t  (*find_spot)(void*, const char* underlying) noexcept;                         // its cash stock / index
+    int32_t  (*find_opt)(void*, const char* underlying, int32_t expiry_index, AlgoOptType, int64_t strike) noexcept;   // its option at an exact strike
     bool     (*info)(void*, int32_t token, AlgoContract* out) noexcept;
     uint32_t (*expiries)(void*, const char* underlying, AlgoKind kind, int32_t* out_yyyymmdd, uint32_t max) noexcept;
     uint32_t (*strikes)(void*, const char* underlying, int32_t expiry_index, AlgoOptType, int32_t* out_tokens, int64_t* out_strikes, uint32_t max) noexcept;
     uint32_t (*nearest)(void*, const char* underlying, int64_t price, AlgoOptType, int32_t expiry_index, uint32_t n, int32_t* out_tokens) noexcept;
+    int32_t  (*moneyness)(void*, const char* underlying, int64_t price, AlgoOptType, int32_t expiry_index, int32_t steps) noexcept;  // 0 = ATM, +k OTM, -k ITM
+    int32_t  (*step_strike)(void*, int32_t option_token, int32_t steps) noexcept;   // +k higher strike, -k lower; same expiry and type
 
     // market data (shared memory, zero copy)
     bool     (*quote)(void*, int32_t token, AlgoQuote* out) noexcept;                               // seqlock read, safe on every callback
@@ -320,22 +329,22 @@ struct AlgoHostAPI {
     uint32_t (*basket)(void*, const char* name, int32_t* out_tokens, uint32_t max) noexcept;      // the members of a baskets.txt basket
 
     // the book (this strategy's portfolios; algo_start / pf_* of the Python automation)
-    void       (*track)(void*, const int32_t* instruments, uint32_t n, uint32_t slots) noexcept;   // re-adopt the portfolios held before a restart
-    AlgoStatus (*assign)(void*, int32_t instrument, int32_t option, const char* name, int32_t slot, AlgoAssignment* out) noexcept;
+    void       (*track)(void*, const int32_t* tokens, uint32_t n, uint32_t slots) noexcept;   // re-adopt the portfolios held before a restart
+    AlgoStatus (*assign)(void*, int32_t token, int32_t pf_token, const char* name, int32_t slot, AlgoAssignment* out) noexcept;
     int64_t    (*activate)(void*, const AlgoAssignment*, AlgoLeg, const AlgoParams*) noexcept;    // [retire old] subscribe, pause, apply, unpause. >0 job id, <=0 -AlgoStatus
-    AlgoLeg    (*leg)(void*, int32_t instrument, int32_t slot) noexcept;
-    void       (*mark)(void*, int32_t instrument, AlgoLeg, int32_t option, int32_t slot) noexcept;
-    bool       (*allowed)(void*, int32_t instrument, int32_t slot) noexcept;
-    bool       (*cooling)(void*, int32_t instrument, int32_t seconds, int32_t slot) noexcept;
+    AlgoLeg    (*leg)(void*, int32_t token, int32_t slot) noexcept;
+    void       (*mark)(void*, int32_t token, AlgoLeg, int32_t pf_token, int32_t slot) noexcept;
+    bool       (*allowed)(void*, int32_t token, int32_t slot) noexcept;
+    bool       (*cooling)(void*, int32_t token, int32_t seconds, int32_t slot) noexcept;
     int32_t    (*new_pf)(void*, const char* name) noexcept;                                       // a fresh portfolio number for one trade (single-order style), 0 on failure
 
     // direct portfolio commands. >0 job id, <=0 -AlgoStatus; the engine's answer comes in onCommandResult
-    int64_t  (*subscribe)(void*, int32_t pf, int32_t option, const AlgoParams*) noexcept;
+    int64_t  (*subscribe)(void*, int32_t pf, int32_t pf_token, const AlgoParams*) noexcept;
     int64_t  (*apply)(void*, int32_t pf, const AlgoParams*) noexcept;
     int64_t  (*pause)(void*, int32_t pf) noexcept;
     int64_t  (*unpause)(void*, int32_t pf) noexcept;
     int64_t  (*squareup)(void*, int32_t pf) noexcept;
-    int64_t  (*unsubscribe)(void*, int32_t pf, int32_t option) noexcept;
+    int64_t  (*unsubscribe)(void*, int32_t pf, int32_t pf_token) noexcept;
     bool     (*pf_state)(void*, int32_t pf, AlgoPfState* out) noexcept;
 
     // control and context
@@ -384,7 +393,12 @@ public:
 
 protected:
     // ---- contracts -------------------------------------------------------------------------------------
-    int32_t  find(const char* name) const noexcept                     { return _h ? _h->find(_c, name) : 0; }
+    int32_t  find(const char* name) const noexcept                     { return _h ? _h->find(_c, name) : 0; }   // exactly the contract named
+    int32_t  findFut(const char* und, int32_t expiry_index = 0) const noexcept { return (_h && _h->find_fut) ? _h->find_fut(_c, und, expiry_index) : 0; }
+    int32_t  findSpot(const char* und) const noexcept                  { return (_h && _h->find_spot) ? _h->find_spot(_c, und) : 0; }
+    int32_t  findOpt(const char* und, int32_t expiry_index, AlgoOptType t, int64_t strike) const noexcept {
+        return (_h && _h->find_opt) ? _h->find_opt(_c, und, expiry_index, t, strike) : 0;
+    }
     bool     info(int32_t token, AlgoContract& out) const noexcept     { return _h && _h->info(_c, token, &out); }
     uint32_t expiries(const char* und, AlgoKind k, int32_t* out, uint32_t max) const noexcept { return _h ? _h->expiries(_c, und, k, out, max) : 0; }
     uint32_t strikes(const char* und, int32_t expiry_index, AlgoOptType t, int32_t* tokens, int64_t* strikes_out, uint32_t max) const noexcept {
@@ -392,6 +406,16 @@ protected:
     }
     uint32_t nearest(const char* und, int64_t price, AlgoOptType t, int32_t expiry_index, uint32_t n, int32_t* out) const noexcept {
         return _h ? _h->nearest(_c, und, price, t, expiry_index, n, out) : 0;
+    }
+    // 0 = not found / out of range, for all of these
+    // ATM = the strike nearest the price (on a tie, the lower one); OTM is above ATM for a CE and below for a PE, ITM the other way
+    int32_t  atm(const char* und, int64_t price, AlgoOptType t, int32_t expiry_index = 0) const noexcept { return moneyness(und, price, t, expiry_index, 0); }
+    int32_t  otm(const char* und, int64_t price, AlgoOptType t, int32_t expiry_index = 0, int32_t steps = 1) const noexcept { return moneyness(und, price, t, expiry_index, steps); }
+    int32_t  itm(const char* und, int64_t price, AlgoOptType t, int32_t expiry_index = 0, int32_t steps = 1) const noexcept { return moneyness(und, price, t, expiry_index, -steps); }
+    int32_t  nextStrike(int32_t option_token, int32_t steps = 1) const noexcept { return (_h && _h->step_strike) ? _h->step_strike(_c, option_token, steps) : 0; }
+    int32_t  prevStrike(int32_t option_token, int32_t steps = 1) const noexcept { return (_h && _h->step_strike) ? _h->step_strike(_c, option_token, -steps) : 0; }
+    int32_t  moneyness(const char* und, int64_t price, AlgoOptType t, int32_t expiry_index, int32_t steps) const noexcept {
+        return (_h && _h->moneyness) ? _h->moneyness(_c, und, price, t, expiry_index, steps) : 0;
     }
 
     // ---- market data ------------------------------------------------------------------------------------
@@ -412,24 +436,24 @@ protected:
     uint32_t basket(const char* name, int32_t* out, uint32_t max) const noexcept { return _h ? _h->basket(_c, name, out, max) : 0; }
 
     // ---- the book ------------------------------------------------------------------------------------------
-    void       track(const int32_t* instruments, uint32_t n, uint32_t slots = 1) noexcept { if (_h) _h->track(_c, instruments, n, slots); }
-    AlgoStatus assign(int32_t instrument, int32_t option, const char* name, int32_t slot, AlgoAssignment& out) noexcept {
-        return _h ? _h->assign(_c, instrument, option, name, slot, &out) : AlgoStatus::NO_SERVICE;
+    void       track(const int32_t* tokens, uint32_t n, uint32_t slots = 1) noexcept { if (_h) _h->track(_c, tokens, n, slots); }
+    AlgoStatus assign(int32_t token, int32_t pf_token, const char* name, int32_t slot, AlgoAssignment& out) noexcept {
+        return _h ? _h->assign(_c, token, pf_token, name, slot, &out) : AlgoStatus::NO_SERVICE;
     }
     int64_t    activate(const AlgoAssignment& a, AlgoLeg leg, const AlgoParams& p) noexcept { return _h ? _h->activate(_c, &a, leg, &p) : -static_cast<int64_t>(AlgoStatus::NO_SERVICE); }
-    AlgoLeg    leg(int32_t instrument, int32_t slot = 0) const noexcept   { return _h ? _h->leg(_c, instrument, slot) : AlgoLeg::NONE; }
-    void       mark(int32_t instrument, AlgoLeg l, int32_t option = 0, int32_t slot = 0) noexcept { if (_h) _h->mark(_c, instrument, l, option, slot); }
-    bool       allowed(int32_t instrument, int32_t slot = 0) const noexcept { return _h && _h->allowed(_c, instrument, slot); }
-    bool       cooling(int32_t instrument, int32_t seconds, int32_t slot = 0) const noexcept { return _h && _h->cooling(_c, instrument, seconds, slot); }
+    AlgoLeg    leg(int32_t token, int32_t slot = 0) const noexcept   { return _h ? _h->leg(_c, token, slot) : AlgoLeg::NONE; }
+    void       mark(int32_t token, AlgoLeg l, int32_t pf_token = 0, int32_t slot = 0) noexcept { if (_h) _h->mark(_c, token, l, pf_token, slot); }
+    bool       allowed(int32_t token, int32_t slot = 0) const noexcept { return _h && _h->allowed(_c, token, slot); }
+    bool       cooling(int32_t token, int32_t seconds, int32_t slot = 0) const noexcept { return _h && _h->cooling(_c, token, seconds, slot); }
     int32_t    newPf(const char* name) noexcept { return _h ? _h->new_pf(_c, name) : 0; }
 
     // ---- direct portfolio commands -----------------------------------------------------------------------------
-    int64_t subscribe(int32_t pf, int32_t option, const AlgoParams& p) noexcept { return _h ? _h->subscribe(_c, pf, option, &p) : -static_cast<int64_t>(AlgoStatus::NO_SERVICE); }
+    int64_t subscribe(int32_t pf, int32_t pf_token, const AlgoParams& p) noexcept { return _h ? _h->subscribe(_c, pf, pf_token, &p) : -static_cast<int64_t>(AlgoStatus::NO_SERVICE); }
     int64_t apply(int32_t pf, const AlgoParams& p) noexcept                     { return _h ? _h->apply(_c, pf, &p) : -static_cast<int64_t>(AlgoStatus::NO_SERVICE); }
     int64_t pause(int32_t pf) noexcept                                          { return _h ? _h->pause(_c, pf) : -static_cast<int64_t>(AlgoStatus::NO_SERVICE); }
     int64_t unpause(int32_t pf) noexcept                                        { return _h ? _h->unpause(_c, pf) : -static_cast<int64_t>(AlgoStatus::NO_SERVICE); }
     int64_t squareup(int32_t pf) noexcept                                       { return _h ? _h->squareup(_c, pf) : -static_cast<int64_t>(AlgoStatus::NO_SERVICE); }
-    int64_t unsubscribe(int32_t pf, int32_t option) noexcept                    { return _h ? _h->unsubscribe(_c, pf, option) : -static_cast<int64_t>(AlgoStatus::NO_SERVICE); }
+    int64_t unsubscribe(int32_t pf, int32_t pf_token) noexcept                    { return _h ? _h->unsubscribe(_c, pf, pf_token) : -static_cast<int64_t>(AlgoStatus::NO_SERVICE); }
     bool    pfState(int32_t pf, AlgoPfState& out) const noexcept                { return _h && _h->pf_state(_c, pf, &out); }
     static AlgoStatus statusOf(int64_t r) noexcept { return r > 0 ? AlgoStatus::QUEUED : static_cast<AlgoStatus>(-r); }
 

@@ -1,29 +1,33 @@
-// candles_replay: feed batches from a CSV through TokenIndex + LttParser + CandleBuilder and write the closed bars.
-// Used by the parity test against the Python Candles plugin, and to replay a recorded day.
+// candles_replay: replay recorded feed rows through the real feed path
+//     TextRowAdapter (the Kafka/DH row rules) -> FeedPipeline (TokenIndex, QuoteTable, CandleBuilder)
+// and write the closed bars (and optionally the final quote table). Used by the parity test against the Python Candles
+// plugin, and to replay a recorded day.
 //
 //   candles_replay --format "%d-%m-%Y %H:%M:%S" --tz Asia/Kolkata --bucket 60 --start <epoch s> [--grace 10]
-//                  [--master tokens.txt] [--overflow 4096] input.csv output.csv
+//                  [--master tokens.txt] [--overflow 4096] [--quotes quotes.csv] input.csv output.csv
 //
-// input.csv:  batch,part,token,ltp,vol,ltt,ltq     (part 0 = added, 1 = modified; ltt "<null>" = null; rows in order)
-// output.csv: token,start,open,high,low,close,volume,cvd   (prices in raw minor units), one line per closed bar
+// input.csv:  batch,part,token,ltp,vol,ltt,ltq[,bid,ask,bid_qty,ask_qty]
+//             (part 0 = added, 1 = modified: one batch is all its added rows, then its modified rows; ltt "<null>" = null)
+// output.csv: token,start,open,high,low,close,volume,cvd            (prices in raw minor units)
+// quotes.csv: token,ltp,bid,ask,bid_qty,ask_qty,ltq,cum_volume,time_ns   (the last known value of each part)
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
 
 #include "core/tz.h"
-#include "data/candle_builder.h"
+#include "data/feed_pipeline.h"
 
 using namespace algo;
 
 namespace {
-struct Row { long batch; int part; FeedRow r; };
+struct Row { long batch; int part; TextRow r; long text; };
 
-bool split(const std::string& line, std::vector<std::string>& out) {
+void split(const std::string& line, std::vector<std::string>& out) {
     out.clear();
     size_t a = 0;
     for (;;) {
@@ -32,12 +36,12 @@ bool split(const std::string& line, std::vector<std::string>& out) {
         if (c == std::string::npos) break;
         a = c + 1;
     }
-    return out.size() == 7;
 }
+double num(const std::string& s) { return s.empty() ? NAN : std::strtod(s.c_str(), nullptr); }
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string format = "%d-%m-%Y %H:%M:%S", tzname = "Asia/Kolkata", master_file, in_path, out_path;
+    std::string format = "%d-%m-%Y %H:%M:%S", tzname = "Asia/Kolkata", master_file, quotes_path, in_path, out_path;
     int64_t start = 0; int bucket = 60, grace = 10; uint32_t overflow = 4096;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -49,6 +53,7 @@ int main(int argc, char** argv) {
         else if (a == "--grace") grace = std::atoi(val().c_str());
         else if (a == "--master") master_file = val();
         else if (a == "--overflow") overflow = static_cast<uint32_t>(std::atoi(val().c_str()));
+        else if (a == "--quotes") quotes_path = val();
         else if (in_path.empty()) in_path = a;
         else out_path = a;
     }
@@ -56,52 +61,56 @@ int main(int argc, char** argv) {
 
     std::string err;
     TimeZone zone;
-    if (!zone.load(tzname, err)) { std::cerr << err << "\n"; return 1; }
+    if (tzname == "UTC") zone = TimeZone::utc();
+    else if (!zone.load(tzname, err)) { std::cerr << err << "\n"; return 1; }
     LttParser parser;
     if (!parser.init(format, zone, err)) { std::cerr << err << "\n"; return 1; }
     std::vector<int64_t> master;
     if (!master_file.empty()) { std::ifstream m(master_file); int64_t t; while (m >> t) master.push_back(t); }
-    TokenIndex index;
-    index.build(master, overflow);
+    TokenIds index(0, master, static_cast<uint32_t>(master.size()) + overflow);   // the day's token -> slot map
 
-    // read everything first (the ltt texts must outlive the rows)
+    // read everything first: the ltt texts must outlive the rows that point at them
     std::ifstream in(in_path);
     if (!in) { std::cerr << "cannot open " << in_path << "\n"; return 1; }
     std::vector<std::string> texts;
     std::vector<Row> rows;
     std::string line;
     std::vector<std::string> f;
-    std::getline(in, line);                                   // header
-    std::vector<std::pair<long, int>> ltt_ref;                 // row -> index into texts (or -1)
+    std::getline(in, line);                                               // header
     while (std::getline(in, line)) {
         if (line.empty()) continue;
-        if (!split(line, f)) { std::cerr << "bad line: " << line << "\n"; return 1; }
-        Row r{std::atol(f[0].c_str()), std::atoi(f[1].c_str()), {}};
+        split(line, f);
+        if (f.size() != 7 && f.size() != 11) { std::cerr << "bad line (7 or 11 fields): " << line << "\n"; return 1; }
+        Row r{std::atol(f[0].c_str()), std::atoi(f[1].c_str()), {}, -1};
         r.r.token = std::atoll(f[2].c_str());
-        r.r.ltp = std::strtod(f[3].c_str(), nullptr);
-        r.r.vol = std::strtod(f[4].c_str(), nullptr);
-        r.r.ltq = std::strtod(f[6].c_str(), nullptr);
-        if (f[5] == "<null>") ltt_ref.push_back({static_cast<long>(rows.size()), -1});
-        else { ltt_ref.push_back({static_cast<long>(rows.size()), static_cast<int>(texts.size())}); texts.push_back(f[5]); }
+        r.r.ltp = num(f[3]); r.r.vol = num(f[4]); r.r.ltq = num(f[6]);
+        r.r.bid = r.r.ask = r.r.bid_qty = r.r.ask_qty = NAN;
+        if (f.size() == 11) { r.r.bid = num(f[7]); r.r.ask = num(f[8]); r.r.bid_qty = num(f[9]); r.r.ask_qty = num(f[10]); }
+        if (f[5] != "<null>") { r.text = static_cast<long>(texts.size()); texts.push_back(f[5]); }
         rows.push_back(r);
     }
-    for (auto& [ri, ti] : ltt_ref) {
-        if (ti < 0) { rows[static_cast<size_t>(ri)].r.ltt = nullptr; rows[static_cast<size_t>(ri)].r.ltt_len = 0; }
-        else { rows[static_cast<size_t>(ri)].r.ltt = texts[static_cast<size_t>(ti)].data(); rows[static_cast<size_t>(ri)].r.ltt_len = static_cast<uint32_t>(texts[static_cast<size_t>(ti)].size()); }
+    for (auto& r : rows) {
+        if (r.text < 0) { r.r.ltt = nullptr; r.r.ltt_len = 0; }
+        else { r.r.ltt = texts[static_cast<size_t>(r.text)].data(); r.r.ltt_len = static_cast<uint32_t>(texts[static_cast<size_t>(r.text)].size()); }
     }
 
-    CandleBuilder builder(index, parser, start, bucket, grace);
+    QuoteTable quotes(index.capacity());
+    CandleBuilder candles(index.capacity(), start, bucket, grace);
     std::vector<ClosedBar> bars;
     bars.reserve(1 << 16);
-    auto sink = [&](const ClosedBar& b) { bars.push_back(b); };
+    FeedPipeline pipeline(index, quotes, candles, [&](const ClosedBar& b) { bars.push_back(b); });
+    TextRowAdapter adapter(parser);
 
-    std::vector<FeedRow> added, modified;
+    std::vector<TextRow> batch;
     const auto t0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < rows.size();) {
         const long b = rows[i].batch;
-        added.clear(); modified.clear();
-        for (; i < rows.size() && rows[i].batch == b; ++i) (rows[i].part == 0 ? added : modified).push_back(rows[i].r);
-        builder.batch(added, modified, sink);
+        batch.clear();
+        size_t j = i;
+        for (; j < rows.size() && rows[j].batch == b; ++j) if (rows[j].part == 0) batch.push_back(rows[j].r);   // added first
+        for (size_t k = i; k < j; ++k) if (rows[k].part != 0) batch.push_back(rows[k].r);                     // then modified
+        adapter.deliver(batch, pipeline);
+        i = j;
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
@@ -112,10 +121,25 @@ int main(int argc, char** argv) {
         std::fprintf(out, "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)x.token, (long long)x.start, (long long)x.open,
                      (long long)x.high, (long long)x.low, (long long)x.close, (long long)x.volume, (long long)x.cvd);
     std::fclose(out);
-    const auto& s = builder.stats();
-    std::fprintf(stderr, "rows=%llu ticks=%llu dropped=%llu repeats=%llu bad_time=%llu overflow=%llu bars=%llu batches=%llu index=%s %.2f ms (%.0f ns/row)\n",
-                 (unsigned long long)s.rows, (unsigned long long)s.ticks, (unsigned long long)s.dropped, (unsigned long long)s.repeats,
-                 (unsigned long long)s.bad_time, (unsigned long long)s.overflow, (unsigned long long)s.bars, (unsigned long long)s.batches,
-                 index.direct() ? "direct" : "hashed", ms, s.rows ? ms * 1e6 / s.rows : 0.0);
+
+    if (!quotes_path.empty()) {
+        FILE* q = std::fopen(quotes_path.c_str(), "w");
+        if (!q) { std::cerr << "cannot write " << quotes_path << "\n"; return 1; }
+        std::fprintf(q, "token,ltp,bid,ask,bid_qty,ask_qty,ltq,cum_volume,time_ns\n");
+        for (uint32_t id = 0; id < index.size(); ++id) {
+            Quote v;
+            if (!quotes.read(static_cast<int32_t>(id), v)) continue;
+            std::fprintf(q, "%lld,%lld,%lld,%lld,%d,%d,%d,%lld,%lld\n", (long long)index.tokenOf(static_cast<int32_t>(id)), (long long)v.ltp, (long long)v.bid,
+                         (long long)v.ask, v.bid_qty, v.ask_qty, v.ltq, (long long)v.cum_volume, (long long)v.time_ns);
+        }
+        std::fclose(q);
+    }
+
+    const auto& a = adapter.stats();
+    const auto& c = candles.stats();
+    std::fprintf(stderr, "rows=%llu trades=%llu quote_only=%llu no_trade=%llu bad_time=%llu ticks=%llu repeats=%llu overflow=%llu bars=%llu batches=%llu index=%s %.2f ms (%.0f ns/row)\n",
+                 (unsigned long long)a.rows, (unsigned long long)a.trades, (unsigned long long)a.quote_only, (unsigned long long)a.no_trade,
+                 (unsigned long long)a.bad_time, (unsigned long long)c.ticks, (unsigned long long)c.repeats, (unsigned long long)pipeline.overflow(),
+                 (unsigned long long)c.bars, (unsigned long long)c.batches, index.direct() ? "direct" : "hashed", ms, a.rows ? ms * 1e6 / a.rows : 0.0);
     return 0;
 }

@@ -2,9 +2,12 @@
 // limits. A port of algo/core/statedb.py -- the SAME four tables with the SAME names and columns, so a Python algod
 // and a C++ algod can hand state back and forth during cutover. Created if missing; nothing existing is touched.
 //
-//   algo_portfolios   user_id, pf, owner, name, algo, created, note, updated_at   pk (user_id, pf)   the registry
-//   algo_pf_map       book, token, pf                                             pk (book, token)   a book's future token -> PF
-//   algo_pf_sub       book, pf, option_token                                      pk (book, pf)      a book's PF -> option token
+//   algo_portfolios   user_id, pf, owner, name, algo, created, note, token, updated_at  pk (user_id, pf)  the registry
+//                     (token: the contract the PF trades, from its confirmed subscribe; C++ only -- the Python stack
+//                      names its columns explicitly, never writes token and is not affected by it)
+//   algo_pf_map       book, token, pf                                             pk (book, token)   a book's tracked token -> PF
+//   algo_pf_sub       book, pf, token                                             pk (book, pf)      a book's PF -> the token it trades
+//                     (was option_token: a table from the Python stack or an older algod is renamed on start)
 //   algo_limits       strategy, turnover, m2m, turnover_hit, m2m_hit, updated_at  pk (strategy)      limits + latches
 //
 // Control-plane only. Every call commits; a call that fails on a dropped connection is retried once on a fresh one
@@ -31,6 +34,7 @@ struct Portfolio {
     std::string algo;
     std::string created;
     std::string note;
+    std::optional<int64_t> token;   // the contract it trades (nullopt = not known yet)
 };
 
 struct Limit {
@@ -43,7 +47,7 @@ struct Limit {
 
 class StateDB {
 public:
-    enum class BookTable { Map, Sub };    // algo_pf_map (token->pf) or algo_pf_sub (pf->option_token)
+    enum class BookTable { Map, Sub };    // algo_pf_map (token -> pf) or algo_pf_sub (pf -> token)
 
     // `factory` makes a fresh connection on demand (for the first connect and for the retry after a drop). The
     // constructor runs the schema; it throws std::runtime_error if the store cannot be reached -- starting from
@@ -69,6 +73,7 @@ private:
 
     void             txWrite(const std::vector<Stmt>& statements);             // run in one transaction, retry once
     std::vector<Row> txRead(const std::string& sql, const std::vector<DbValue>& params);
+    bool             hasColumn(const std::string& table, const std::string& column);   // retry once, like txRead
 
     Factory                  factory_;
     std::unique_ptr<SqlConn> con_;

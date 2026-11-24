@@ -23,7 +23,7 @@ namespace algo {
 // How a strategy sequences its commands (the connection itself is NatsConfig). Port of algo/strategy/config.py.
 struct BridgeConfig {
     bool                   unsubscribe_on_retire = true;   // after the squareup, unsubscribe the old portfolio
-    bool                   squareup_on_repoint = true;     // square up the old portfolio when a stock moves option
+    bool                   squareup_on_repoint = true;     // square up the old portfolio when a stock moves pf_token
     double                 squareup_settle_s = 60.0;       // wait after a squareup before the unsubscribe destroys it
     int64_t                add_qty = 5;                     // added to the cumulative maxqty on every activation/flip
     Payload                subscribe;                       // fields added over the service's subscribe defaults
@@ -53,8 +53,8 @@ public:
 
     // ---- command sequences (start a workflow; return true if it was started) ------------------------------------
     bool retire(int64_t old_pf);
-    bool swap(int64_t pf, int64_t token, int64_t option, Payload params,
-              std::optional<std::string> prev_leg, std::optional<int64_t> prev_option,
+    bool swap(int64_t pf, int64_t token, int64_t pf_token, Payload params,
+              std::optional<std::string> prev_leg, std::optional<int64_t> prev_token,
               std::optional<int64_t> old_pf = std::nullopt);
 
     // ---- operator actions ---------------------------------------------------------------------------------------
@@ -69,11 +69,17 @@ public:
 
     // ---- lookups ------------------------------------------------------------------------------------------------
     std::optional<int64_t> user() const;                    // cfg.user, else the book's user
-    std::optional<int64_t> subscribedOption(int64_t pf) const;
+    std::optional<int64_t> subscribedToken(int64_t pf) const;
 
 private:
+    // Retire one portfolio on its lane: pause -> squareup (if squareup_on_repoint) -> unsubscribe. With a squareup and a
+    // settle time, the unsubscribe is NOT sent here but `squareup_settle_s` later (unsubscribeLater): an unsubscribe
+    // destroys the engine's plugin, which must first get its closing order filled.
+    Reply retireSteps(Call& call, int64_t old_pf, int64_t old_token);
+    bool  unsubscribeDeferred() const noexcept;                 // the retire leaves its unsubscribe for later
+    void  unsubscribeLater(int64_t pf, int64_t pf_token, std::optional<int64_t> user);
     void    onPf(int64_t user, int64_t pf, const PfState& st);   // a confirmed command: bring the book in line
-    Payload sub(int64_t option) const;                          // subscribe/unsubscribe payload (defaults + T1)
+    Payload sub(int64_t pf_token) const;                          // subscribe/unsubscribe payload (defaults + T1)
     Reply   pauseStep(Call& call, int64_t pf, const std::string& action);  // call + book update when ok
     bool    guard() const;                                      // may this bridge send right now?
 

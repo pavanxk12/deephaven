@@ -26,24 +26,24 @@ void Bridge::bind(NatsService* nats, Portfolios* book) {
     nats_ = nats;
     book_ = book;
     if (!nats_ || !book_) return;
-    nats_->disable(client_);                                 // every bind begins OFF
+    nats_->strategyOff(client_);                                 // every bind begins OFF
     listener_ = nats_->states().onChange([this](int64_t u, int64_t pf, const PfState& st) { onPf(u, pf, st); });
     // tell the shared states about the portfolios the book already had subscribed (so a restart re-adopts them)
     if (auto u = user()) {
-        for (const auto& [pf, option] : book_->subscribed)
-            nats_->states().adopt(*u, pf, option, book_->paused.count(pf) != 0);
+        for (const auto& [pf, pf_token] : book_->subscribed)
+            nats_->states().adopt(*u, pf, pf_token, book_->paused.count(pf) != 0);
     }
 }
 
 void Bridge::unbind() {
     if (nats_ && listener_) nats_->states().removeListener(listener_);
     listener_ = 0;
-    if (nats_) { try { nats_->disable(client_); } catch (...) {} }
+    if (nats_) { try { nats_->strategyOff(client_); } catch (...) {} }
 }
 
 // ---- the send switch --------------------------------------------------------------------------------------------
 bool Bridge::sendOn() {
-    if (!nats_ || !nats_->enable(client_)) return false;
+    if (!nats_ || !nats_->strategyOn(client_)) return false;
     if (book_) book_->changed();
     std::vector<std::pair<Token, std::function<void()>>> cbs;
     { std::lock_guard<std::mutex> g(cb_mu_); cbs = enable_cbs_; }
@@ -52,7 +52,7 @@ bool Bridge::sendOn() {
 }
 
 void Bridge::sendOff() {
-    if (nats_) nats_->disable(client_);
+    if (nats_) nats_->strategyOff(client_);
     if (book_) book_->changed();
 }
 
@@ -62,7 +62,7 @@ bool Bridge::dryRun() const { return nats_ && nats_->cfg().dry_run; }
 std::string Bridge::state() const {
     if (!nats_) return "service_down";
     const std::string base = nats_->state();
-    return (base == "on" && !nats_->isEnabled(client_)) ? "off" : base;
+    return (base == "on" && !nats_->isStrategyOn(client_)) ? "off" : base;
 }
 
 Bridge::Token Bridge::onEnable(std::function<void()> cb) {
@@ -92,21 +92,21 @@ std::optional<int64_t> Bridge::user() const {
     return book_ ? book_->userId() : std::nullopt;
 }
 
-std::optional<int64_t> Bridge::subscribedOption(int64_t pf) const {
+std::optional<int64_t> Bridge::subscribedToken(int64_t pf) const {
     if (book_) {
         auto it = book_->subscribed.find(pf);
         if (it != book_->subscribed.end()) return it->second;
     }
     if (!nats_) return std::nullopt;
     auto st = nats_->pfState(pf, user());
-    if (st && st->subscribed && st->option) return st->option;
+    if (st && st->subscribed && st->pf_token) return st->pf_token;
     return std::nullopt;
 }
 
-Payload Bridge::sub(int64_t option) const {
+Payload Bridge::sub(int64_t pf_token) const {
     Payload out = nats_ ? nats_->cfg().sub_payload : Payload{};
     for (const auto& [k, v] : cfg_.subscribe) out[k] = v;
-    out["T1"] = option;
+    out["T1"] = pf_token;
     return out;
 }
 
@@ -119,36 +119,59 @@ Reply Bridge::pauseStep(Call& call, int64_t pf, const std::string& action) {
 bool Bridge::guard() const { return sending(); }
 
 // ---- command sequences ------------------------------------------------------------------------------------------
+bool Bridge::unsubscribeDeferred() const noexcept {
+    return cfg_.unsubscribe_on_retire && cfg_.squareup_on_repoint && cfg_.squareup_settle_s > 0;
+}
+
+Reply Bridge::retireSteps(Call& call, int64_t old_pf, int64_t old_token) {
+    need(pauseStep(call, old_pf, "Pause"), "pause of old PF not ok, new PF skipped");
+    Reply last{true, "ok", old_pf, "pause_unpause", {}, 0};
+    if (cfg_.squareup_on_repoint) last = need(call("squareup", {}), "squareup of old PF not ok, new PF skipped");
+    if (cfg_.unsubscribe_on_retire && !unsubscribeDeferred())
+        last = call("unsubscribe", sub(old_token));                // no squareup to settle: at once (not ok does not block)
+    return last;
+}
+
+void Bridge::unsubscribeLater(int64_t pf, int64_t pf_token, std::optional<int64_t> u) {
+    const bool started = nats_->go([this, pf, pf_token, u] {
+        if (!nats_->waitUnlessStopped(cfg_.squareup_settle_s)) {   // the service is stopping: say so, do not hang it
+            nats_->note(pf, "retire", "not_sent", "unsubscribe after squareup not sent: the service stopped during the wait", u.value_or(0));
+            return;
+        }
+        try {
+            const Reply r = nats_->lane(pf, [this, pf_token](Call& call) -> Reply { return call("unsubscribe", sub(pf_token)); }, u, client_);
+            if (!r.ok) nats_->note(pf, "retire", "failed", "unsubscribe after squareup not ok: " + r.status, u.value_or(0));
+        } catch (const std::exception& e) {
+            nats_->note(pf, "retire", "failed", std::string("unsubscribe after squareup: ") + e.what(), u.value_or(0));
+        }
+    }, client_);
+    if (!started)
+        nats_->note(pf, "retire", "not_sent", "unsubscribe after squareup not scheduled (sending is off): the portfolio stays "
+                    "subscribed, paused and squared", u.value_or(0));
+}
+
 bool Bridge::retire(int64_t old_pf) {
     if (!nats_) return false;
     const auto u = user();
-    return nats_->go([this, old_pf, u] {
-        nats_->lane(old_pf, [this, old_pf](Call& call) -> Reply {
-            need(pauseStep(call, old_pf, "Pause"), "pause of old PF not ok, new PF skipped");
-            if (cfg_.squareup_on_repoint) need(call("squareup", {}), "squareup of old PF not ok, new PF skipped");
-            Reply last{true, "ok", old_pf, "squareup", {}, 0};
-            if (cfg_.unsubscribe_on_retire) {
-                int64_t opt = 0;
-                auto it = book_->subscribed.find(old_pf);
-                if (it != book_->subscribed.end()) opt = it->second;
-                last = call("unsubscribe", sub(opt));          // already paused + squared: not ok does not block
-            }
-            return last;
-        }, u, client_);
+    int64_t old_token = 0;
+    if (auto it = book_->subscribed.find(old_pf); it != book_->subscribed.end()) old_token = it->second;
+    return nats_->go([this, old_pf, old_token, u] {
+        nats_->lane(old_pf, [this, old_pf, old_token](Call& call) -> Reply { return retireSteps(call, old_pf, old_token); }, u, client_);
+        if (unsubscribeDeferred()) unsubscribeLater(old_pf, old_token, u);
     }, client_);
 }
 
-bool Bridge::swap(int64_t pf, int64_t token, int64_t option, Payload params,
-                  std::optional<std::string> prev_leg, std::optional<int64_t> prev_option, std::optional<int64_t> old_pf) {
+bool Bridge::swap(int64_t pf, int64_t token, int64_t pf_token, Payload params,
+                  std::optional<std::string> prev_leg, std::optional<int64_t> prev_token, std::optional<int64_t> old_pf) {
     if (!nats_) return false;
     const auto u = user();
-    return nats_->go([this, pf, token, option, params = std::move(params), prev_leg, prev_option, old_pf, u]() mutable {
-        auto job = [this, pf, option, &params, u](Call& call) -> Reply {
+    return nats_->go([this, pf, token, pf_token, params = std::move(params), prev_leg, prev_token, old_pf, u]() mutable {
+        auto job = [this, pf, pf_token, &params, u](Call& call) -> Reply {
             auto seen = nats_->pfState(pf, u);
             const bool held = seen && seen->paused && seen->by != client_;   // paused by the console/another algo
             if (book_->subscribed.find(pf) == book_->subscribed.end()) {     // new PF: subscribe it
-                need(call("subscribe", sub(option)), "subscribe not ok, apply skipped");
-                book_->subscribe(pf, option);
+                need(call("subscribe", sub(pf_token)), "subscribe not ok, apply skipped");
+                book_->subscribe(pf, pf_token);
             }
             need(pauseStep(call, pf, "Pause"), "pause not ok, apply skipped");
             int64_t cap = cfg_.add_qty;
@@ -164,25 +187,18 @@ bool Bridge::swap(int64_t pf, int64_t token, int64_t option, Payload params,
         };
         try {
             if (old_pf) {
-                // retire the old PF first, on its own lane, before taking over the stock
-                nats_->lane(*old_pf, [this, old_pf](Call& call) -> Reply {
-                    need(pauseStep(call, *old_pf, "Pause"), "pause of old PF not ok, new PF skipped");
-                    if (cfg_.squareup_on_repoint) need(call("squareup", {}), "squareup of old PF not ok, new PF skipped");
-                    Reply last{true, "ok", *old_pf, "", {}, 0};
-                    if (cfg_.unsubscribe_on_retire) {
-                        int64_t opt = 0;
-                        auto it = book_->subscribed.find(*old_pf);
-                        if (it != book_->subscribed.end()) opt = it->second;
-                        last = call("unsubscribe", sub(opt));
-                    }
-                    return last;
-                }, u, client_);
+                // retire the old PF first, on its own lane, before taking over the stock. Its unsubscribe (if any) follows
+                // `squareup_settle_s` later, so its plugin can fill the closing order; the new PF does not wait for it.
+                int64_t old_token = 0;
+                if (auto it = book_->subscribed.find(*old_pf); it != book_->subscribed.end()) old_token = it->second;
+                nats_->lane(*old_pf, [this, old_pf, old_token](Call& call) -> Reply { return retireSteps(call, *old_pf, old_token); }, u, client_);
+                if (unsubscribeDeferred()) unsubscribeLater(*old_pf, old_token, u);
             }
             nats_->lane(pf, job, u, client_);
         } catch (const std::exception& e) {
             if (old_pf && book_->subscribed.find(pf) == book_->subscribed.end())
                 book_->revert(token, *old_pf, pf);                           // the new PF never reached the bridge
-            book_->setLive(token, prev_leg, prev_option);                    // allow a retry on a later update
+            book_->setLive(token, prev_leg, prev_token);                    // allow a retry on a later update
             book_->last_fail[token] = nowEpoch();
             nats_->note(pf, "swap", "failed", e.what(), u.value_or(0));
         }
@@ -248,14 +264,14 @@ std::vector<std::future<Reply>> Bridge::unsubscribeAll(bool pause) {
 
 Job Bridge::unsubscribeJob(int64_t pf, bool pause) {
     return [this, pf, pause](Call& call) -> Reply {
-        auto opt = subscribedOption(pf);
-        if (!opt) return Reply{true, "ok", pf, "", {}, 0};   // nothing to unsubscribe
+        auto pf_token = subscribedToken(pf);
+        if (!pf_token) return Reply{true, "ok", pf, "", {}, 0};   // nothing to unsubscribe
         if (pause) { Reply r = pauseStep(call, pf, "Pause"); if (!r.ok) return r; }
         Reply sq = call("squareup", {});
         if (!sq.ok) return sq;
-        if (cfg_.squareup_settle_s > 0)
-            std::this_thread::sleep_for(std::chrono::duration<double>(cfg_.squareup_settle_s));  // let the close fill first
-        return call("unsubscribe", sub(*opt));
+        if (cfg_.squareup_settle_s > 0 && !nats_->waitUnlessStopped(cfg_.squareup_settle_s))   // let the close fill first
+            return Reply{false, "stopped", pf, "unsubscribe", {}, 0};    // the service is stopping: do not hang it
+        return call("unsubscribe", sub(*pf_token));
     };
 }
 
@@ -268,9 +284,9 @@ void Bridge::onPf(int64_t u, int64_t pf, const PfState& st) {
     if (!key && !in_sub) return;                            // not one of ours
     try {
         auto it = book_->subscribed.find(pf);
-        if (st.cmd == "subscribe" && st.subscribed && st.option &&
-            (it == book_->subscribed.end() || it->second != *st.option))
-            book_->subscribe(pf, *st.option);               // whoever sent it: the book (and Postgres) records it
+        if (st.cmd == "subscribe" && st.subscribed && st.pf_token &&
+            (it == book_->subscribed.end() || it->second != *st.pf_token))
+            book_->subscribe(pf, *st.pf_token);               // whoever sent it: the book (and Postgres) records it
         if (st.cmd == "pause_unpause") book_->setPaused(pf, st.paused);
         else if (st.cmd == "squareup" && key) book_->setLive(*key, std::nullopt);
         else if ((st.cmd == "subscribe" || st.cmd == "unsubscribe") && st.by != client_ && key)

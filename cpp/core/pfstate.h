@@ -21,7 +21,7 @@ namespace algo {
 
 // One portfolio as the bridge last confirmed it.
 struct PfState {
-    std::optional<int64_t> option;        // the option token it is subscribed to (nullopt = not known)
+    std::optional<int64_t> pf_token;        // the token it is subscribed to (nullopt = not known)
     bool        subscribed = false;       // true after subscribe, false after unsubscribe
     bool        paused = false;           // the Pause / Resume button
     bool        squared = false;          // a square up went through and nothing has been applied since
@@ -50,9 +50,9 @@ public:
     std::vector<Entry>     items(std::optional<int64_t> user = std::nullopt) const;  // one user or everybody
     std::size_t            size() const;
 
-    // option token -> the portfolio that trades it. If several do, a subscribed one wins, then the latest change.
+    // a traded token -> the portfolio that trades it. If several do, a subscribed one wins, then the latest change.
     // `keep(user, pf, state)` may leave some out first (e.g. another strategy's portfolios).
-    std::unordered_map<int64_t, Entry> byOption(
+    std::unordered_map<int64_t, Entry> byToken(
         std::optional<int64_t> user = std::nullopt,
         const std::function<bool(int64_t, int64_t, const PfState&)>& keep = {}) const;
 
@@ -62,7 +62,7 @@ public:
     std::optional<PfState> record(int64_t user, int64_t pf, std::string_view cmd, const PfPayload& payload,
                                   std::string_view by);
     // A portfolio the book already had subscribed (from its file) when this session began. Never overwrites a seen one.
-    void adopt(int64_t user, int64_t pf, int64_t option, std::optional<bool> paused = std::nullopt);
+    void adopt(int64_t user, int64_t pf, int64_t pf_token, std::optional<bool> paused = std::nullopt);
     void forget(std::optional<int64_t> user = std::nullopt);
 
     // ---- listening ----------------------------------------------------------------------------------------------

@@ -33,7 +33,7 @@ public:
             log("NiftySmaCross: n_strikes must be 1..16 and fast < slow <= 256; not started", AlgoLogLevel::ERROR);
             return;
         }
-        future_ = find(underlying_);                           // a bare name = its nearest future
+        future_ = findFut(underlying_);                        // the nearest unexpired future of the underlying
         if (!future_) { log("NiftySmaCross: no future for the underlying; not started", AlgoLogLevel::ERROR); return; }
 
         track(&future_, 1, nStrikes_);                         // re-adopt the portfolios held before a restart (one per strike slot)

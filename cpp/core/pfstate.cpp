@@ -10,7 +10,7 @@ double nowEpoch() {
 }
 
 // The contract a command names: T1 (churning), or TOKEN (the single-order strategy's own field), else what was known.
-std::optional<int64_t> contractOf(const PfPayload& p, std::optional<int64_t> known) {
+std::optional<int64_t> tokenFrom(const PfPayload& p, std::optional<int64_t> known) {
     if (p.t1) return p.t1;
     if (p.token) return p.token;
     return known;
@@ -38,17 +38,17 @@ std::size_t PfStates::size() const {
     return d_.size();
 }
 
-std::unordered_map<int64_t, PfStates::Entry> PfStates::byOption(
+std::unordered_map<int64_t, PfStates::Entry> PfStates::byToken(
     std::optional<int64_t> user, const std::function<bool(int64_t, int64_t, const PfState&)>& keep) const {
     std::unordered_map<int64_t, Entry> out;
     for (auto& e : items(user)) {
         const auto& [u, p, s] = e;
-        if (!s.option || (keep && !keep(u, p, s))) continue;
-        auto it = out.find(*s.option);
+        if (!s.pf_token || (keep && !keep(u, p, s))) continue;
+        auto it = out.find(*s.pf_token);
         // a subscribed portfolio wins, then the latest change: compare (subscribed, at) as a pair.
         if (it == out.end() ||
             std::make_pair(s.subscribed, s.at) > std::make_pair(std::get<2>(it->second).subscribed, std::get<2>(it->second).at))
-            out[*s.option] = e;
+            out[*s.pf_token] = e;
     }
     return out;
 }
@@ -60,12 +60,12 @@ std::optional<PfState> PfStates::record(int64_t user, int64_t pf, std::string_vi
         std::lock_guard<std::mutex> g(lock_);
         PfState& st = d_[{user, pf}];
         if (cmd == "subscribe") {
-            st.option = contractOf(payload, st.option);
+            st.pf_token = tokenFrom(payload, st.pf_token);
             st.subscribed = true;
             st.squared = false;
         } else if (cmd == "unsubscribe") {
             st.subscribed = false;
-            st.option = contractOf(payload, st.option);
+            st.pf_token = tokenFrom(payload, st.pf_token);
         } else if (cmd == "pause_unpause") {
             st.paused = payload.action && *payload.action == "Pause";
         } else if (cmd == "squareup") {
@@ -86,14 +86,14 @@ std::optional<PfState> PfStates::record(int64_t user, int64_t pf, std::string_vi
     return snapshot;
 }
 
-void PfStates::adopt(int64_t user, int64_t pf, int64_t option, std::optional<bool> paused) {
+void PfStates::adopt(int64_t user, int64_t pf, int64_t pf_token, std::optional<bool> paused) {
     PfState snapshot;
     {
         std::lock_guard<std::mutex> g(lock_);
         const Key key{user, pf};
         if (d_.count(key)) return;                 // never overwrite what was seen
         PfState& st = d_[key];
-        st.option = option;
+        st.pf_token = pf_token;
         st.subscribed = true;
         st.cmd = "adopted";
         st.at = nowEpoch();

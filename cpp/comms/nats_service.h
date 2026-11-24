@@ -61,7 +61,7 @@ struct NatsConfig {
     int32_t              max_queued = 5000;     // commands inside the service (running + waiting); 0 = no cap
     std::string          subject = "cmd.hft.{pf}";
     bool                 dry_run = false;       // true: no connection, commands are only logged
-    bool                 send_on = false;       // false: nothing is sent (switch live with sendOn())
+    bool                 send_on = false;       // the whole-service switch at start (switch live with on() / off())
     Payload              sub_payload;           // defaults merged into subscribe / unsubscribe (filled by default ctor)
 
     NatsConfig();
@@ -110,8 +110,8 @@ public:
     void stop();                                // drain, tell waiting jobs "stopped", close the transport
 
     // ---- the six commands (each returns a future; .get() waits for the Reply) ------------------------------------
-    std::future<Reply> subscribe(int64_t pf, int64_t option, const Payload& params = {}, std::optional<int64_t> user = std::nullopt, std::optional<std::string> client = std::nullopt);
-    std::future<Reply> unsubscribe(int64_t pf, int64_t option, const Payload& params = {}, std::optional<int64_t> user = std::nullopt, std::optional<std::string> client = std::nullopt);
+    std::future<Reply> subscribe(int64_t pf, int64_t pf_token, const Payload& params = {}, std::optional<int64_t> user = std::nullopt, std::optional<std::string> client = std::nullopt);
+    std::future<Reply> unsubscribe(int64_t pf, int64_t pf_token, const Payload& params = {}, std::optional<int64_t> user = std::nullopt, std::optional<std::string> client = std::nullopt);
     std::future<Reply> pause(int64_t pf, std::optional<int64_t> user = std::nullopt, std::optional<std::string> client = std::nullopt);
     std::future<Reply> unpause(int64_t pf, std::optional<int64_t> user = std::nullopt, std::optional<std::string> client = std::nullopt);
     std::future<Reply> squareup(int64_t pf, std::optional<int64_t> user = std::nullopt, std::optional<std::string> client = std::nullopt);
@@ -127,19 +127,33 @@ public:
     // Run a free-form workflow (that calls lane() itself) on its own thread. Returns false (dropped) while sending is
     // off for everyone or for this client. The workflow's threads are joined at stop.
     bool               go(std::function<void()> workflow, std::optional<std::string> client = std::nullopt);
+    // Wait `seconds` inside a workflow / job without holding up a shutdown: returns false at once if the service stops.
+    bool               waitUnlessStopped(double seconds);
 
     // ---- the switches -------------------------------------------------------------------------------------------
-    bool sendOn();                              // master switch on (needs a live transport)
-    void sendOff();
-    bool enable(const std::string& client);     // a client's own switch on
-    void disable(const std::string& client);
-    bool isEnabled(const std::string& client) const;
-    bool allowed(std::optional<std::string> client = std::nullopt) const;   // master on AND the client's switch on
+    // Four ON/OFF switches. A command goes out only while EVERY switch on its path is ON; a refused command is answered
+    // "off" with the reason, and a switch turned off also stops a sequence already running, at its next request.
+    //   whole     the service            ON once started (on() needs a live transport)
+    //   user      everything of a user   ON by default -- strategies AND the operator
+    //   strategy  one strategy's own     OFF until the strategy switches itself on (operator commands don't need it)
+    //   pf        one (user, portfolio)  ON by default -- strategies AND the operator
+    bool on();
+    void off();
+    bool isOn() const { return sending_.load(); }
+    void userOn(int64_t user);
+    void userOff(int64_t user);
+    bool isUserOn(int64_t user) const;
+    bool strategyOn(const std::string& strategy);
+    void strategyOff(const std::string& strategy);
+    bool isStrategyOn(const std::string& strategy) const;
+    void pfOn(int64_t user, int64_t pf);
+    void pfOff(int64_t user, int64_t pf);
+    bool isPfOn(int64_t user, int64_t pf) const;
+    // why a command for (user, pf) from `strategy` (nullopt = the operator) would be refused; "" = every switch is ON
+    std::string offReason(int64_t user, int64_t pf, const std::optional<std::string>& strategy) const;
+    bool allowed(std::optional<std::string> client = std::nullopt) const;   // the whole switch AND the strategy's switch
     void addUsers(const std::vector<int64_t>& users);
 
-    // ---- users and blocks ---------------------------------------------------------------------------------------
-    void block(std::optional<int64_t> user, const std::vector<int64_t>& pfs = {});
-    void unblock(std::optional<int64_t> user, const std::vector<int64_t>& pfs = {});
 
     // ---- state --------------------------------------------------------------------------------------------------
     bool                   connected() const;
@@ -170,6 +184,7 @@ private:
     void               drain(std::pair<int64_t, int64_t> key);         // the drain thread body for one lane
     Reply              call(int64_t pf, int64_t user, const std::optional<std::string>& client, const std::string& cmd, const Payload& payload);
     std::pair<int64_t, std::string> resolve(std::optional<int64_t> user) const;   // (user, "") or (0, why)
+    std::string        userPfReason(int64_t user, int64_t pf) const;               // the user / pf switches only
     Payload            stamp(const std::string& cmd, Payload payload, int64_t user) const;
     void               track(int64_t pf, int64_t user, const std::string& cmd, const Payload& payload, const std::optional<std::string>& client);
     void               acquireSlot();
@@ -186,10 +201,12 @@ private:
     std::map<std::pair<int64_t, int64_t>, std::deque<Waiting>> lanes_;   // (user, pf) -> waiting jobs
     int                               active_drains_ = 0;                // live drain threads (detached)
     std::condition_variable           drains_cv_;                        // guarded by mu_; stop() waits on it
+    std::mutex                        stop_mu_;                          // waitUnlessStopped() sleeps on stop_cv_
+    std::condition_variable           stop_cv_;
     std::vector<std::thread>          workflows_;                        // go() threads, joined at stop
     std::set<std::string>             enabled_;
-    std::set<int64_t>                 blocked_users_;
-    std::set<std::pair<int64_t, int64_t>> blocked_pfs_;
+    std::set<int64_t>                 users_off_;
+    std::set<std::pair<int64_t, int64_t>> pfs_off_;
     Counts                            counts_;
     std::vector<Event>                events_;
     PfStates                          states_;

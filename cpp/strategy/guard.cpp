@@ -80,8 +80,8 @@ std::map<int64_t, int> Guard::squareAll(const std::string& strategy) {
         if (!st.subscribed || !rec || rec->algo != strategy) continue;
 
         Job job;
-        if (bridge && bridge->subscribedOption(pf))
-            job = bridge->unsubscribeJob(pf);                  // the bridge knows the option: pause -> squareup -> unsubscribe
+        if (bridge && bridge->subscribedToken(pf))
+            job = bridge->unsubscribeJob(pf);                  // the bridge knows the pf_token: pause -> squareup -> unsubscribe
         else
             job = [pf](Call& call) -> Reply { call("pause_unpause", {{"Action", std::string("Pause")}}); return call("squareup", {}); };
 

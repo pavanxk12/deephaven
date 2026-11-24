@@ -38,7 +38,7 @@ Registry::Registry(StateDB* db) : db_(db) { load(); }
 void Registry::load() {
     if (!db_) return;
     for (const auto& p : db_->loadPortfolios())
-        data_[p.user][p.pf] = {p.owner, p.name, p.algo, p.created, p.note};
+        data_[p.user][p.pf] = {p.owner, p.name, p.algo, p.created, p.note, p.token};
 }
 
 std::string Registry::stamp() const {
@@ -62,7 +62,7 @@ RegRec Registry::put(int64_t user, int64_t pf, RegRec rec) {
     mine[pf] = rec;
     if (db_) {
         try {
-            db_->savePortfolio({user, pf, rec.owner, rec.name, rec.algo, rec.created, rec.note});
+            db_->savePortfolio({user, pf, rec.owner, rec.name, rec.algo, rec.created, rec.note, rec.token});
         } catch (...) {
             if (existed) mine[pf] = before;
             else { mine.erase(pf); if (mine.empty()) data_.erase(user); }
@@ -89,7 +89,7 @@ int64_t Registry::allocate(int64_t user, const std::string& owner_in, int64_t st
         if (r.owner == owner) { highest_mine = std::max(highest_mine, p); have_mine = true; }
     int64_t n = have_mine ? std::max(s, highest_mine + 1) : s;
     while (held.count(n)) ++n;
-    put(u, n, {owner, trim(name), trim(algo), stamp(), trim(note)});
+    put(u, n, {owner, trim(name), trim(algo), stamp(), trim(note), std::nullopt});
     return n;
 }
 
@@ -106,7 +106,7 @@ Claim Registry::registerPf(int64_t user, int64_t pf, const std::string& owner_in
     auto uit = data_.find(u);
     const RegRec* have = (uit != data_.end() && uit->second.count(p)) ? &uit->second.at(p) : nullptr;
     if (!have) {
-        put(u, p, {owner, trim(name), trim(algo), stamp(), trim(note)});
+        put(u, p, {owner, trim(name), trim(algo), stamp(), trim(note), std::nullopt});
         return {true, "registered", u, p, owner, ""};
     }
     if (have->owner != owner) return {false, "taken", u, p, owner, have->owner};
@@ -118,6 +118,19 @@ Claim Registry::registerPf(int64_t user, int64_t pf, const std::string& owner_in
         return {true, "exists", u, p, owner, ""};
     put(u, p, updated);
     return {true, "updated", u, p, owner, ""};
+}
+
+bool Registry::setToken(int64_t user, int64_t pf, int64_t token) {
+    std::lock_guard<std::recursive_mutex> g(lock_);
+    auto uit = data_.find(user);
+    if (uit == data_.end()) return false;
+    auto pit = uit->second.find(pf);
+    if (pit == uit->second.end()) return false;
+    if (pit->second.token == token) return true;           // unchanged: no write
+    RegRec updated = pit->second;
+    updated.token = token;
+    put(user, pf, updated);
+    return true;
 }
 
 std::optional<std::string> Registry::ownerOf(int64_t user, int64_t pf) const {
@@ -140,7 +153,7 @@ std::vector<Portfolio> Registry::portfolios(std::optional<int64_t> user) const {
     std::vector<Portfolio> out;
     for (const auto& [u, pfs] : data_) {
         if (user && u != *user) continue;
-        for (const auto& [p, r] : pfs) out.push_back({u, p, r.owner, r.name, r.algo, r.created, r.note});
+        for (const auto& [p, r] : pfs) out.push_back({u, p, r.owner, r.name, r.algo, r.created, r.note, r.token});
     }
     return out;                                   // std::map keeps users and pfs sorted
 }

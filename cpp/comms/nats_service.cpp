@@ -47,7 +47,7 @@ NatsConfig::NatsConfig() {
 }
 
 bool isRefused(const std::string& status) {
-    return status == "stopped" || status == "full" || status == "no_user" || status == "user_not_allowed" || status == "blocked";
+    return status == "stopped" || status == "full" || status == "no_user" || status == "user_not_allowed" || status == "off";
 }
 
 Reply Call::operator()(const std::string& cmd, const Payload& payload) {
@@ -75,6 +75,8 @@ void NatsService::connect() {
 void NatsService::stop() {
     if (stopped_.exchange(true)) return;         // runs once; a later call (e.g. the destructor) is a no-op
     closing_ = true;
+    { std::lock_guard<std::mutex> g(stop_mu_); }  // wake every waitUnlessStopped() at once
+    stop_cv_.notify_all();
     {
         std::lock_guard<std::mutex> g(mu_);      // whatever is still waiting is told it will not run
         for (auto& [key, lane] : lanes_) {
@@ -98,11 +100,11 @@ void NatsService::stop() {
 }
 
 // ---- the six commands -------------------------------------------------------------------------------------------
-std::future<Reply> NatsService::subscribe(int64_t pf, int64_t option, const Payload& params, std::optional<int64_t> user, std::optional<std::string> client) {
-    return send(pf, "subscribe", merge(cfg_.sub_payload, params, option), user, std::move(client));
+std::future<Reply> NatsService::subscribe(int64_t pf, int64_t pf_token, const Payload& params, std::optional<int64_t> user, std::optional<std::string> client) {
+    return send(pf, "subscribe", merge(cfg_.sub_payload, params, pf_token), user, std::move(client));
 }
-std::future<Reply> NatsService::unsubscribe(int64_t pf, int64_t option, const Payload& params, std::optional<int64_t> user, std::optional<std::string> client) {
-    return send(pf, "unsubscribe", merge(cfg_.sub_payload, params, option), user, std::move(client));
+std::future<Reply> NatsService::unsubscribe(int64_t pf, int64_t pf_token, const Payload& params, std::optional<int64_t> user, std::optional<std::string> client) {
+    return send(pf, "unsubscribe", merge(cfg_.sub_payload, params, pf_token), user, std::move(client));
 }
 std::future<Reply> NatsService::pause(int64_t pf, std::optional<int64_t> user, std::optional<std::string> client) {
     return send(pf, "pause_unpause", {{"Action", std::string("Pause")}}, user, std::move(client));
@@ -132,6 +134,11 @@ Reply NatsService::lane(int64_t pf, Job job, std::optional<int64_t> user, std::o
     return r;
 }
 
+bool NatsService::waitUnlessStopped(double seconds) {
+    std::unique_lock<std::mutex> g(stop_mu_);
+    return !stop_cv_.wait_for(g, std::chrono::duration<double>(seconds), [this] { return closing_.load(); });
+}
+
 bool NatsService::go(std::function<void()> workflow, std::optional<std::string> client) {
     if (cfg_.dry_run || !allowed(client) || stopped_) return false;
     std::lock_guard<std::mutex> g(mu_);
@@ -143,24 +150,22 @@ std::future<Reply> NatsService::submitInternal(int64_t pf, Job job, const std::s
     std::promise<Reply> promise;
     std::future<Reply> fut = promise.get_future();
     auto [uid, why] = resolve(user);
-    if (why.empty()) {
-        std::lock_guard<std::mutex> g(mu_);
-        if (blocked_users_.count(uid) || blocked_pfs_.count({uid, pf})) why = "blocked";
-    }
     if (!why.empty()) {
-        const std::string detail = why == "no_user" ? "several users are allowed: say which one"
-                                 : why == "user_not_allowed" ? "that user is not allowed"
-                                 : "this user or portfolio is blocked";
+        const std::string detail = why == "no_user" ? "several users are allowed: say which one" : "that user is not allowed";
         note(pf, label, why, detail, uid);
         promise.set_value(Reply{false, why, pf, label, {{"detail", detail}}, uid});
         return fut;
     }
-    if (cfg_.dry_run) { promise.set_value(Reply{true, "dry", pf, label, {}, uid}); return fut; }
-    if (gated && !allowed(client)) {
-        const std::string off = !sending_ ? "sending is off for everyone" : "this client has not switched sending on";
-        promise.set_value(Reply{false, "off", pf, label, {{"detail", off}}, uid});
+    // the user / pf switches hold for everyone and every kind of call; the whole / strategy switches for gated calls
+    // (a running workflow's lane() steps were gated when the workflow started, and are re-checked per request in call())
+    std::string reason = userPfReason(uid, pf);
+    if (reason.empty() && !cfg_.dry_run && gated) reason = offReason(uid, pf, client);
+    if (!reason.empty()) {
+        note(pf, label, "off", reason, uid);
+        promise.set_value(Reply{false, "off", pf, label, {{"detail", reason}}, uid});
         return fut;
     }
+    if (cfg_.dry_run) { promise.set_value(Reply{true, "dry", pf, label, {}, uid}); return fut; }
     if (stopped_) { promise.set_value(Reply{false, "stopped", pf, label, {}, uid}); return fut; }
     enqueue(pf, uid, std::move(job), std::move(promise), std::move(client));
     return fut;
@@ -225,11 +230,11 @@ void NatsService::drain(std::pair<int64_t, int64_t> key) {
 
 // ---- one request ------------------------------------------------------------------------------------------------
 Reply NatsService::call(int64_t pf, int64_t user, const std::optional<std::string>& client, const std::string& cmd, const Payload& payload) {
-    bool blocked;
-    { std::lock_guard<std::mutex> g(mu_); blocked = blocked_users_.count(user) || blocked_pfs_.count({user, pf}); if (blocked) counts_.failed++; }
-    if (blocked) {                                   // blocked in the middle of a sequence
-        note(pf, cmd, "blocked", "this user or portfolio is blocked", user);
-        return Reply{false, "blocked", pf, cmd, {}, user};
+    const std::string reason = offReason(user, pf, client);   // a switch turned off while a sequence was running
+    if (!reason.empty()) {
+        { std::lock_guard<std::mutex> g(mu_); counts_.failed++; }
+        note(pf, cmd, "off", reason, user);
+        return Reply{false, "off", pf, cmd, {{"detail", reason}}, user};
     }
     if (transport_ && !transport_->isConnected()) {
         { std::lock_guard<std::mutex> g(mu_); counts_.failed++; }
@@ -288,27 +293,45 @@ void NatsService::track(int64_t pf, int64_t user, const std::string& cmd, const 
 }
 
 // ---- switches ---------------------------------------------------------------------------------------------------
-bool NatsService::sendOn() {
+bool NatsService::on() {
     if (!transport_) return false;
     sending_ = true;
     return true;
 }
-void NatsService::sendOff() { sending_ = false; }
+void NatsService::off() { sending_ = false; }
 
-bool NatsService::enable(const std::string& client) {
+void NatsService::userOn(int64_t user) { std::lock_guard<std::mutex> g(mu_); users_off_.erase(user); }
+void NatsService::userOff(int64_t user) { std::lock_guard<std::mutex> g(mu_); users_off_.insert(user); }
+bool NatsService::isUserOn(int64_t user) const { std::lock_guard<std::mutex> g(mu_); return users_off_.count(user) == 0; }
+
+bool NatsService::strategyOn(const std::string& strategy) {
     if (!transport_) return false;
     std::lock_guard<std::mutex> g(mu_);
-    enabled_.insert(client);
+    enabled_.insert(strategy);
     return true;
 }
-void NatsService::disable(const std::string& client) {
+void NatsService::strategyOff(const std::string& strategy) { std::lock_guard<std::mutex> g(mu_); enabled_.erase(strategy); }
+bool NatsService::isStrategyOn(const std::string& strategy) const { std::lock_guard<std::mutex> g(mu_); return enabled_.count(strategy) != 0; }
+
+void NatsService::pfOn(int64_t user, int64_t pf) { std::lock_guard<std::mutex> g(mu_); pfs_off_.erase({user, pf}); }
+void NatsService::pfOff(int64_t user, int64_t pf) { std::lock_guard<std::mutex> g(mu_); pfs_off_.insert({user, pf}); }
+bool NatsService::isPfOn(int64_t user, int64_t pf) const { std::lock_guard<std::mutex> g(mu_); return pfs_off_.count({user, pf}) == 0; }
+
+std::string NatsService::userPfReason(int64_t user, int64_t pf) const {
     std::lock_guard<std::mutex> g(mu_);
-    enabled_.erase(client);
+    if (users_off_.count(user)) return "user " + std::to_string(user) + " is off";
+    if (pfs_off_.count({user, pf})) return "user " + std::to_string(user) + " portfolio " + std::to_string(pf) + " is off";
+    return "";
 }
-bool NatsService::isEnabled(const std::string& client) const {
-    std::lock_guard<std::mutex> g(mu_);
-    return enabled_.count(client) != 0;
+
+std::string NatsService::offReason(int64_t user, int64_t pf, const std::optional<std::string>& strategy) const {
+    if (!sending_) return "nats is off";
+    std::string r = userPfReason(user, pf);
+    if (!r.empty()) return r;
+    if (strategy && !isStrategyOn(*strategy)) return "strategy " + *strategy + " is off";
+    return "";
 }
+
 bool NatsService::allowed(std::optional<std::string> client) const {
     if (!sending_) return false;
     if (!client) return true;
@@ -319,20 +342,6 @@ void NatsService::addUsers(const std::vector<int64_t>& users) {
     std::lock_guard<std::mutex> g(mu_);
     for (int64_t u : users)
         if (std::find(cfg_.users.begin(), cfg_.users.end(), u) == cfg_.users.end()) cfg_.users.push_back(u);
-}
-
-// ---- blocks -----------------------------------------------------------------------------------------------------
-void NatsService::block(std::optional<int64_t> user, const std::vector<int64_t>& pfs) {
-    if (!user) throw std::invalid_argument("block(user=..): a portfolio number belongs to a user, so name the user");
-    std::lock_guard<std::mutex> g(mu_);
-    if (!pfs.empty()) for (int64_t p : pfs) blocked_pfs_.insert({*user, p});
-    else blocked_users_.insert(*user);
-}
-void NatsService::unblock(std::optional<int64_t> user, const std::vector<int64_t>& pfs) {
-    if (!user) throw std::invalid_argument("unblock(user=..): name the user");
-    std::lock_guard<std::mutex> g(mu_);
-    if (!pfs.empty()) for (int64_t p : pfs) blocked_pfs_.erase({*user, p});
-    else { blocked_users_.erase(*user); for (auto it = blocked_pfs_.begin(); it != blocked_pfs_.end();) it = (it->first == *user) ? blocked_pfs_.erase(it) : std::next(it); }
 }
 
 // ---- state ------------------------------------------------------------------------------------------------------
