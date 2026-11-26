@@ -6,3 +6,6 @@ __pycache__/
 build/
 dist/
 history/
+
+# C++ parity-test fixtures (large SQLite market-data dumps)
+cpp/tests/parity/data/

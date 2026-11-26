@@ -1,42 +1,47 @@
-# US BASKET + 5-MINUTE RSI + CrossOrder: the US version of 07. A plain script (functions, no class). Paste in the US server's terminal after the services are up (init.py).
+# US BASKET + EXTREME FILTERS + CrossOrder: the US version of 13. A plain script (functions, no class). Paste in the US server's terminal after the services are up (init.py).
 #
 #   The basket        BASKETS = {"tech": [...], "chips": [...], "other": [...]}: named sector baskets. A symbol is ranked against the OTHERS of its own basket only (each saved in baskets.txt too).
-#   The filter        a symbol may be traded only while its % change from the OPEN stands in the MIDDLE of its basket (REL_ZONE["pct_open"], Q2 to Q3), AND its % from the VWAP,
-#                     among that same basket, sits on the side matching the RSI zone -- ABOVE REL_ZONE["pct_vwap"]'s high for OVERBOUGHT (SELL), BELOW its low for OVERSOLD (BUY).
-#   The own history   AND, against the same minute on its previous ABS_DAYS (22) trading days: its own % from the OPEN, now, must sit INSIDE ABS_ZONE["pct_open"] (Q2 to Q3);
-#                     its own % from the VWAP, now, must sit on the side matching the RSI zone -- ABOVE ABS_ZONE["pct_vwap"]'s high for OVERBOUGHT (SELL), BELOW its low for OVERSOLD (BUY).
-#                     absolute() reads those days from the saved candle files, one stock and one day at a time. With fewer than half of the days in the files there is no trade.
-#   The signal        5-minute RSI, made from the 1-minute candles: it ENTERS oversold (< RSI_LOW) -> BUY, or overbought (> RSI_HIGH) -> SELL. One position per symbol at a time.
-#   The history       the RSI does not start from nothing at the open: the 5-minute closes of the last HIST_DAYS saved days (candles_<day>.parquet in the market-data / EOD folders)
-#                     come first, then today's candles. So the RSI at 09:35 is computed through yesterday's prices, overnight gap included. No files = it says so and starts from today.
-#   The exit          the script's own target and stop-loss on the price: +TARGET_PCT in its favour, or -STOP_PCT against it (checked on every 1-minute close). TRAIL_TRIGGER_PCT /
-#                     PROFIT_LOCK_PCT (both None, or both set): once the move reaches TRAIL_TRIGGER_PCT the stop shifts, for the rest of that position's life, from -STOP_PCT to PROFIT_LOCK_PCT.
+#   The signal        at the end of every SIGNAL_BAR bar (the candle that ends it: :05, :10, :15 ...), for each stock that has no position, four filters in this order:
+#                     0. TODAY      the latest SIGNAL_BAR close must be the HIGHEST of today's SIGNAL_BAR closes so far (a BUY) or the LOWEST (a SELL) (DAY_EXTREME); a stock that is neither is
+#                                   dropped here, before anything else is asked.
+#                     1. BASKET AVG the basket's own AVERAGE % change from the open (across every member, from the same relative() read filter 2 uses): BUY needs it at least BASKAVG_LONG,
+#                                   SELL needs it at or below BASKAVG_SHORT. A basket-wide momentum gate, not a per-stock ranking.
+#                     2. RELATIVE   the stock must be EXTREME against its basket (relative()), for the % change from the OPEN and the % change from the VWAP. BUY needs it the BEST of the basket
+#                                   (percentile 100) on both; SELL needs it WEAK (below EXTREME[0]) on both. DIRECTION_MATCH = True: BUY needs the best, SELL the weak side. False: either passes.
+#                     3. ABSOLUTE   the stock must also be EXTREME against its own earlier days at the same minute (absolute(), ABS_DAYS = 22 saved days). BUY needs it above 90 on both refs;
+#                                   SELL needs it below EXTREME[0] on both, on the same side as filter 2.
+#                     4. RVOL       today's cumulative volume so far (absolute("volume", ...)) must be at least RVOL_MIN_MULT times the AVERAGE of the same point in the session over the
+#                                   previous ABS_DAYS days. Not directional (no side of its own): a gate on both BUY and SELL alike. Off when RVOL_MIN_MULT is None, or ABS_DAYS is 0.
+#                     5. TURNOVER   today's cumulative traded VALUE (price x volume, dollars) so far must be at least TURNOVER_MIN. A flat floor, not a ranking: it screens out stocks too
+#                                   thin to trade in size, regardless of what the other filters say. Not directional. Off when TURNOVER_MIN is None.
+#                     Each filter runs only for the stocks that passed the one before it. With fewer than half of the days in the files absolute() cannot tell and there is no trade.
+#                     A trade needs the sides of 0 and 1 (and 2, and 3 when ABS_DAYS > 0) to agree on exactly one side.
+#                     USE_IV = False: no IV filter (the US has no straddle series; True would make every entry say "cannot tell").
+#   The exit          the script's own target and stop-loss on the price: +TARGET_PCT in its favour, or -STOP_PCT against it, on every price tick of the live feed for the open positions (TICK_EXITS)
+#                     and on each 1-minute close. TRAIL_TRIGGER_PCT / PROFIT_LOCK_PCT (both None, or both set): once the move reaches TRAIL_TRIGGER_PCT the stop shifts, for the rest of that
+#                     position's life, from -STOP_PCT to PROFIT_LOCK_PCT.
 #   One entry         ONE_ENTRY_PER_STOCK = True: a stock is entered ONCE. After its take-profit, stop-loss or any other exit it is not entered again (until the script is pasted again).
 #   The time exit     EXIT_AT (15:55 New York time, 5 minutes before the 16:00 close): the automation is stopped the way algo_stop does it: every portfolio is paused and squared up, a minute
-#                     later unsubscribed (so the plugin can close first), and the script stops. No entry is made from then on. It is checked on every batch of 1-minute candles, so it
-#                     starts within a minute of EXIT_AT. It refuses while sending is OFF (it says so; then run meanrevert_stop() by hand).
+#                     later unsubscribed (so the plugin can close first), and the script stops. No entry is made from then on. It refuses while sending is OFF (it says so; then run directional_stop() by hand).
 #   The order         ENGINE["strategyname"] = "LimitOrder" (the engine plugin that rests a limit order and MODIFYs it in place on later params, never CrossOrder's immediate fill):
 #                     {"strategyname": "LimitOrder", "TOKEN": <contract>, "SIDE": 1|2, "QTY": n lots, "PRICE": <int>, "SERVERCODE": ..., "ACCOUNT": "PRO", "ALGOID": "1", "MAX_TRIES": 5}
-#   The spread gate   ENTRY and EXIT both wait for the live spread (SPREAD_MAX, from fo_market_data's b0p/a0p/ltp) to tighten before sending anything -- see spread_ok()/the
-#                     pending_entry/pending_exit state machine below. An ENTRY that never tightens within SPREAD_WAIT_S is dropped (no trade); an EXIT fires anyway once it times out
-#                     (a stop-loss/target must never just hang unsent). Once resting, an order is "chased": every CHASE_EVERY_S, if the spread is still OK and the best price has moved,
-#                     an "apply" (not a new subscribe) re-prices it in place, up to CHASE_TRIES times; after that it is paused (cancelled) and, for an entry, unsubscribed -- nothing more.
-#                     An EXIT is a brand-new portfolio (opposite side, NOT the original entry's `squareup`): the original entry pf is left open, now offset by this new one. Its QTY is
-#                     the REAL filled amount read from the `orders_trade` table (token, buy_sell, fill_quantity, fill_price, PF), never the original target -- so a partially filled
-#                     entry is still closed exactly, not over- or under-closed. The book gives the portfolio numbers; each stock may use up to 100 a day.
+#   The spread gate   ENTRY and EXIT both wait for the live spread (SPREAD_MAX, from fo_market_data's b0p/a0p/ltp) to tighten before sending anything. An ENTRY that never tightens within
+#                     SPREAD_WAIT_S is dropped (no trade); an EXIT fires anyway once it times out (a stop-loss/target must never just hang unsent). Once resting, an order is "chased": every
+#                     CHASE_EVERY_S, if the spread is still OK and the best price has moved, an "apply" (not a new subscribe) re-prices it in place, up to CHASE_TRIES times; after that it
+#                     is paused (cancelled) and, for an entry, unsubscribed -- nothing more. An EXIT is a brand-new portfolio (opposite side, NOT the original entry's `squareup`): the
+#                     original entry pf is left open, now offset by this new one. Its QTY is the REAL filled amount read from the `orders_trade` table (token, buy_sell, fill_quantity,
+#                     fill_price, PF), never the original target -- so a partially filled entry is still closed exactly. The book gives the portfolio numbers; each stock may use up to 100 a day.
 #                     CHECK on the US server before real money: SERVERCODE and ACCOUNT are India's values.
 #
-# EVERYTHING is inside the function run_meanrevert() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of
-# names shared by every script you paste, so top-level `rsi` or `closes` would overwrite another running script's. The only names left in the terminal start with meanrevert:
-#   meanrevert_status()   meanrevert_exit_all()   meanrevert_stop()   (stop pauses, squares up and unsubscribes every portfolio, then stops; it refuses while sending is OFF)
+# EVERYTHING is inside the function run_directional() (not named like the strategy: its console window is published under the strategy name): the terminal has ONE set of
+# names shared by every script you paste, so top-level `step` or `closes` would overwrite another running script's. The only names left in the terminal start with directional:
+#   directional_status()   directional_exit_all()   directional_stop()   (stop pauses, squares up and unsubscribes every portfolio, then stops; it refuses while sending is OFF)
 # Positions are kept in the script only: if you stop it or Deephaven restarts while a position is open, it no longer knows about it (square it up from the console).
 
 
-def run_meanrevert():
+def run_directional():
     import contextlib
-    import glob
     import io
-    import os
     import queue
     import threading
     import time
@@ -54,28 +59,37 @@ def run_meanrevert():
 
     # =============================== USER INPUT ===============================
     USER = 3
-    STRATEGY = "meanrevert"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
+    STRATEGY = "directional"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
     BASKETS = {                              # named sector baskets: a symbol is ranked only against the OTHERS of ITS basket (each saved as its own basket.txt entry)
-        "us":   ["MSFT", "GOOG", "META", "AMZN", "NFLX", "SHOP", "CRWD", "PANW", "PLTR", "AAPL", "TSLA","WMT", "COST", "PEP", "AMGN", "LIN", "GILD", "SPCX","NVDA", "AVGO", "AMD", "MU", "ASML", "INTC", "AMAT", "MRVL", "KLAC", "ADI", "QCOM", "ARM", "SNDK", "TXN", "CSCO"],
+        "tech":   ["MSFT", "GOOG", "META", "AMZN", "NFLX", "SHOP", "CRWD", "PANW", "PLTR", "AAPL", "TSLA"],
+        "chips":  ["NVDA", "AVGO", "AMD", "MU", "ASML", "INTC", "AMAT", "MRVL", "KLAC", "ADI", "QCOM", "ARM", "SNDK", "TXN", "CSCO"],
+        "other":  ["WMT", "COST", "PEP", "AMGN", "LIN", "GILD", "SPCX"],
     }
 
     TRADE_AS = {}                            # optional: {"AAPL": "<another contract name or token>"} trade another contract than the basket entry
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
-    REL_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # relative(): pct_open's percentile among the basket must land inside its (low, high) band (Q2 to Q3);
-                                              # pct_vwap's percentile among the basket must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD)
+    BASKAVG_LONG = 0.1                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
+    BASKAVG_SHORT = -0.1                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
+    REL_BUY = {"pct_open": 80.0, "pct_vwap": 51.0, "iv": 80.0}         # relative(): BUY needs every ref at least its own threshold here
+    REL_SELL = {"pct_open": 20.0, "pct_vwap": 49.0, "iv": 20.0}           # relative(): SELL needs every ref below its own threshold here
+    ABS_BUY = {"pct_open": 80.0, "pct_vwap": 51.0, "iv": 80.0}            # absolute(): BUY needs every ref at least its own threshold here
+    ABS_SELL = {"pct_open": 20.0, "pct_vwap": 49.0, "iv": 20.0}           # absolute(): SELL needs every ref below its own threshold here
+    DIRECTION_MATCH = True                   # True: a BUY needs the REL_BUY/ABS_BUY side everywhere, a SELL the REL_SELL/ABS_SELL side.
+                                             # False: either side passes
+    USE_IV = False                           # False: % from open / VWAP only. True would also need an IV series (the US has none), so every entry would say "cannot tell"
+    DAY_EXTREME = True                       # True: filter 0, the latest SIGNAL_BAR close (5min) must be the highest (BUY) or the lowest (SELL) of today's SIGNAL_BAR closes so far (at least 2 bars today). False: off
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
-    ABS_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # absolute(): pct_open's percentile against its own days must land inside its (low, high) band (Q2 to Q3);
-                                              # pct_vwap's percentile against its own days must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD)
-    RSI_BAR = "5min"                         # the bar the RSI is computed on (made from the 1-minute candles)
-    RSI_N, RSI_HIGH, RSI_LOW = 9, 70, 30
-    RSI_LIVE = False                          # True: the bar still forming counts too (acts every minute); False: finished bars only
-    ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an RSI_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
+    RVOL_MIN_MULT = 1.25                      # filter 4: today's cumulative volume so far must be at least this many times the AVERAGE of the same point in the session over the
+                                             # previous ABS_DAYS days (relative volume). None = off; has no effect while ABS_DAYS is 0 (no history to average)
+    TURNOVER_MIN = 100_000_000                # filter 5: today's cumulative traded VALUE (price x volume, dollars) so far must be at least this. A flat floor, not a ranking against
+                                             # earlier days or other stocks: it only screens out stocks too thin to trade in size. None = off
+    SIGNAL_BAR = "5min"                         # the bar filter 0 (TODAY) checks today's highest/lowest close on (made from the 1-minute candles)
+    ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an SIGNAL_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
                                              # 1-minute close. False: look for an entry on every 1-minute candle
-    HIST_DAYS = 1                            # how many earlier saved days seed the RSI (0 = none)
-    TARGET_PCT, STOP_PCT = 3.0, 0.5
-    TRAIL_TRIGGER_PCT = 1.25                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
-    PROFIT_LOCK_PCT = 1.0                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
-    TRAIL_STEP_PCT = 0.2                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
+    TARGET_PCT, STOP_PCT = 6.0, 1.0
+    TRAIL_TRIGGER_PCT = 1.0                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
+    PROFIT_LOCK_PCT = 0.5                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
+    TRAIL_STEP_PCT = 1.0                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
                                              # move - TRAIL_STEP_PCT (never lowered), so once the move is up X% the lock is up (X - TRAIL_STEP_PCT)% -- it never gives back more than TRAIL_STEP_PCT
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)
@@ -83,7 +97,7 @@ def run_meanrevert():
     ENTRY_VALUE = 5000                       # None: every entry is QTY lots. A number (dollars): the quantity at entry is int(ENTRY_VALUE / the last 1-minute close), QTY is then not used;
                                              # if one share costs more than ENTRY_VALUE the quantity would be 0 and that entry is skipped (it says so)
     ENGINE = {"strategyname": "LimitOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1","MAX_TRIES":5}      # "CrossOrder" is the engine's name for the CrossOrder plugin
-    WINDOW = (dtime(10, 0), dtime(15, 0))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
+    WINDOW = (dtime(10, 0), dtime(13, 45))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
     EXIT_AT = dtime(15, 45)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
     MAX_PORTFOLIOS = 28                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
                                              # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.
@@ -99,24 +113,26 @@ def run_meanrevert():
     CHASE_TRIES = 3                          # once a LimitOrder is resting, up to this many times it is re-priced ("apply", not a new subscribe) to the current best price, each time
                                              # the spread is still SPREAD_MAX-ok AND the price has moved since the last one sent. After CHASE_TRIES it is cancelled (paused) and,
                                              # for an entry, unsubscribed -- nothing more is tried for that signal.
-    CHASE_EVERY_S = 3                        # how often (seconds) a resting order's chase re-checks the best price
+    CHASE_EVERY_S = 2                        # how often (seconds) a resting order's chase re-checks the best price
     FAIL_COOLDOWN_S = 30
     RETRY_RANKING_S = 20                     # a ranking read that fails (a rare clash with the update cycle: "Previous values requested or inconsistent") is tried again on the next candle batches
                                              # for this many seconds instead of giving up on that stock for the whole bar. 0 = no retry
     # ==========================================================================
-    REFS = ("pct_open", "pct_vwap")
-    if not (all(0 <= ZONE[ref][0] < ZONE[ref][1] <= 100 for ZONE in (REL_ZONE, ABS_ZONE) for ref in REFS)
-            and TARGET_PCT > 0 and STOP_PCT > 0 and QTY >= 1 and (ENTRY_VALUE is None or ENTRY_VALUE > 0) and HIST_DAYS >= 0 and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
+    REFS = ("pct_open", "pct_vwap", "iv")
+    if not (BASKAVG_SHORT < BASKAVG_LONG and all(0 <= SELL[ref] < BUY[ref] <= 100 for SELL, BUY in ((REL_SELL, REL_BUY), (ABS_SELL, ABS_BUY)) for ref in REFS)
+            and (TARGET_PCT is None or TARGET_PCT > 0) and (STOP_PCT is None or STOP_PCT > 0) and QTY >= 1 and (ENTRY_VALUE is None or ENTRY_VALUE > 0) and BASKETS and all(len(v) >= 3 for v in BASKETS.values())
             and ((TRAIL_TRIGGER_PCT is None) == (PROFIT_LOCK_PCT is None)) and (TRAIL_TRIGGER_PCT is None or TRAIL_TRIGGER_PCT > 0)
             and (TRAIL_STEP_PCT is None or (TRAIL_TRIGGER_PCT is not None and TRAIL_STEP_PCT > 0))
-            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)
+            and isinstance(ABS_DAYS, int) and 0 <= ABS_DAYS <= 400 and (RVOL_MIN_MULT is None or RVOL_MIN_MULT > 0)
+            and (TURNOVER_MIN is None or TURNOVER_MIN > 0)
+            and WINDOW[0] < EXIT_AT and isinstance(MAX_PORTFOLIOS, int) and MAX_PORTFOLIOS >= 0 and (UNSUB_AFTER_S is None or UNSUB_AFTER_S >= 0)
             and SPREAD_MAX > 0 and SPREAD_WAIT_S >= 0 and isinstance(CHASE_TRIES, int) and CHASE_TRIES >= 0 and CHASE_EVERY_S > 0):
-        raise ValueError("every (low, high) band in REL_ZONE/ABS_ZONE must be inside 0 to 100 with low below high, TARGET_PCT and STOP_PCT above 0, "
-                         "TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
-                         "QTY at least 1, HIST_DAYS 0 or more, ABS_DAYS 0 to 400, EXIT_AT after the window opens, every basket needs at least 3 symbols, "
+        raise ValueError("BASKAVG_SHORT below BASKAVG_LONG; every SELL threshold must be below its BUY threshold, both inside 0 to 100, for pct_open, pct_vwap and iv in REL_BUY/REL_SELL/ABS_BUY/ABS_SELL, "
+                         "TARGET_PCT and STOP_PCT (if set) above 0, TRAIL_TRIGGER_PCT and PROFIT_LOCK_PCT must both be None or both set (and TRAIL_TRIGGER_PCT above 0), "
+                         "QTY at least 1, ABS_DAYS 0 to 400, RVOL_MIN_MULT None or above 0, TURNOVER_MIN None or above 0, EXIT_AT after the window opens, every basket needs at least 3 symbols, "
                          "SPREAD_MAX above 0, SPREAD_WAIT_S 0 or more, CHASE_TRIES a whole number 0 or more, CHASE_EVERY_S above 0, "
                          "and TRAIL_STEP_PCT (if set) needs TRAIL_TRIGGER_PCT set too and must be above 0")
-    BAR_S = parse_timeframe(RSI_BAR)                               # 300; refuses a size that does not line up with the clock
+    BAR_S = parse_timeframe(SIGNAL_BAR)                               # 300; refuses a size that does not line up with the clock
     basket_of = {}                                                 # symbol -> the name of its basket
     for name, members in BASKETS.items():
         for symbol in members:
@@ -146,13 +162,12 @@ def run_meanrevert():
             print(f"{name}: no such contract, left out of the trading (it still counts in the basket)")
             continue
         symbol_of[int(info["token"])] = name
-    token_of = {name: token for token, name in symbol_of.items()}
     pf_track(STRATEGY, list(symbol_of), slots=100)                 # the portfolios it had before (a restart or a paste again); every trade takes the next free slot
     with contextlib.redirect_stdout(io.StringIO()):                # (algo_portfolios prints a table; only the numbers are needed)
         had = algo_portfolios(STRATEGY)
     next_slot = {t: (int(had[had["instrument"] == t]["slot"].max()) + 1 if had is not None and (had["instrument"] == t).any() else 0) for t in symbol_of}
 
-    bars = {t: {} for t in symbol_of}                              # token -> {5-minute bar number: the last 1-minute close inside it}: what the RSI is computed from
+    bars = {t: {} for t in symbol_of}                              # token -> {5-minute bar number: the last 1-minute close inside it}: what the TODAY filter checks
     last_px = {}                                                   # token -> the latest 1-minute close (candle)
     last_tick = {}                                                 # token -> the latest ltp from fo_market_data (tick, not candle): what spread_ok() compares bid/ask against
     best = {}                                                      # token -> (bid, ask), the latest best quotes from fo_market_data's b0p/a0p
@@ -162,7 +177,7 @@ def run_meanrevert():
     pending_exit = {}                                              # token -> {why, qty, deadline}: an exit was triggered, waiting for SPREAD_MAX (falls back to firing anyway past the deadline);
                                                                    # qty is the real filled amount of the entry pf at the moment it was armed, not the original target
     chase = {}                                                     # pf -> {token, side, qty, price, tries, kind}: a resting LimitOrder being re-priced ("entry" or "exit")
-    traded_in_zone = {}                                            # token -> the zone it was traded in: no second trade until the RSI has left it
+    last_cross = {}                                                # token -> the bar it was last entered on: not twice on one bar
     entered = set()                                                # tokens already entered by this script: with ONE_ENTRY_PER_STOCK they are not entered again
     last_fail = {}
     counts = {}                                                    # where the signals went (shown by status()): looked at, refused at which filter, ranking errors, entered
@@ -183,7 +198,6 @@ def run_meanrevert():
         else:
             print(f"{symbol_of[token]}: the ranking is still not available ({said}); no trade this time")
 
-    zone_side = {"OVERSOLD": 1, "OVERBOUGHT": 2}                   # 1 = buy, 2 = sell
 
     def epoch_s(minute):
         """A candle's Minute (a numpy / pandas / Java time) as UTC epoch seconds. 5-minute bars line up with the clock in New York (its offsets are whole hours)."""
@@ -195,68 +209,17 @@ def run_meanrevert():
         for old in sorted(b)[:-600]:
             del b[old]
 
-    def closes(token):
-        """The bar closes, oldest first. The newest bar is still forming, so it is left out when RSI_LIVE is False."""
-        keys = sorted(bars[token])
-        return [bars[token][k] for k in (keys if RSI_LIVE else keys[:-1])]
-
-    # ---- the history: earlier days' 1-minute closes -> 5-minute closes, before today's -------------------------------------------------------
-    def load_history():
-        """Seed `bars` from the last HIST_DAYS saved days (candles_<yyyy-mm-dd>.parquet) before today. Returns the days used."""
-        if HIST_DAYS <= 0 or not symbol_of:
-            return []
-        try:
-            import pyarrow.parquet as pq
-        except ImportError:
-            print("history: pyarrow is not installed, the RSI starts from today's candles")
-            return []
-        paths = current().paths
-        folders = [d for d in (paths.saved, paths.market_data) if d and os.path.isdir(d)]
-        today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-        files = {}
-        for d in folders:
-            for f in sorted(glob.glob(os.path.join(d, "candles_*.parquet"))):
-                day = os.path.basename(f)[len("candles_"):-len(".parquet")]
-                if len(day) == 10 and day[4] == "-" and day < today:           # ISO days; today's own candles come from the live table
-                    files.setdefault(day, f)
-        used = sorted(files)[-HIST_DAYS:]
-        if not used:
-            print(f"history: no candles_<day>.parquet before {today} in {', '.join(folders) or 'any folder'}: the RSI starts from today's candles")
-            return []
-        names = sorted(set(symbol_of.values()))
-        loaded = []
-        for day in used:
-            try:
-                df = pq.read_table(files[day], columns=["Minute", "Symbol", "Close"], filters=[("Symbol", "in", names)]).to_pandas()
-            except Exception as e:
-                print(f"history: {day} could not be read ({e}); left out")
-                continue
-            if df.empty:
-                continue
-            loaded.append(day)
-            minute = df["Minute"]
-            if getattr(minute.dt, "tz", None) is not None:
-                minute = minute.dt.tz_convert("UTC").dt.tz_localize(None)
-            df["ts"] = minute.to_numpy().astype("datetime64[s]").astype("int64")
-            df["bar"] = df["ts"] // BAR_S
-            last = df.sort_values(["Symbol", "ts"]).groupby(["Symbol", "bar"], sort=True)["Close"].last()          # the last 1-minute close inside each 5-minute bar
-            for (name, bar), close in last.items():
-                if name in token_of and close > 0:
-                    bars[token_of[name]][int(bar)] = float(close)
-        if not loaded:
-            print("history: none of the earlier days could be used, the RSI starts from today's candles")
-            return []
-        print(f"history: {len(loaded)} earlier day(s) ({', '.join(loaded)}) seed the {RSI_BAR} RSI of {sum(1 for t in bars if bars[t])} of {len(symbol_of)} stocks")
-        return loaded
-
-    load_history()
     if ABS_DAYS > 0:                                               # read the earlier days of every stock NOW (one read per day file for all of them), not in the candle thread at the first signal
         try:
             for warm_ref in ("open", "vwap"):
                 absolute_warm("pct", LEVEL, sorted(set(symbol_of.values())), ABS_DAYS, ref=warm_ref)
+            if USE_IV:
+                absolute_warm("iv", LEVEL, sorted(set(symbol_of.values())), ABS_DAYS)
+            if RVOL_MIN_MULT is not None:
+                absolute_warm("volume", LEVEL, sorted(set(symbol_of.values())), ABS_DAYS)
         except Exception as e:
             print(f"absolute(): the earlier days could not be preloaded ({e}); they are read at the first signal instead")
-    for t in symbol_of:                                            # today's candles already built, over the history
+    for t in symbol_of:                                            # today's candles already built
         h = last_candles(t, 400, show=False)
         if h is not None:
             for m, c in zip(h["Minute"], h["Close"]):
@@ -264,50 +227,89 @@ def run_meanrevert():
             if len(h):
                 last_px[t] = float(h["Close"].iloc[-1])
 
-    # ---- the indicator: Wilder's RSI ------------------------------------------------------------------------------------------------
-    def rsi(values, n=RSI_N):
-        """RSI of the last closes, or None until there are n + 1 of them."""
-        if len(values) <= n:
-            return None
-        d = np.diff(np.asarray(values, dtype=float))
-        up, down = np.where(d > 0, d, 0.0), np.where(d < 0, -d, 0.0)
-        avg_up, avg_down = up[:n].mean(), down[:n].mean()
-        for u, v in zip(up[n:], down[n:]):
-            avg_up, avg_down = (avg_up * (n - 1) + u) / n, (avg_down * (n - 1) + v) / n
-        if avg_down == 0:
-            return 100.0 if avg_up > 0 else 50.0
-        return 100.0 - 100.0 / (1.0 + avg_up / avg_down)
+    def day_sides(token):
+        """Filter 0: the sides today's SIGNAL_BAR closes allow. {1} (BUY) when the latest bar close is the highest of today so far, {2} (SELL) when it is the lowest, empty when it is neither or when
+        there are fewer than 2 bars today (the first one is both). Only today's bars count. Everything is allowed when DAY_EXTREME is False."""
+        if not DAY_EXTREME:
+            return {1, 2}
+        b = bars[token]
+        if not b:
+            return set()
+        keys = sorted(b, reverse=True)
+        day = datetime.fromtimestamp(keys[0] * BAR_S, ZoneInfo("America/New_York")).date()
+        today = []
+        for k in keys:                                             # newest first, until an earlier day begins
+            if datetime.fromtimestamp(k * BAR_S, ZoneInfo("America/New_York")).date() != day:
+                break
+            today.append(b[k])
+        if len(today) < 2:
+            return set()
+        return ({1} if today[0] >= max(today) else set()) | ({2} if today[0] <= min(today) else set())
 
-    def zone_of(value):
-        return None if value is None else "OVERBOUGHT" if value > RSI_HIGH else "OVERSOLD" if value < RSI_LOW else None
+    # ---- the filters: EXTREME against the basket (relative), EXTREME against the stock's own days (absolute) ------------------------
+    def sides_of(strong, weak):
+        """{1} (BUY) when `strong` holds, {2} (SELL) when `weak` holds. With DIRECTION_MATCH False, {1, 2} when either one holds. Empty when neither."""
+        if DIRECTION_MATCH:
+            return ({1} if strong else set()) | ({2} if weak else set())
+        return {1, 2} if (strong or weak) else set()
 
-    # ---- the filters: the middle of the basket (relative), the middle of its own days (absolute) --------------------------------------
-    def relative_sides(symbol, zone):
-        """True when the symbol's % from the open ranks inside its REL_ZONE band, among ITS basket (the other symbols of it), AND its % from the VWAP ranks on the side
-        matching the zone, among that same basket: OVERBOUGHT (SELL) needs it ABOVE the band's high (> 75), OVERSOLD (BUY) needs it BELOW the band's low (< 25)."""
-        with exec_ctx:                                             # relative() reads the candles table; a listener thread needs the terminal's query context for that
-            open_result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref="open")
-        if not (open_result[1] >= 0 and REL_ZONE["pct_open"][0] <= open_result.pctile <= REL_ZONE["pct_open"][1]):      # (the second item is -1 when it cannot be told)
-            return False
-        with exec_ctx:
-            vwap_result = relative("pct", LEVEL, symbol, BASKETS[basket_of[symbol]], ref="vwap")
-        if vwap_result[1] < 0:
-            return False
-        return vwap_result.pctile > REL_ZONE["pct_vwap"][1] if zone == "OVERBOUGHT" else vwap_result.pctile < REL_ZONE["pct_vwap"][0]
+    def ranked_sides(call, buy, sell):
+        """Collects pct_open, pct_vwap (and iv, when USE_IV) via `call(series, ref)`, a no-basket-no-level relative()/absolute() wrapper. BUY needs every ref at least `buy[ref]`;
+        SELL needs every ref below `sell[ref]`. Empty when one of them cannot be told, or is unknown."""
+        pctiles = {}
+        for ref in ("pct_open", "pct_vwap"):
+            with exec_ctx:                                         # the call reads the candles table; a listener thread needs the terminal's query context for that
+                result = call("pct", ref[len("pct_"):])
+            if result[1] < 0:                                      # (the second item is -1 when it cannot be told)
+                return set()
+            pctiles[ref] = result.pctile
+        if USE_IV:
+            with exec_ctx:
+                result = call("iv", None)
+            if result[1] < 0:
+                return set()
+            pctiles["iv"] = result.pctile
+        if any(p != p for p in pctiles.values()):
+            return set()
+        return sides_of(all(p >= buy[ref] for ref, p in pctiles.items()), all(p < sell[ref] for ref, p in pctiles.items()))
 
-    def absolute_sides(symbol, zone):
-        """True when the symbol's % from the open, now, ranks INSIDE its ABS_ZONE band (Q2-Q3) against the same minute on its previous ABS_DAYS trading days,
-        AND its % from the VWAP ranks on the side matching the zone: OVERBOUGHT (SELL) needs it ABOVE the band's high (> 75), OVERSOLD (BUY) needs it BELOW
-        the band's low (< 25). absolute() answers idx = -1 (cannot tell) when fewer than half of those days are in the saved files; that is no trade."""
-        with exec_ctx:                                             # absolute() reads today's candles table once, and the saved day files
-            open_result = absolute("pct", LEVEL, symbol, ABS_DAYS, ref="open")
-        if open_result[1] < 0 or not (ABS_ZONE["pct_open"][0] <= open_result.pctile <= ABS_ZONE["pct_open"][1]):
+    def basket_avg_sides(symbol):
+        """Filter 1: the basket's own AVERAGE % change from the open (across every member). BUY needs it at least BASKAVG_LONG; SELL needs it at or below BASKAVG_SHORT.
+        A basket-wide momentum gate, not a per-stock ranking."""
+        members = BASKETS[basket_of[symbol]]
+        with exec_ctx:                                             # the call reads the candles table; a listener thread needs the terminal's query context for that
+            result = relative("pct", LEVEL, symbol, members, ref="open")
+        if result[1] < 0:                                          # (the second item is -1 when it cannot be told)
+            return set()
+        avg = float(np.mean(result[0]))                            # result[0]: every basket member's own % change from the open, right now
+        return sides_of(avg >= BASKAVG_LONG, avg <= BASKAVG_SHORT)
+
+    def relative_sides(symbol):
+        """Filter 2, relative(): the ranking among the OTHER symbols of ITS basket, for pct_open, pct_vwap and iv (if USE_IV), each against its own REL_BUY / REL_SELL threshold."""
+        members = BASKETS[basket_of[symbol]]
+        return ranked_sides(lambda series, ref: relative(series, LEVEL, symbol, members, **({"ref": ref} if ref else {})), REL_BUY, REL_SELL)
+
+    def absolute_sides(symbol):
+        """Filter 3, absolute(): the ranking among the same minute of its previous ABS_DAYS trading days, for pct_open, pct_vwap and iv (if USE_IV), each against its own
+        ABS_BUY / ABS_SELL threshold."""
+        return ranked_sides(lambda series, ref: absolute(series, LEVEL, symbol, ABS_DAYS, **({"ref": ref} if ref else {})), ABS_BUY, ABS_SELL)
+
+    def rvol_ok(symbol):
+        """Filter 4: today's cumulative volume so far must be at least RVOL_MIN_MULT times the AVERAGE of the same point in the session over the previous ABS_DAYS days.
+        Not a ranking: True/False only (no side), so it never decides BUY vs SELL, only whether there is enough volume behind the move to trade it at all."""
+        with exec_ctx:                                             # the call reads the candles table; a listener thread needs the terminal's query context for that
+            result = absolute("volume", LEVEL, symbol, ABS_DAYS)
+        if result[1] < 0:                                          # (the second item is -1 when it cannot be told)
             return False
-        with exec_ctx:
-            vwap_result = absolute("pct", LEVEL, symbol, ABS_DAYS, ref="vwap")
-        if vwap_result[1] < 0:
-            return False
-        return vwap_result.pctile > ABS_ZONE["pct_vwap"][1] if zone == "OVERBOUGHT" else vwap_result.pctile < ABS_ZONE["pct_vwap"][0]
+        avg = float(np.mean(result[0][np.isfinite(result[0])]))
+        return avg > 0 and result.now >= RVOL_MIN_MULT * avg
+
+    def turnover_ok(symbol):
+        """Filter 5: today's cumulative traded VALUE (price x volume, dollars) so far must be at least TURNOVER_MIN. A flat floor, not a ranking: `now` is set regardless of
+        whether absolute() could rank it against earlier days, so this works even on a stock with no (or too few) saved days."""
+        with exec_ctx:                                             # the call reads the candles table; a listener thread needs the terminal's query context for that
+            result = absolute("turnover", LEVEL, symbol, max(ABS_DAYS, 1))
+        return result.now >= TURNOVER_MIN
 
     # ---- the orders ------------------------------------------------------------------------------------------------------------------
     def in_window():
@@ -351,6 +353,16 @@ def run_meanrevert():
         return abs(ref - ltp) / float(div) <= SPREAD_MAX
 
     live = set()                                                   # portfolios this script holds in the engine: open positions, and closed ones waiting for their unsubscribe
+    pf_side = {}                                                   # pf -> the side that OPENS exposure on it (1 BUY, 2 SELL). on_trade nets every fill against it, so a
+                                                                   # closing fill (a console "Square off all", or the LimitOrder plugin's own SquareUpEvent order) SUBTRACTS.
+
+    def pf_state(pf):
+        """The portfolio as the NATS bridge last confirmed it: PfState with .squared / .paused / .by ("operator" for the console), or None if nothing is known yet.
+        Used to defer to the operator -- a console Pause all / Square off all must not be undone or doubled up by this script."""
+        try:
+            return current().get("nats").states.get(USER, pf)
+        except Exception:
+            return None
     at_limit_said = []                                             # the "at the limit" message is printed once until a slot frees
 
     def release(pf, token):
@@ -403,6 +415,12 @@ def run_meanrevert():
         c = chase.get(pf)
         if c is None:
             return
+        st = pf_state(pf)
+        if st is not None and (st.paused or st.squared):            # the LimitOrder plugin's PauseUnPauseEvent(False) is a NO-OP ("staying paused until params are
+            chase.pop(pf, None)                                     # sent again"), so an "apply" from the chase would UN-PAUSE it and re-arm the entry the
+            print(f"{STRATEGY}: PF {pf} {'squared up' if st.squared else 'paused'} by {st.by}; chase stopped")
+            maybe_untrack(c["token"])                               # operator just cancelled. Stop chasing instead.
+            return
         if filled.get(pf, 0) >= c["qty"]:
             chase.pop(pf, None)                                     # fully filled: nothing left to re-price or cancel
             maybe_untrack(c["token"])
@@ -443,39 +461,39 @@ def run_meanrevert():
         tick_track(token, False)
 
     def fire_entry(token):
-        """The signal's spread finally tightened (or was already tight): send the real entry now. True when sent."""
+        """The signal's spread finally tightened (or was already tight): send the real entry now."""
         side = pending_entry.pop(token, {}).get("side")
         if side is None:
-            return False
+            return
         if len(live) >= MAX_PORTFOLIOS:
             if not at_limit_said:
                 at_limit_said.append(True)
                 print(f"{STRATEGY}: {len(live)} portfolios held (MAX_PORTFOLIOS {MAX_PORTFOLIOS}); no new entry until an exit has been unsubscribed")
             maybe_untrack(token)
-            return False
+            return
         if next_slot[token] >= 100:
             print(f"{symbol_of[token]}: all 100 portfolios of the day are used, no trade")
             maybe_untrack(token)
-            return False
+            return
         qty = QTY if ENTRY_VALUE is None else int(ENTRY_VALUE / last_px[token])         # by value: whole units for ENTRY_VALUE at the last close
         if qty < 1:
             print(f"{symbol_of[token]}: ENTRY_VALUE {ENTRY_VALUE:g} buys less than one unit at {last_px[token]:g}, no trade")
             maybe_untrack(token)
-            return False
+            return
         a = pf_assign(STRATEGY, token, token, name=symbol_of[token], slot=next_slot[token])       # the BOOK gives a NEW portfolio number (None while OFF or unticked)
         if not a:
             maybe_untrack(token)
-            return False
+            return
         next_slot[token] += 1
         pf = a["pf"]
         price = best_price(token, side)
         live.add(pf)
+        pf_side[pf] = side
         entered.add(token)
         position[token] = {"side": side, "entry": last_px[token], "qty": qty, "pf": pf, "state": "entering", "trailing": False, "lock": None}
         chase[pf] = {"token": token, "side": side, "qty": qty, "price": price, "tries": 0, "kind": "entry"}
         print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {qty} lot(s) at {price} (LimitOrder) on PF {pf}")
         send_place(pf, token, side, qty, price).add_done_callback(lambda f: settled(token, f))
-        return True
 
     def arm_entry(token, side):
         if token in pending_entry or token in position:
@@ -500,6 +518,7 @@ def run_meanrevert():
         next_slot[token] += 1
         pf = a["pf"]
         live.add(pf)
+        pf_side[pf] = closing_side
         pos["state"] = "exiting"
         chase[pf] = {"token": token, "side": closing_side, "qty": qty, "price": price, "tries": 0, "kind": "exit"}
         print(f"{symbol_of[token]}: closing {qty} on NEW PF {pf} at {price}{' (forced, spread never tightened)' if forced else ''}")
@@ -510,6 +529,13 @@ def run_meanrevert():
             return
         pos = position.get(token)
         if pos is None or pos["state"] != "open":
+            return
+        st = pf_state(pos["pf"])
+        if st is not None and (st.squared or st.paused):            # the operator closed or froze this portfolio from the console: an exit of ours would open a
+            print(f"{symbol_of[token]}: {why}, but PF {pos['pf']} was "   # brand-new opposite position against a book that is already flat
+                  f"{'squared up' if st.squared else 'paused'} by {st.by}; dropping it, no exit sent")
+            position.pop(token, None)
+            maybe_untrack(token)
             return
         qty_open = filled.get(pos["pf"], 0)
         if qty_open <= 0:
@@ -524,13 +550,15 @@ def run_meanrevert():
         """orders_trade: token, buy_sell, fill_quantity, fill_price, response_order_number, PF, activity_time. Its PF is wire-level (USER * PF_PER_USER + the book's pf,
         e.g. 31002 for user 3's book pf 1002) -- converted back to the book's own pf before matching, since `live`/`chase`/`filled` are all keyed by the book's pf everywhere
         else. Only this strategy's own live pfs are kept."""
-        ch = update.added(["PF", "fill_quantity"])
+        ch = update.added(["PF", "buy_sell", "fill_quantity"])
         if ch is None:
             return
-        for wire_pf, qty in zip(ch["PF"], ch["fill_quantity"]):
+        for wire_pf, bs, qty in zip(ch["PF"], ch["buy_sell"], ch["fill_quantity"]):
             pf = int(wire_pf) - USER * PF_PER_USER
             if pf in live:
-                filled[pf] = filled.get(pf, 0) + int(qty)
+                q = int(qty)
+                opens = pf_side.get(pf)                             # fills are NETTED, not summed: a fill on the opening side adds, one on the other side
+                filled[pf] = filled.get(pf, 0) + (q if opens is None or int(bs) == opens else -q)   # (a squareup) takes away, so `filled` is the real live size
 
     def start_trade_listener():
         """watch() checks app.tables/app.ns, which orders_trade may never be registered in even once it exists as a bare console
@@ -636,7 +664,6 @@ def run_meanrevert():
             tick_state.clear()
             print(f"{STRATEGY}: live ticks not available ({e}); spread gate / chase cannot run, only the candle-close checks will")
 
-
     def settled(token, future):
         """The entry's own pf answered (called from the NATS thread)."""
         try:
@@ -681,8 +708,9 @@ def run_meanrevert():
                 pos["state"] = "open"
             print(f"{symbol_of[token]}: exit FAILED ({why}); still open, will retry on the next signal")
 
-    def step(token, entry_ok=True):
-        """One new 1-minute close of a traded stock: manage its position, or look for an entry (only when `entry_ok`: with ACT_ON_BAR_END that is the candle that ends a bar)."""
+    def step(token, entry_ok=True, ends_bar=True):
+        """One new 1-minute close of a traded stock: manage its position, or look for an entry (only when `entry_ok`: with ACT_ON_BAR_END that is the candle that ends a bar).
+        `ends_bar` says if this candle completes a bar, so the newest bar counts for the TODAY filter."""
         px = last_px[token]
         pos = position.get(token)
         if pos is not None:
@@ -694,31 +722,46 @@ def run_meanrevert():
             return
         if token in pending_entry or not entry_ok or (ONE_ENTRY_PER_STOCK and token in entered):
             return
-        zone = zone_of(rsi(closes(token)))
-        if zone is None:
-            traded_in_zone.pop(token, None)                        # out of the zone: a new entry may trade it again
-            return
-        if traded_in_zone.get(token) == zone or not in_window() or not algo_sending(STRATEGY) or not pf_allowed(STRATEGY, token):
+        keys = sorted(bars[token])
+        bar = keys[-1] if ends_bar else (keys[-2] if len(keys) > 1 else None)       # the bar this look is at
+        if last_cross.get(token) == bar or not in_window() or not algo_sending(STRATEGY) or not pf_allowed(STRATEGY, token):
             return
         if time.time() - last_fail.get(token, 0.0) < FAIL_COOLDOWN_S:
             return
         first = retry.pop(token, None)
         if first is None:
-            count("signals")
+            count("looked at")
         try:
-            own = ABS_DAYS == 0 or absolute_sides(symbol_of[token], zone)         # its own days first (cached), then the basket
-            middle = own and relative_sides(symbol_of[token], zone)
+            today = day_sides(token)                               # 0. today's bar closes: the latest is the day's highest (buy) or lowest (sell)
+            if not today:
+                count("not the high/low of the day")
+                return
+            sides = today & basket_avg_sides(symbol_of[token])     # 1. basket avg: the basket's own average % move from the open
+            if not sides:
+                count("refused by basket avg")
+                return
+            sides &= relative_sides(symbol_of[token])              # 2. relative: extreme in its basket (and on which side)
+            if not sides:
+                count("refused by basket")
+                return
+            if ABS_DAYS > 0:
+                sides &= absolute_sides(symbol_of[token])          # 3. absolute: extreme against its own days, on the same side
+            if len(sides) != 1:
+                count("refused by own days" if ABS_DAYS > 0 and not sides else "no single side agreed")
+                return
+            if RVOL_MIN_MULT is not None and ABS_DAYS > 0 and not rvol_ok(symbol_of[token]):      # 4. rvol: enough volume behind the move (not directional)
+                count("refused by rvol")
+                return
+            if TURNOVER_MIN is not None and not turnover_ok(symbol_of[token]):                    # 5. turnover: a flat dollar floor on today's traded value (not directional)
+                count("refused by turnover")
+                return
+            side = next(iter(sides))
         except Exception as e:
             ranking_failed(token, first, e)
             return
-        if not own:
-            count("refused by own days")
-        elif not middle:
-            count("refused by basket")
-        else:
-            traded_in_zone[token] = zone
-            arm_entry(token, zone_side[zone])
-            count("armed")
+        last_cross[token] = bar
+        arm_entry(token, side)
+        count("armed")
 
     stopping = []                                                  # set once the time exit has started the stop
 
@@ -742,12 +785,13 @@ def run_meanrevert():
             if tok in bars and close > 0:
                 add_close(tok, minute, close)
                 last_px[tok] = float(close)
-                step(tok, not ACT_ON_BAR_END or (epoch_s(minute) + 60) % BAR_S == 0)       # this candle ends a bar of RSI_BAR: an entry may be looked for
+                ends_bar = (epoch_s(minute) + 60) % BAR_S == 0                              # this candle completes a bar of SIGNAL_BAR
+                step(tok, not ACT_ON_BAR_END or ends_bar, ends_bar)
         for tok, t0 in due:
             if time.time() - t0 >= RETRY_RANKING_S:
                 retry.pop(tok, None)                               # waited long enough: given up on this bar
             elif tok in retry:
-                step(tok, True)
+                step(tok, True, True)
         if trade_listener[0] is None:                               # orders_trade was not there yet when this script started: keep trying every candle batch, not just once
             trade_listener[0] = start_trade_listener()
             if trade_listener[0] is not None:
@@ -767,8 +811,6 @@ def run_meanrevert():
         for token, p in position.items():
             print(f"   {symbol_of[token]:8} {'LONG' if p['side'] == 1 else 'SHORT'} {p['qty']} lot(s) entry {p['entry']:g} now {last_px.get(token, float('nan')):g} "
                   f"PF {p['pf']} filled {filled.get(p['pf'], 0)} {p['state']}")
-        ready = sum(1 for t in symbol_of if rsi(closes(t)) is not None)
-        print(f"   RSI is ready for {ready} of {len(symbol_of)} stocks ({RSI_BAR} bars, {RSI_N + 1} needed)")
         print(f"   waiting on spread: {len(pending_entry)} entr{'y' if len(pending_entry) == 1 else 'ies'}, {len(pending_exit)} exit(s); chasing: {len(chase)} order(s)")
         print("   signals: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none yet"))
 
@@ -786,8 +828,8 @@ def run_meanrevert():
         algo_stop(STRATEGY, pause=False)                           # square up + unsubscribe every portfolio (no pause step), wait for it, then stop (refuses while sending is OFF)
 
     shared = globals()
-    shared["meanrevert_status"], shared["meanrevert_exit_all"], shared["meanrevert_stop"] = status, exit_all, stop
+    shared["directional_status"], shared["directional_exit_all"], shared["directional_stop"] = status, exit_all, stop
     nats_send(True, client=STRATEGY)                               # NOW it may send. Stop just this automation: nats_send(False, client=STRATEGY)
 
 
-run_meanrevert()
+run_directional()

@@ -354,6 +354,16 @@ def run_directional():
         return abs(ref - ltp) / float(div) <= SPREAD_MAX
 
     live = set()                                                   # portfolios this script holds in the engine: open positions, and closed ones waiting for their unsubscribe (always empty in DRY_RUN)
+    pf_side = {}                                                   # pf -> the side that OPENS exposure on it (1 BUY, 2 SELL). on_trade nets every fill against it, so a
+                                                                   # closing fill (a console "Square off all", or the LimitOrder plugin's own SquareUpEvent order) SUBTRACTS.
+
+    def pf_state(pf):
+        """The portfolio as the NATS bridge last confirmed it: PfState with .squared / .paused / .by ("operator" for the console), or None if nothing is known yet.
+        Used to defer to the operator -- a console Pause all / Square off all must not be undone or doubled up by this script."""
+        try:
+            return current().get("nats").states.get(USER, pf)
+        except Exception:
+            return None
     at_limit_said = []                                             # the "at the limit" message is printed once until a slot frees
 
     def release(pf, token):
@@ -409,6 +419,12 @@ def run_directional():
         modified there), kept only so an exit is cancelled the same way after CHASE_TRIES."""
         c = chase.get(pf)
         if c is None:
+            return
+        st = pf_state(pf)
+        if st is not None and (st.paused or st.squared):            # the LimitOrder plugin's PauseUnPauseEvent(False) is a NO-OP ("staying paused until params are
+            chase.pop(pf, None)                                     # sent again"), so an "apply" from the chase would UN-PAUSE it and re-arm the entry the
+            print(f"{STRATEGY}: PF {pf} {'squared up' if st.squared else 'paused'} by {st.by}; chase stopped")
+            maybe_untrack(c["token"])                               # operator just cancelled. Stop chasing instead.
             return
         if filled.get(pf, 0) >= c["qty"]:
             chase.pop(pf, None)                                     # fully filled: nothing left to re-price or cancel
@@ -477,6 +493,7 @@ def run_directional():
         pf = a["pf"]
         price = best_price(token, side)
         live.add(pf)
+        pf_side[pf] = side
         entered.add(token)
         position[token] = {"side": side, "entry": last_px[token], "qty": qty, "pf": pf, "state": "entering", "trailing": False, "lock": None}
         chase[pf] = {"token": token, "side": side, "qty": qty, "price": price, "tries": 0, "kind": "entry"}
@@ -506,6 +523,7 @@ def run_directional():
         next_slot[token] += 1
         pf = a["pf"]
         live.add(pf)
+        pf_side[pf] = closing_side
         pos["state"] = "exiting"
         chase[pf] = {"token": token, "side": closing_side, "qty": qty, "price": price, "tries": 0, "kind": "exit"}
         print(f"{symbol_of[token]}: closing {qty} on NEW PF {pf} at {price}{' (forced, spread never tightened)' if forced else ''}")
@@ -516,6 +534,13 @@ def run_directional():
             return
         pos = position.get(token)
         if pos is None or pos["state"] != "open":
+            return
+        st = pf_state(pos["pf"])
+        if st is not None and (st.squared or st.paused):            # the operator closed or froze this portfolio from the console: an exit of ours would open a
+            print(f"{symbol_of[token]}: {why}, but PF {pos['pf']} was "   # brand-new opposite position against a book that is already flat
+                  f"{'squared up' if st.squared else 'paused'} by {st.by}; dropping it, no exit sent")
+            position.pop(token, None)
+            maybe_untrack(token)
             return
         qty_open = filled.get(pos["pf"], 0)
         if qty_open <= 0:
@@ -530,13 +555,15 @@ def run_directional():
         """orders_trade: token, buy_sell, fill_quantity, fill_price, response_order_number, PF, activity_time. Its PF is wire-level (USER * PF_PER_USER + the book's pf,
         e.g. 31002 for user 3's book pf 1002) -- converted back to the book's own pf before matching, since `live`/`chase`/`filled` are all keyed by the book's pf everywhere
         else. Only this strategy's own live pfs are kept. DRY_RUN: always empty, harmless."""
-        ch = update.added(["PF", "fill_quantity"])
+        ch = update.added(["PF", "buy_sell", "fill_quantity"])
         if ch is None:
             return
-        for wire_pf, qty in zip(ch["PF"], ch["fill_quantity"]):
+        for wire_pf, bs, qty in zip(ch["PF"], ch["buy_sell"], ch["fill_quantity"]):
             pf = int(wire_pf) - USER * PF_PER_USER
             if pf in live:
-                filled[pf] = filled.get(pf, 0) + int(qty)
+                q = int(qty)
+                opens = pf_side.get(pf)                             # fills are NETTED, not summed: a fill on the opening side adds, one on the other side
+                filled[pf] = filled.get(pf, 0) + (q if opens is None or int(bs) == opens else -q)   # (a squareup) takes away, so `filled` is the real live size
 
     def start_trade_listener():
         """watch() checks app.tables/app.ns, which orders_trade may never be registered in even once it exists as a bare console

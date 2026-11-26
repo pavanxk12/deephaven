@@ -240,7 +240,10 @@ def on_candle(update, is_replay):
 # ---- the old `blocked` set: a slot squared up or unsubscribed from the console stays off ------------------------------------------
 def slot_of(name, pf):
     cfg, future = UNDERLYINGS[name], state[name]["future"]
-    ids = current().get(STRATEGY).book.state.current_pf_map()           # book id -> portfolio; slot 0 is the future itself, slot k is future * 100 + k
+    run = current().get(STRATEGY)
+    if run is None:                                                    # the automation was stopped, but this listener is still registered:
+        return None                                                    # it is orphaned, and on_state takes it off (it used to raise here)
+    ids = run.book.state.current_pf_map()           # book id -> portfolio; slot 0 is the future itself, slot k is future * 100 + k
     for k in range(cfg["N_STRIKES"]):
         if ids.get(future if k == 0 else future * 100 + k) == pf:
             return k
@@ -248,6 +251,12 @@ def slot_of(name, pf):
 
 
 def on_state(user, pf, st):
+    if current().get(STRATEGY) is None:                                 # the automation was stopped: this callback is orphaned. Take it off rather than
+        try:                                                           # failing on every squareup / pause / unsubscribe of every OTHER strategy.
+            current().get("nats").states.on_change(on_state)()         # on_change() registers a function once, so the undo it returns removes THIS one
+        except Exception:
+            pass
+        return
     if user == USER and st.cmd in ("squareup", "unsubscribe") and st.by != STRATEGY:
         for name in state:
             k = slot_of(name, pf)

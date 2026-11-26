@@ -167,7 +167,7 @@ def run_nifty_500_directional():
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
     BASKAVG_LONG = 0.2                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
     BASKAVG_SHORT = -0.2                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
-    RTURNOVER_MIN = 8.0                      # filter 2: the stock's cumulative traded VALUE (price x volume) from today's open must be at least this many times its own
+    RTURNOVER_MIN = 12.0                      # filter 2: the stock's cumulative traded VALUE (price x volume) from today's open must be at least this many times its own
                                              # average at the SAME minute over RTURNOVER_DAYS earlier days. None = the gate is off. Not backtested separately from RVOL (see above).
     RTURNOVER_DAYS = 22                      # how many earlier days the RTURNOVER average is taken over (the same 22 as absolute()); absolute()'s own rule applies: fewer
                                              # than half of them in the saved files and it cannot be told (no trade)
@@ -184,10 +184,10 @@ def run_nifty_500_directional():
     SIGNAL_BAR = "1min"                      # the bar filter 0 (TODAY) checks today's highest/lowest close on (made from the 1-minute candles)
     ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends a SIGNAL_BAR bar. Take-profit and stop-loss are still checked on every
                                              # 1-minute close. False: look for an entry on every 1-minute candle
-    TARGET_PCT, STOP_PCT = 10.0, 1.0       # NOTE: the +10% target did not fire ONCE in the backtest, and the median trade was the -0.75% stop
-    TRAIL_TRIGGER_PCT = 1.0                  # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
+    TARGET_PCT, STOP_PCT = 10.0, 2.0       # NOTE: the +10% target did not fire ONCE in the backtest, and the median trade was the -0.75% stop
+    TRAIL_TRIGGER_PCT = 2.0                  # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
     PROFIT_LOCK_PCT = 0.5                    # the new stop level once TRAIL_TRIGGER_PCT is reached; must be set together with TRAIL_TRIGGER_PCT
-    TRAIL_STEP_PCT = 0.5                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock follows the move, held at
+    TRAIL_STEP_PCT = 2.0                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock follows the move, held at
                                              # move - TRAIL_STEP_PCT (never lowered)
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once entered, a take-profit, stop-loss or any exit ends its trading. False: it may be entered again
     ENTRY_VALUE = 100000.0                    # rupees to put into EACH entry: the number of shares sent is ENTRY_VALUE / the price at entry, rounded to a whole share (minimum 1)

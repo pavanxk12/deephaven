@@ -71,8 +71,8 @@ def run_directional():
     }                                         # add/remove/comment out symbols or whole baskets here; empty = none
     EXCLUDE = []                             # optional: underlyings to leave out (applied across every basket)
     LEVEL = "intraday"                       # relative() level: today's open and VWAP
-    BASKAVG_LONG = 0.2                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
-    BASKAVG_SHORT = -0.2                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
+    BASKAVG_LONG = 0.5                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
+    BASKAVG_SHORT = -0.5                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
     REL_BUY = {"pct_open": 80.0, "v": 70.0}         # relative(): BUY needs pct_open at least this; the straddle V % from open (if USE_V) needs to be at least this too
     REL_SELL = {"pct_open": 20.0, "v": 80.0}        # relative(): SELL needs pct_open at or below this; the V % from open (if USE_V) needs to be at least this (its own threshold, not REL_BUY's)
     ABS_BUY = {"pct_open": 80.0, "v": 70.0}         # absolute(): BUY needs pct_open at least this; the V % from open (if USE_V) needs to be at least this too
@@ -84,13 +84,13 @@ def run_directional():
     STRADDLE_N = 0                           # straddle_start(STRADDLE_N) when the script starts it itself: 0 = the nearest expiry only (what the IV filters read)
     DAY_EXTREME = True                       # True: filter 0, the latest SIGNAL_BAR close (5min) must be the highest (BUY) or the lowest (SELL) of today's SIGNAL_BAR closes so far (at least 2 bars today). False: off
     ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
-    SIGNAL_BAR = "5min"                         # the bar filter 0 (TODAY) checks today's highest/lowest close on (made from the 1-minute candles)
+    SIGNAL_BAR = "10min"                         # the bar filter 0 (TODAY) checks today's highest/lowest close on (made from the 1-minute candles)
     ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an SIGNAL_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
                                              # 1-minute close. False: look for an entry on every 1-minute candle
-    TARGET_PCT, STOP_PCT = 4.0, 0.5
+    TARGET_PCT, STOP_PCT = 4.0, 1.0
     TRAIL_TRIGGER_PCT = 1.0                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
-    PROFIT_LOCK_PCT = 0.8                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
-    TRAIL_STEP_PCT = 0.2                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
+    PROFIT_LOCK_PCT = 0.5                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
+    TRAIL_STEP_PCT = 1.0                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
                                              # move - TRAIL_STEP_PCT (never lowered), so once the move is up X% the lock is up (X - TRAIL_STEP_PCT)% -- it never gives back more than TRAIL_STEP_PCT
     ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
                                              # (the pasted script forgets this on a paste or a restart)

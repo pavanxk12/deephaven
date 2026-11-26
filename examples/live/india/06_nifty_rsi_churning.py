@@ -1,16 +1,4 @@
-# NIFTY churning on N strikes, driven by a 5-MINUTE RSI of the nearest NIFTY future: the same automation as 06, PLUS two extra checks
-# that read the gateway's own feedback off strategy_events instead of just reacting to the RSI:
-#
-#   adaptive cap    strategy_events carries a LOGMSG per portfolio shaped like:   actpos=O[0] E[6] X[6],curpnl=0,book=B[..]|A[..]|L[0.00],exp=8.00
-#                   X is how much of the portfolio's CURRENT cap (maxqty) is actually filled. Normally the cap only grows on a flip (a new
-#                   leg/option), so a position that keeps the same leg stays capped at whatever it got on entry. bump_qty() watches for
-#                   X catching up to the cap and re-applies the SAME option (no new subscribe, no leg change) purely so the book raises the
-#                   cap by ADD_QTY again -- the same cap bump a flip would give it, without needing one.
-#   the M2M gate    SIZING's target/maxloss are remembered against the portfolio that got them, the moment they are sent. The same LOGMSG's
-#                   curpnl is the gateway's own running P&L for that portfolio. Once curpnl reaches either one, that portfolio is GATED: no
-#                   more sends for it at all (no bump, no fresh re-entry on the same leg) until it moves to a different option, which starts
-#                   the gate fresh for the new one.
-#
+# NIFTY churning on N strikes, driven by a 5-MINUTE RSI of the nearest NIFTY future: your old automation.py as a plain script. No class.
 #   RSI > RSI_HIGH -> BUY PUTs on N_STRIKES strikes     RSI < RSI_LOW -> BUY CALLs on N_STRIKES strikes     (always the BUY side)
 # Paste in the terminal after 00_services.py has started the services.
 #
@@ -27,7 +15,6 @@
 # Your old `blocked` set is kept: a slot that someone squares up or unsubscribes from the CONSOLE stays off until the RSI leaves its zone.
 # Old files: the PF map of the NIFTY script (token:slot format) is not read; the book numbers its portfolios from PF_START on its own and the registry remembers them.
 import math
-import re
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -36,13 +23,12 @@ import pandas as pd
 
 from algo import current
 from algo.core.timeframe import parse_timeframe
-from algo.ui.filters import PF_PER_USER
 
 # =============================== USER INPUT ===============================
 USER = 4                         # USER_ID
-STRATEGY = "nifty_churning_adaptive"  # its name: recorded with every portfolio, the name of its sending switch and of its console window
-PF_START = 1400                  # PF_START (kept clear of 06's 1300 range so both may run together)
-ADD_QTY = 20                      # ADD_QTY: also what bump_qty() adds to the cap each time X catches up to it
+STRATEGY = "nifty_churning"           # its name: recorded with every portfolio, the name of its sending switch and of its console window
+PF_START = 1300                  # PF_START
+ADD_QTY = 20                      # ADD_QTY
 UNDERLYING = "NIFTY"             # UNDERLYING
 EXPIRY_INDEX = 0                 # OPT_EXPIRY_IDX: 0 = the nearest expiry that has not passed
 N_STRIKES = 1                    # N_STRIKES
@@ -54,7 +40,7 @@ RSI_LIVE = True                  # True: the forming bar counts too (acts every 
 FAIL_COOLDOWN_S = 30
 WINDOW = (dtime(9, 20), dtime(15, 20))          # TRADE_START, TRADE_END (India time)
 # what this script puts on subscribe / unsubscribe over the service's defaults (your SUB_PAYLOAD; the user ids are added by the service)
-SUBSCRIBE = {"strategyname": "Churning", "maxloss": -2000, "stoploss": -2000, "max_unhedge": 10, "gtw": 26286}
+SUBSCRIBE = {"strategyname": "Churning", "maxloss": -2000, "stoploss": -2000, "max_unhedge": 10,"gtw": 26286}
 SIZING = dict(ival_pct=0.01, range_pct=0.2, trp_pct=0.01, jval_frac=0.75, sval_mult=5,
               jqty1=1, jqty2=1, target=6000, stoploss=-2000, maxloss=-2000, max_unhedge=10, PRNT=1)   # OPT_IVAL_PCT ... APPLY_PARAMS (read by order_params below)
 # ==========================================================================
@@ -71,9 +57,6 @@ ltp = {}                                                               # token -
 bars = {}                                                              # bar number -> the last 1-minute close inside it: what the RSI is computed from
 blocked = set()                                                        # slots stopped by hand: off until the RSI leaves its zone
 ZONE_LEG = {"OVERBOUGHT": "PUT", "OVERSOLD": "CALL"}
-ACTPOS_RE = re.compile(r"actpos=O\[(\d+)\] E\[(\d+)\] X\[(\d+)\],curpnl=(-?[\d.]+)")     # the gateway's own LOGMSG, on strategy_events
-sent_limits = {}                                                       # pf -> (maxprofit, maxloss): the target/maxloss SIZING last sent it, to gate curpnl against
-gated = set()                                                          # pf: curpnl already reached its own maxprofit or maxloss -- no more sends for it
 
 
 def epoch_s(minute):
@@ -180,79 +163,6 @@ def pick(leg):
     return out
 
 
-# ---- the old `blocked` set: a slot squared up or unsubscribed from the console stays off ------------------------------------------
-def slot_of(pf):
-    ids = current().get(STRATEGY).book.state.current_pf_map()           # book id -> portfolio; slot 0 is the future itself, slot k is future * 100 + k
-    for k in range(N_STRIKES):
-        if ids.get(future if k == 0 else future * 100 + k) == pf:
-            return k
-    return None
-
-
-def pf_of(k):
-    """The slot's current portfolio, or None if it has none yet."""
-    ids = current().get(STRATEGY).book.state.current_pf_map()
-    return ids.get(future if k == 0 else future * 100 + k)
-
-
-# ---- adaptive cap and the M2M gate, both from the gateway's own LOGMSG on strategy_events -------------------------------------------
-def activate_with_limits(a, leg, params):
-    """pf_activate, then remember what target/maxloss this send carried for the gate to check curpnl against, and lift any old gate
-    (a fresh send to this pf means a fresh position, or a bumped cap on the one it already has)."""
-    ok = pf_activate(a, leg, params)
-    if ok:
-        sent_limits[a["pf"]] = (SIZING.get("target"), SIZING.get("maxloss"))
-        gated.discard(a["pf"])
-    return ok
-
-
-def bump_qty(pf):
-    """Re-apply the SAME option this pf already trades (no subscribe, no leg change): pf_activate's own swap always adds ADD_QTY
-    to the cap again, so this is exactly how a flip would raise it -- just without needing one."""
-    k = slot_of(pf)
-    if k is None or pf in gated:
-        return
-    leg = pf_leg(STRATEGY, future, k)
-    option = current().get(STRATEGY).book.state.subscribed.get(pf)
-    if leg is None or option is None:
-        return
-    params = order_params(ltp.get(option), contract(option, show=False)["tick"], **SIZING)
-    if params is None:
-        return
-    a = pf_assign(STRATEGY, future, option, name=UNDERLYING, slot=k)      # same option -> same pf, no retire, no resubscribe
-    if a:
-        activate_with_limits(a, leg, params)
-
-
-def on_event(update, is_replay):
-    """strategy_events: parse the LOGMSG of every row belonging to one of our own portfolios. X caught up to the cap -> bump_qty();
-    curpnl past its own target/maxloss -> gated (no more sends for that pf until it moves to a different option)."""
-    ch = update.added(["PF", "Payload"])
-    if ch is None:
-        return
-    mine = {pf_of(k) for k in range(N_STRIKES)} - {None}
-    if not mine:
-        return
-    caps = current().get(STRATEGY).book.state.caps
-    for pf_raw, payload in zip(ch["PF"], ch["Payload"]):
-        pf = int(pf_raw) - USER * PF_PER_USER               # strategy_events' own PF is user*10000+pf, the same as the order/trade tables
-        if pf not in mine:
-            continue
-        m = ACTPOS_RE.search(str(payload))
-        if not m:
-            continue
-        x, curpnl = int(m.group(3)), float(m.group(4))
-        limit = sent_limits.get(pf)
-        if limit and ((limit[0] is not None and curpnl >= limit[0]) or (limit[1] is not None and curpnl <= limit[1])):
-            if pf not in gated:
-                gated.add(pf)
-                print(f"{STRATEGY}: PF {pf} gated: curpnl {curpnl} reached its own target/maxloss {limit}; no more sends for it")
-            continue
-        cap = caps.get(pf, 0)
-        if cap and x >= cap:
-            bump_qty(pf)
-
-
 # ---- 3. WHEN ---------------------------------------------------------------------------------------------------------------------
 def in_window():
     return WINDOW[0] <= datetime.now(ZoneInfo("Asia/Kolkata")).time() <= WINDOW[1]
@@ -278,8 +188,6 @@ def on_zone(zone, force=False):
             continue
         if pf_leg(STRATEGY, future, k) == leg or (not force and pf_cooling(STRATEGY, future, FAIL_COOLDOWN_S, k)):
             continue                                                # this slot already runs this leg, or failed a moment ago
-        if pf_of(k) in gated:
-            continue                                                # curpnl already reached its target/maxloss: no more sends until it moves option
         # ---- 2. HOW MUCH ----
         params = order_params(ltp.get(option), contract(option, show=False)["tick"], **SIZING)
         if params is None:
@@ -287,7 +195,7 @@ def on_zone(zone, force=False):
             continue
         a = pf_assign(STRATEGY, future, option, name=UNDERLYING, slot=k)      # the BOOK picks the portfolio number
         if a:
-            activate_with_limits(a, leg, params)                                 # the NATS service does the rest, and the gate remembers target/maxloss
+            pf_activate(a, leg, params)                                       # the NATS service does the rest
 
 
 def check():
@@ -317,7 +225,25 @@ def on_candle(update, is_replay):
         check()
 
 
+# ---- the old `blocked` set: a slot squared up or unsubscribed from the console stays off ------------------------------------------
+def slot_of(pf):
+    run = current().get(STRATEGY)
+    if run is None:                                                    # the automation was stopped, but this listener is still registered:
+        return None                                                    # it is orphaned, and on_state takes it off (it used to raise here)
+    ids = run.book.state.current_pf_map()           # book id -> portfolio; slot 0 is the future itself, slot k is future * 100 + k
+    for k in range(N_STRIKES):
+        if ids.get(future if k == 0 else future * 100 + k) == pf:
+            return k
+    return None
+
+
 def on_state(user, pf, st):
+    if current().get(STRATEGY) is None:                                 # the automation was stopped: this callback is orphaned. Take it off rather than
+        try:                                                           # failing on every squareup / pause / unsubscribe of every OTHER strategy.
+            current().get("nats").states.on_change(on_state)()         # on_change() registers a function once, so the undo it returns removes THIS one
+        except Exception:
+            pass
+        return
     if user == USER and st.cmd in ("squareup", "unsubscribe") and st.by != STRATEGY:
         k = slot_of(pf)
         if k is not None:
@@ -345,8 +271,7 @@ def exit_all():
 
 
 candle_listener = watch("candles", on_candle, owner=STRATEGY)       # follows the table if candles are restarted
-events_listener = watch("strategy_events", on_event, owner=STRATEGY)  # the gateway's own feedback: adaptive cap and the M2M gate
 
 nats_send(True, client=STRATEGY)                                    # NOW it may send. Stop just this automation: nats_send(False, client=STRATEGY)
 check()                                                             # ACT_ON_START: if the RSI is already in a zone, start now
-# To remove it:  candle_listener.stop(); events_listener.stop(); undo_state(); algo_stop(STRATEGY)        Its portfolios:  algo_portfolios(STRATEGY)
+# To remove it:  candle_listener.stop(); undo_state(); algo_stop(STRATEGY)        Its portfolios:  algo_portfolios(STRATEGY)
