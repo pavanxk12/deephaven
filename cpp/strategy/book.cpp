@@ -69,7 +69,7 @@ void Portfolios::reset(const std::optional<std::vector<int64_t>>& tokens) {
         std::vector<int64_t> list = tokens ? *tokens : std::vector<int64_t>(tracked.begin(), tracked.end());
         for (int64_t t : list) {
             live[t] = std::nullopt;
-            opt_of.erase(t);
+            pf_token_of.erase(t);
             last_fail.erase(t);
             auto it = pf_map.find(t);
             if (it != pf_map.end()) caps[it->second] = 0;
@@ -118,8 +118,8 @@ std::optional<int64_t> Portfolios::ownerOf(int64_t token, const SymbolOf& symbol
     if (current.count(token)) return token;
     {
         std::lock_guard<std::recursive_mutex> g(lock_);
-        for (const auto& [pf, opt] : subscribed)
-            if (opt == token)
+        for (const auto& [pf, pf_token] : subscribed)
+            if (pf_token == token)
                 for (const auto& [u, p] : current)
                     if (p == pf) return u;
     }
@@ -133,8 +133,8 @@ std::optional<int64_t> Portfolios::pfForRow(int64_t token, const SymbolOf& symbo
     std::optional<int64_t> best;
     {
         std::lock_guard<std::recursive_mutex> g(lock_);
-        for (const auto& [pf, opt] : subscribed)
-            if (opt == token) best = best ? std::max(*best, pf) : pf;
+        for (const auto& [pf, pf_token] : subscribed)
+            if (pf_token == token) best = best ? std::max(*best, pf) : pf;
     }
     if (best) return best;                                     // exact subscription (newest if several)
     auto owner = ownerOf(token, symbol_of);
@@ -149,7 +149,7 @@ std::optional<int64_t> Portfolios::lastPf() const {
     std::lock_guard<std::recursive_mutex> g(lock_);
     std::optional<int64_t> hi;
     for (const auto& [t, p] : pf_map) hi = hi ? std::max(*hi, p) : p;
-    for (const auto& [pf, opt] : subscribed) hi = hi ? std::max(*hi, pf) : pf;
+    for (const auto& [pf, pf_token] : subscribed) hi = hi ? std::max(*hi, pf) : pf;
     return hi;
 }
 
@@ -160,7 +160,7 @@ std::vector<Claim> Portfolios::claimExisting() {
         std::lock_guard<std::recursive_mutex> g(lock_);
         std::set<int64_t> s;
         for (const auto& [t, p] : pf_map) s.insert(p);
-        for (const auto& [pf, opt] : subscribed) s.insert(pf);
+        for (const auto& [pf, pf_token] : subscribed) s.insert(pf);
         mine.assign(s.begin(), s.end());
     }
     std::vector<Claim> refused;
@@ -171,7 +171,7 @@ std::vector<Claim> Portfolios::claimExisting() {
     return refused;
 }
 
-std::pair<std::optional<int64_t>, std::optional<int64_t>> Portfolios::plan(int64_t token, int64_t option) const {
+std::pair<std::optional<int64_t>, std::optional<int64_t>> Portfolios::plan(int64_t token, int64_t pf_token) const {
     std::lock_guard<std::recursive_mutex> g(lock_);
     std::optional<int64_t> cur;
     if (tracked.count(token)) {
@@ -181,16 +181,16 @@ std::pair<std::optional<int64_t>, std::optional<int64_t>> Portfolios::plan(int64
     bool moves = false;
     if (cur) {
         auto sit = subscribed.find(*cur);
-        moves = sit != subscribed.end() && sit->second != option;   // subscribed to a different option -> it moves
+        moves = sit != subscribed.end() && sit->second != pf_token;   // subscribed to a different pf_token -> it moves
     }
     return {cur, moves ? cur : std::nullopt};
 }
 
-Portfolios::Assign Portfolios::assign(int64_t token, int64_t option, const std::string& name, const std::string& algo) {
+Portfolios::Assign Portfolios::assign(int64_t token, int64_t pf_token, const std::string& name, const std::string& algo) {
     std::optional<int64_t> cur, old_pf;
     {
         std::lock_guard<std::recursive_mutex> g(lock_);
-        std::tie(cur, old_pf) = plan(token, option);
+        std::tie(cur, old_pf) = plan(token, pf_token);
         if (!cur || old_pf) {
             const int64_t pf = create(token, name, algo);           // (create takes the lock recursively)
             return {pf, old_pf, true};
@@ -235,11 +235,16 @@ void Portfolios::revert(int64_t token, int64_t old_pf, int64_t new_pf) {
 }
 
 // ---- mutations --------------------------------------------------------------------------------------------------
-void Portfolios::subscribe(int64_t pf, int64_t option_token) {
+void Portfolios::subscribe(int64_t pf, int64_t pf_token) {
     {
         std::lock_guard<std::recursive_mutex> g(lock_);
-        subscribed[pf] = option_token;
+        subscribed[pf] = pf_token;
         store(Which::Sub, subscribed);
+    }
+    // the registry row of this portfolio names the contract it trades (algo_portfolios.token). Informational, so a
+    // failed write here never fails the subscribe that already went through: the next subscribe writes it again.
+    if (registry_ && user_) {
+        try { registry_->setToken(*user_, pf, pf_token); } catch (...) {}
     }
     changed();
 }
@@ -254,11 +259,11 @@ void Portfolios::setAllow(int64_t token, bool on) {
     changed();
 }
 
-void Portfolios::setLive(int64_t token, std::optional<std::string> leg, std::optional<int64_t> option) {
+void Portfolios::setLive(int64_t token, std::optional<std::string> leg, std::optional<int64_t> pf_token) {
     std::lock_guard<std::recursive_mutex> g(lock_);
     live[token] = std::move(leg);
-    if (!option) opt_of.erase(token);
-    else opt_of[token] = *option;                                  // no changed(): live legs are not drawn
+    if (!pf_token) pf_token_of.erase(token);
+    else pf_token_of[token] = *pf_token;                                  // no changed(): live legs are not drawn
 }
 
 void Portfolios::saveMap() {

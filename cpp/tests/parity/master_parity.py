@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "cpp", "tests", "parity", "reference"))   # the Python reference (see reference/README.md)
 from algo.core.config import NSE, US               # noqa: E402
 from algo.data.master import classify, normalise, read_contracts  # noqa: E402
 

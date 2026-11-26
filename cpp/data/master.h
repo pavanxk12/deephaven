@@ -32,6 +32,7 @@ struct Contract {
     double      tick = 0;
     double      lot = 0;
     double      divisor = 0;
+    bool        is_index = false;    // InstType INDEX (classified with the equities, like Python; the SDK reports INDEX)
     std::string display;             // symbol_of text: "NIFTY 27OCT26 25000 CE" / "NIFTY 27OCT26 FUT" / "AAPL"
 };
 
@@ -77,6 +78,11 @@ public:
     bool strikes(const std::string& symbol, int32_t expiry, char option_type,
                 std::vector<double>& strikes_out, std::vector<int64_t>& tokens_out) const;  // sorted by strike
 
+    // Every future of an underlying, (expiry yyyymmdd, token), sorted by expiry (past ones included: callers filter).
+    const std::vector<std::pair<int32_t, int64_t>>& futures(const std::string& symbol) const;
+    // The paired CE <-> PE at the same (symbol, expiry, strike), from the chain.
+    std::optional<int64_t> altOf(int64_t option_token) const;
+
     // Sorted token array of the chosen kind/symbols; `expiries_n` keeps, per underlying, only its n nearest
     // option expiries (nullopt = no restriction on either).
     std::vector<int64_t> tokensFor(const std::vector<std::string>* symbols, std::optional<Kind> kind,
@@ -87,6 +93,8 @@ private:
     std::unordered_map<std::string, int64_t>                         spot_of_;    // underlying -> eq token (first)
     std::unordered_map<int64_t, std::pair<std::string, int32_t>>     fut_info_;
     std::unordered_map<int64_t, double>                              tick_by_token_, divisor_by_token_;
+    std::unordered_map<std::string, std::vector<std::pair<int32_t, int64_t>>> futures_of_;   // symbol -> (expiry, token)
+    std::unordered_map<int64_t, int64_t>                             alt_of_;     // CE <-> PE
     struct OptKey { std::string symbol; int32_t expiry; char opt_type; bool operator==(const OptKey&) const noexcept; };
     struct OptKeyHash { size_t operator()(const OptKey&) const noexcept; };
     std::unordered_map<OptKey, std::pair<std::vector<double>, std::vector<int64_t>>, OptKeyHash> option_index_;

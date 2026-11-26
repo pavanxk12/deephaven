@@ -29,6 +29,7 @@ struct RegRec {
     std::string algo;              // the strategy/screen using it (may be empty; updated on take-over)
     std::string created;           // when first registered (ISO-8601 local)
     std::string note;
+    std::optional<int64_t> token;  // the contract it trades, from its confirmed subscribe (nullopt = not known yet)
 };
 
 // The answer to registerPf. status: registered (new), exists (already yours, unchanged), updated (already yours,
@@ -65,6 +66,10 @@ public:
     // Claim a specific number, or say what the one you hold is for. Throws on a bad user/pf/owner.
     Claim   registerPf(int64_t user, int64_t pf, const std::string& owner,
                        const std::string& note = "", const std::string& algo = "", const std::string& name = "");
+
+    // Record the contract a portfolio trades (called by its book on every confirmed subscribe). Only the token
+    // changes; persisted and told to listeners when it differs. False for a portfolio the registry does not hold.
+    bool    setToken(int64_t user, int64_t pf, int64_t token);
 
     // ---- looking ------------------------------------------------------------------------------------------------
     std::optional<std::string> ownerOf(int64_t user, int64_t pf) const;

@@ -30,7 +30,8 @@ if(UNIX AND NOT APPLE)
   target_link_libraries(algo_core PUBLIC rt pthread)
 endif()
 
-add_library(algo_data STATIC data/ltt_parser.cpp data/token_index.cpp data/candle_aggregator.cpp data/master.cpp)
+add_library(algo_data STATIC data/ltt_parser.cpp data/token_index.cpp data/candle_aggregator.cpp data/quote_table.cpp data/token_ids.cpp data/master.cpp
+                             data/master_service.cpp)
 target_link_libraries(algo_data PUBLIC algo_core)
 
 # comms layer: the NATS service; links only core
@@ -41,6 +42,10 @@ target_link_libraries(algo_comms PUBLIC algo_core)
 # service), as the Python package's imports do.
 add_library(algo_strategy STATIC strategy/registry.cpp strategy/book.cpp strategy/bridge.cpp strategy/guard.cpp)
 target_link_libraries(algo_strategy PUBLIC algo_core algo_comms)
+
+# host layer: the SDK's services answered for strategies (contracts first; book, quotes, analytics follow)
+add_library(algo_host STATIC host/contract_api.cpp)
+target_link_libraries(algo_host PUBLIC algo_data)
 
 add_executable(candles_replay tools/candles_replay.cpp)
 target_link_libraries(candles_replay PRIVATE algo_data)
@@ -53,8 +58,11 @@ target_link_libraries(master_build PRIVATE algo_data)
 
 enable_testing()
 add_executable(test_core tests/test_core.cpp)
-target_link_libraries(test_core PRIVATE algo_data algo_strategy algo_comms)
+target_link_libraries(test_core PRIVATE algo_data algo_host algo_strategy algo_comms)
 add_test(NAME test_core COMMAND test_core WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(test_feed tests/test_feed.cpp)
+target_link_libraries(test_feed PRIVATE algo_data)
+add_test(NAME test_feed COMMAND test_feed WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME candles_parity
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/parity/candles_parity.py --bin $<TARGET_FILE:candles_replay>
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)

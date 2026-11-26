@@ -1,9 +1,9 @@
 // Portfolio bookkeeping shared by every strategy and the console. A port of algo/strategy/book.py's Portfolios
-// class (the Deephaven Book plugin comes later with the API). One portfolio (PF) = one option contract for its whole
-// life; a stock's PF is created lazily on its first signal, numbered by the registry (per user) so no two strategies
+// class (the Deephaven Book plugin comes later with the API). One portfolio (PF) = one traded token (pf_token) for its
+// whole life; a tracked token's PF is created lazily on its first signal, numbered by the registry (per user) so no two strategies
 // get the same number, and numbers are never reused.
 //
-// Two maps must survive a restart -- pf_map (future token -> PF) and subscribed (PF -> option token it trades) --
+// Two maps must survive a restart -- pf_map (tracked token -> PF) and subscribed (PF -> the token it trades) --
 // held in StateDB (algo_pf_map / algo_pf_sub, keyed by a book name). Everything else (caps, paused, live legs, allow
 // switches, cooldowns) is in-memory session state. Control-plane only; a recursive mutex guards compound changes
 // (strategy threads, the bridge loop and the API all touch this), matching the Python RLock.
@@ -37,15 +37,15 @@ public:
                std::string owner = "", StateDB* db = nullptr);
 
     // ---- persisted + session state (public, like the Python object; the bridge/API read these) ------------------
-    std::map<int64_t, int64_t>                        pf_map;       // future token -> PF (persisted)
-    std::map<int64_t, int64_t>                        subscribed;   // PF -> option token (persisted)
+    std::map<int64_t, int64_t>                        pf_map;       // tracked token -> PF (persisted)
+    std::map<int64_t, int64_t>                        subscribed;   // PF -> the token it trades, pf_token (persisted)
     std::map<int64_t, int64_t>                        caps;         // PF -> cumulative maxqty
     std::set<int64_t>                                 paused;       // PFs the bridge confirmed paused
-    std::map<int64_t, bool>                           allow;        // future token -> automation may send
-    std::map<int64_t, std::optional<std::string>>     live;         // future token -> leg last started (CALL/PUT)
-    std::map<int64_t, int64_t>                        opt_of;       // future token -> option token it trades
-    std::map<int64_t, double>                         last_fail;    // future token -> time of last failed swap
-    std::set<int64_t>                                 tracked;      // future tokens some strategy follows this session
+    std::map<int64_t, bool>                           allow;        // tracked token -> automation may send
+    std::map<int64_t, std::optional<std::string>>     live;         // tracked token -> leg last started (CALL/PUT)
+    std::map<int64_t, int64_t>                        pf_token_of;  // tracked token -> the token its PF trades
+    std::map<int64_t, double>                         last_fail;    // tracked token -> time of last failed swap
+    std::set<int64_t>                                 tracked;      // tokens some strategy follows this session
     std::set<int64_t>                                 session_pfs;  // PFs touched this session (current + retired)
 
     // ---- change notification ------------------------------------------------------------------------------------
@@ -54,11 +54,11 @@ public:
     void  changed();
 
     // ---- registration -------------------------------------------------------------------------------------------
-    void track(const std::vector<int64_t>& tokens);                 // a strategy follows these futures
+    void track(const std::vector<int64_t>& tokens);                 // a strategy follows these tokens
     void reset(const std::optional<std::vector<int64_t>>& tokens = std::nullopt);  // forget live legs/caps/cooldowns
 
     // ---- lookups ------------------------------------------------------------------------------------------------
-    std::optional<int64_t>      pfOf(int64_t token) const;          // the PF of a tracked future, or nullopt
+    std::optional<int64_t>      pfOf(int64_t token) const;          // the PF of a tracked token, or nullopt
     std::map<int64_t, int64_t>  currentPfMap() const;               // tracked token -> PF (only those with a PF)
     std::vector<int64_t>        currentPfs() const;
     std::vector<int64_t>        allPfs() const;                     // every PF this session touched, retired included
@@ -69,9 +69,9 @@ public:
     // ---- numbering ----------------------------------------------------------------------------------------------
     std::optional<int64_t>      lastPf() const;                     // highest PF in memory
     std::vector<Claim>          claimExisting();                    // register held numbers; returns the refused ones
-    std::pair<std::optional<int64_t>, std::optional<int64_t>> plan(int64_t token, int64_t option) const;  // (current, retiring)
+    std::pair<std::optional<int64_t>, std::optional<int64_t>> plan(int64_t token, int64_t pf_token) const;  // (current, retiring)
     struct Assign { int64_t pf; std::optional<int64_t> old_pf; bool created; };
-    Assign  assign(int64_t token, int64_t option, const std::string& name = "", const std::string& algo = "");
+    Assign  assign(int64_t token, int64_t pf_token, const std::string& name = "", const std::string& algo = "");
     void    label(int64_t pf, const std::string& algo = "", const std::string& name = "");
     int64_t create(int64_t token, const std::string& name = "", const std::string& algo = "");
     void    revert(int64_t token, int64_t old_pf, int64_t new_pf);
@@ -80,10 +80,10 @@ public:
     std::optional<int64_t> userId() const { return user_; }   // the user this book's numbers belong to (if any)
     bool isPaused(int64_t pf) const { std::lock_guard<std::recursive_mutex> g(lock_); return paused.count(pf) != 0; }
 
-    void subscribe(int64_t pf, int64_t option_token);
+    void subscribe(int64_t pf, int64_t pf_token);
     void setPaused(int64_t pf, bool paused_on);
     void setAllow(int64_t token, bool on);
-    void setLive(int64_t token, std::optional<std::string> leg, std::optional<int64_t> option = std::nullopt);
+    void setLive(int64_t token, std::optional<std::string> leg, std::optional<int64_t> pf_token = std::nullopt);
     void saveMap();
 
 private:

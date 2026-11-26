@@ -194,7 +194,7 @@ MasterData MasterData::build(std::vector<RawRow> rows) {
             c.display = c.symbol + " " + expiryText(c.expiry) + " FUT";
             m.futs.push_back(c);
         } else if (is_eq) {
-            c.kind = Kind::kEq; c.tick = r.tick; c.divisor = r.divisor;
+            c.kind = Kind::kEq; c.tick = r.tick; c.divisor = r.divisor; c.is_index = r.inst_type == "INDEX";
             c.display = c.symbol;
             m.eqs.push_back(c);
         } else {
@@ -217,8 +217,12 @@ MasterData MasterData::build(std::vector<RawRow> rows) {
         ChainRow row;
         row.ce_token = ce_tok; row.pe_token = it->second;
         row.symbol = std::get<0>(key); row.expiry = std::get<1>(key); row.strike = std::get<2>(key);
+        m.alt_of_[row.ce_token] = row.pe_token;
+        m.alt_of_[row.pe_token] = row.ce_token;
         m.chain.push_back(std::move(row));
     }
+    for (auto& c : m.futs) m.futures_of_[c.symbol].emplace_back(c.expiry, c.token);
+    for (auto& [sym, v] : m.futures_of_) std::sort(v.begin(), v.end());
 
     // token -> dense id over every kept contract, and the dense (cold) rows the host reads at lookup time
     std::vector<int64_t> toks;
@@ -319,6 +323,18 @@ std::optional<int64_t> MasterData::nearestFuture(const std::string& symbol, int3
     for (auto& c : futs)
         if (c.symbol == symbol && c.expiry >= today_yyyymmdd && c.expiry < best_exp) { best_exp = c.expiry; best = c.token; }
     return best;
+}
+
+const std::vector<std::pair<int32_t, int64_t>>& MasterData::futures(const std::string& symbol) const {
+    static const std::vector<std::pair<int32_t, int64_t>> kNone;
+    auto it = futures_of_.find(symbol);
+    return it == futures_of_.end() ? kNone : it->second;
+}
+
+std::optional<int64_t> MasterData::altOf(int64_t option_token) const {
+    auto it = alt_of_.find(option_token);
+    if (it == alt_of_.end()) return std::nullopt;
+    return it->second;
 }
 
 std::vector<int32_t> MasterData::expiries(const std::string& symbol, char option_type) const {

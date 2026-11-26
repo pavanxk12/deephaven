@@ -32,6 +32,9 @@ public:
     virtual void rollback() = 0;
     virtual void exec(const std::string& sql, const std::vector<DbValue>& params) = 0;
     virtual std::vector<Row> query(const std::string& sql, const std::vector<DbValue>& params) = 0;
+    // Does `table` have `column`? Asks the database's own catalogue, so it never raises a SQL error (a probe query
+    // that fails would look like a dropped connection to the caller's retry logic).
+    virtual bool hasColumn(const std::string& table, const std::string& column) = 0;
 };
 
 // A libpq connection from a conninfo string (see pgConninfo). Throws if it cannot connect.

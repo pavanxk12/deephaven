@@ -53,6 +53,11 @@ public:
 
     void exec(const std::string& sql, const std::vector<DbValue>& params) override { clear(run(sql, params, false)); }
 
+    bool hasColumn(const std::string& table, const std::string& column) override {
+        return !query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() "
+                      "AND table_name = ? AND column_name = ?", {table, column}).empty();
+    }
+
     std::vector<Row> query(const std::string& sql, const std::vector<DbValue>& params) override {
         PGresult* r = run(sql, params, true);
         const int rows = PQntuples(r), cols = PQnfields(r);
@@ -125,6 +130,10 @@ public:
         const int rc = sqlite3_step(st);
         if (rc != SQLITE_DONE && rc != SQLITE_ROW) { const std::string e = sqlite3_errmsg(db_); sqlite3_finalize(st); throw std::runtime_error(e); }
         sqlite3_finalize(st);
+    }
+
+    bool hasColumn(const std::string& table, const std::string& column) override {
+        return !query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", {table, column}).empty();
     }
 
     std::vector<Row> query(const std::string& sql, const std::vector<DbValue>& params) override {

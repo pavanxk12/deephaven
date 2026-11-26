@@ -5,16 +5,21 @@ INC      := -I.
 B        := build
 
 CORE := core/ini.cpp core/tz.cpp core/market.cpp core/mirror_ring.cpp core/process_config.cpp core/event_bus.cpp core/plugin.cpp core/app.cpp core/sql.cpp core/statedb.cpp core/pfstate.cpp core/limits.cpp
-DATA := data/ltt_parser.cpp data/token_index.cpp data/candle_aggregator.cpp data/master.cpp
+DATA := data/ltt_parser.cpp data/token_index.cpp data/candle_aggregator.cpp data/quote_table.cpp data/token_ids.cpp data/master.cpp data/master_service.cpp
+# the feed path (adapter -> token index -> quote table -> candles) needs no Postgres / SQLite: builds anywhere
+FEED := core/tz.cpp data/ltt_parser.cpp data/token_index.cpp data/token_ids.cpp data/candle_aggregator.cpp data/quote_table.cpp
 COMMS := comms/nats_service.cpp
+HOST := host/contract_api.cpp
 STRATEGY := strategy/registry.cpp strategy/book.cpp strategy/bridge.cpp strategy/guard.cpp
 # libpq's header lives under a "postgresql" subdir on Debian/Ubuntu (/usr/include/postgresql/libpq-fe.h), not on the
 # plain include path; sqlite3.h usually is on the plain path already, so only the extra -I is needed here.
-MASTER_INC  := -I/usr/include/postgresql -I/usr/local/include/postgresql
-MASTER_LIBS := -lsqlite3 -lpq
+# macOS: Homebrew's keg-only libpq (brew install libpq) is found automatically when present.
+PG_PREFIX   := $(shell brew --prefix libpq 2>/dev/null)
+MASTER_INC  := -I/usr/include/postgresql -I/usr/local/include/postgresql $(if $(PG_PREFIX),-I$(PG_PREFIX)/include)
+MASTER_LIBS := $(if $(PG_PREFIX),-L$(PG_PREFIX)/lib) -lsqlite3 -lpq
 
-.PHONY: all test parity master-parity tsan sdk sdk-test sdk-check clean
-all: $(B)/test_core $(B)/candles_replay $(B)/master_dump $(B)/master_build sdk
+.PHONY: all test test-feed parity master-parity tsan tsan-feed sdk sdk-test sdk-check clean
+all: $(B)/test_core $(B)/test_feed $(B)/candles_replay $(B)/master_dump $(B)/master_build sdk
 
 # strategy plugins: C++17, hidden visibility, no algod code linked (the SDK's build rules)
 SO_FLAGS := -std=c++17 -O3 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -Wall -Wextra -Wno-unused-parameter -shared -Isdk
@@ -39,11 +44,17 @@ sdk-check: $(B)/libNiftySmaCross.so $(B)/libBasketRsiSingle.so
 $(B):
 	mkdir -p $(B)
 
-$(B)/test_core: $(CORE) $(DATA) $(STRATEGY) $(COMMS) tests/test_core.cpp $(wildcard core/*.h data/*.h strategy/*.h comms/*.h) | $(B)
-	$(CXX) $(CXXFLAGS) $(INC) $(MASTER_INC) $(CORE) $(DATA) $(STRATEGY) $(COMMS) tests/test_core.cpp $(MASTER_LIBS) -o $@
+$(B)/test_core: $(CORE) $(DATA) $(HOST) $(STRATEGY) $(COMMS) tests/test_core.cpp $(wildcard core/*.h data/*.h host/*.h strategy/*.h comms/*.h sdk/*.h) | $(B)
+	$(CXX) $(CXXFLAGS) $(INC) $(MASTER_INC) $(CORE) $(DATA) $(HOST) $(STRATEGY) $(COMMS) tests/test_core.cpp $(MASTER_LIBS) -o $@
 
-$(B)/candles_replay: $(CORE) $(DATA) tools/candles_replay.cpp $(wildcard core/*.h data/*.h) | $(B)
-	$(CXX) $(CXXFLAGS) $(INC) $(MASTER_INC) $(CORE) $(DATA) tools/candles_replay.cpp $(MASTER_LIBS) -o $@
+$(B)/candles_replay: $(FEED) tools/candles_replay.cpp $(wildcard core/*.h data/*.h) | $(B)
+	$(CXX) $(CXXFLAGS) $(INC) $(FEED) tools/candles_replay.cpp -o $@
+
+$(B)/test_feed: $(FEED) tests/test_feed.cpp $(wildcard core/*.h data/*.h) | $(B)
+	$(CXX) $(CXXFLAGS) $(INC) $(FEED) tests/test_feed.cpp -o $@
+
+$(B)/test_feed_tsan: $(FEED) tests/test_feed.cpp | $(B)
+	$(CXX) -std=c++20 -O1 -g -pthread -fsanitize=thread $(INC) $(FEED) tests/test_feed.cpp -o $@
 
 $(B)/master_dump: $(CORE) $(DATA) tools/master_dump.cpp $(wildcard core/*.h data/*.h) | $(B)
 	$(CXX) $(CXXFLAGS) $(INC) $(MASTER_INC) $(CORE) $(DATA) tools/master_dump.cpp $(MASTER_LIBS) -o $@
@@ -51,11 +62,18 @@ $(B)/master_dump: $(CORE) $(DATA) tools/master_dump.cpp $(wildcard core/*.h data
 $(B)/master_build: $(CORE) $(DATA) tools/master_build.cpp $(wildcard core/*.h data/*.h) | $(B)
 	$(CXX) $(CXXFLAGS) $(INC) $(MASTER_INC) $(CORE) $(DATA) tools/master_build.cpp $(MASTER_LIBS) -o $@
 
-$(B)/test_core_tsan: $(CORE) $(DATA) $(STRATEGY) $(COMMS) tests/test_core.cpp | $(B)
-	$(CXX) -std=c++20 -O1 -g -pthread -fsanitize=thread $(INC) $(MASTER_INC) $(CORE) $(DATA) $(STRATEGY) $(COMMS) tests/test_core.cpp $(MASTER_LIBS) -o $@
+$(B)/test_core_tsan: $(CORE) $(DATA) $(HOST) $(STRATEGY) $(COMMS) tests/test_core.cpp | $(B)
+	$(CXX) -std=c++20 -O1 -g -pthread -fsanitize=thread $(INC) $(MASTER_INC) $(CORE) $(DATA) $(HOST) $(STRATEGY) $(COMMS) tests/test_core.cpp $(MASTER_LIBS) -o $@
 
-test: $(B)/test_core
+test: $(B)/test_core $(B)/test_feed
 	./$(B)/test_core
+	./$(B)/test_feed
+
+test-feed: $(B)/test_feed
+	./$(B)/test_feed
+
+tsan-feed: $(B)/test_feed_tsan
+	./$(B)/test_feed_tsan
 
 parity: $(B)/candles_replay
 	cd .. && python3 cpp/tests/parity/candles_parity.py --bin cpp/$(B)/candles_replay
