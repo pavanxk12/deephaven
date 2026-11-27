@@ -56,84 +56,94 @@ def run_dipbounce():
     from algo import current
     from algo.comms.nats_service import NO_SERVICE
 
+    _INI_NAME = "params.ini"
+    
+    def _params(section):
+        """Every USER INPUT value of this script, from params.ini, section [section]. Values are Python
+        literals (ast.literal_eval): numbers, strings, True/False/None, lists, tuples, dicts. A value that is
+        not a literal is kept as text, which is how a time like 15:45 survives for P.time(). '#' is NOT an
+        inline comment here, so a value keeps any '#' it contains; put comments on their own line.
+        init.py exec()s this script, so __file__ may not exist: the file is looked for in $ALGO_PARAMS, then
+        the container's strategies folder, then beside this script, then the working directory."""
+        import ast, configparser, os
+    
+        def _lit(text):
+            """A Python literal, also allowing dict(a=1, b=2) -- the shape the scripts already used. No other
+            call is accepted, so a params.ini can never run anything."""
+            class _D(ast.NodeTransformer):
+                def visit_Call(self, n):
+                    self.generic_visit(n)
+                    if isinstance(n.func, ast.Name) and n.func.id == "dict" and not n.args:
+                        return ast.Dict([ast.Constant(kw.arg) for kw in n.keywords], [kw.value for kw in n.keywords])
+                    raise ValueError("only dict(...) may be called in a value")
+            tree = _D().visit(ast.parse(text.strip(), mode="eval"))
+            return ast.literal_eval(ast.fix_missing_locations(tree))
+        _here = globals().get("__file__")
+        cands = [os.environ.get("ALGO_PARAMS", ""),
+                 "/app/scripts/strategies/" + _INI_NAME,
+                 os.path.join(os.path.dirname(os.path.abspath(_here)), _INI_NAME) if _here else "",
+                 _INI_NAME]
+        path = next((p for p in cands if p and os.path.isfile(p)), None)
+        if path is None:
+            raise FileNotFoundError(f"{_INI_NAME} not found: looked at $ALGO_PARAMS, /app/scripts/strategies/, "
+                                    f"beside this script, and {os.getcwd()}")
+        cfg = configparser.ConfigParser(inline_comment_prefixes=None, interpolation=None)
+        cfg.optionxform = str                                          # keys stay UPPER CASE
+        with open(path, encoding="utf-8") as fh:
+            cfg.read_file(fh)
+        if not cfg.has_section(section):
+            raise KeyError(f"{path}: no section [{section}]; it has {cfg.sections()}")
+    
+        class _P(dict):
+            path, section = "", ""
+            def __missing__(self, k):
+                raise KeyError(f"{self.path} [{self.section}]: {k} is not set")
+            def time(self, k):
+                """A HH:MM or HH:MM:SS value as a datetime.time."""
+                from datetime import time as _t
+                parts = [int(x) for x in str(self[k]).strip().split(":")]
+                if not 2 <= len(parts) <= 3:
+                    raise ValueError(f"{self.path} [{self.section}]: {k} = {self[k]!r} is not HH:MM")
+                return _t(*parts)
+    
+        out = _P()
+        out.path, out.section = path, section
+        for k, v in cfg.items(section):
+            v = v.strip()
+            try:
+                out[k] = _lit(v)
+            except (ValueError, SyntaxError, TypeError):
+                out[k] = v                                             # a time like 15:45, or plain text
+        return out
+    
     # =============================== USER INPUT ===============================
-    USER = 3
-    STRATEGY = "dipbounce"                  # its name: recorded with every portfolio, the name of its sending switch and of its console window
-    UNDERLYINGS = {                          # name: lots (QTY) and how many strikes OTM each leg is, counted from the ATM CE strike
-        "NIFTY":    dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "ADANIENT":    dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "ADANIPORTS":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "APOLLOHOSP":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "ASIANPAINT":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "AXISBANK":    dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "BAJAJ-AUTO":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "BAJFINANCE":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "BAJAJFINSV":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "BEL":         dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "BHARTIARTL":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "CIPLA":       dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "COALINDIA":   dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "DRREDDY":     dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "EICHERMOT":   dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "ETERNAL":     dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "GRASIM":      dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "HCLTECH":     dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "HDFCBANK":    dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "HDFCLIFE":    dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "HEROMOTOCO":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "HINDALCO":    dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "HINDUNILVR":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "ICICIBANK":   dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "ITC":         dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "INDUSINDBK":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "INFY":        dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "JSWSTEEL":    dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "JIOFIN":      dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "KOTAKBANK":   dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "LT":          dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "M&M":         dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "MARUTI":      dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "NTPC":        dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "NESTLEIND":   dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "ONGC":        dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "POWERGRID":   dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "RELIANCE":    dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "SBILIFE":     dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "SHRIRAMFIN":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "SBIN":        dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "SUNPHARMA":   dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "TCS":         dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "TATACONSUM":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "TATAMOTORS":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "TATASTEEL":   dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "TECHM":       dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "TITAN":       dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "TRENT":       dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "ULTRACEMCO":  dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "WIPRO":       dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # "VBL":         dict(QTY=1, OTM1_STEPS=1, OTM3_STEPS=3),
-        # add more underlyings here, each with its own QTY (lots) / OTM1_STEPS / OTM3_STEPS
-    }
-
-    LEVEL = "intraday"                       # absolute() level: today's open, against the same minute of earlier days
-    ABS_DAYS = 22                            # absolute(): compare with the same minute of the previous 22 trading days (saved files); 0 = off (no filters 2/4, those two always pass)
-    PCTILE_MAX = 50.0                        # filters 2 and 4: the 22-day percentile of the price's / V's % change from open must be at or below this (Q1/Q2, a weak reading)
-    V_RANGE_MAX = 0.25                       # filter 5: V's position in today's own (low, high) range so far must be at or below this (0 = today's low, 1 = today's high)
-    WINDOW = (dtime(9, 20), dtime(15, 0))     # entries only inside it (India time), checked on every 1-minute straddle_series point, not just a bar close
-    EXIT_AT = dtime(15, 10)                  # time exit (India time): the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
-    STOP_PCT = 25.0                          # the spread's combined P&L, as a % of its net entry debit: -STOP_PCT against it closes the position
-    TRAIL_TRIGGER_PCT = 25.0                 # once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT (None: no trailing, plain STOP_PCT only)
-    PROFIT_LOCK_PCT = 10.0                   # the new stop level once TRAIL_TRIGGER_PCT is reached (must be set together with TRAIL_TRIGGER_PCT)
-    TRAIL_STEP_PCT = 10.0                    # from then on the lock continuously follows the move, held at move - TRAIL_STEP_PCT (never lowered); None: the lock stays at PROFIT_LOCK_PCT
-    TARGET_PCT = None                        # a fixed take-profit on top of the trailing rule; None = trailing (or the plain stop) is the only exit
-    STRADDLE_N = 0                           # straddle_start(STRADDLE_N) when the script starts it itself: 0 = the nearest expiry only (what Synthetic/V are read from)
-    ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 26286, "ACCOUNT": "", "ALGOID": "34500"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
-    MAX_PORTFOLIOS = 32                      # portfolios this script may hold in the engine at once (both legs of every open/closing position count)
-    UNSUB_AFTER_S = 60                       # a closed leg's portfolio is unsubscribed this many seconds after its exit, so the engine frees the slot
-    TICK_EXITS = True                        # True: the spread's combined exit (SL/trail) is checked on every price tick of EITHER leg (FEED_TABLE) -- the CE legs' only
-                                             # price source in this script (not candles). False refuses to run: there would be no exit check at all for an open position.
-    FEED_TABLE = "fo_market_data"            # the live feed: columns token and ltp (raw price; the contract's own divisor from the master turns it into the price)
-    FAIL_COOLDOWN_S = 30
+    # Every value below is read from params.ini in this folder, section [dipbounce].
+    # Change a number there, not here; this block only names what the script needs.
+    PARAMS_SECTION = "dipbounce"
+    P = _params(PARAMS_SECTION)
+    print(f"{P.section}: {len(P)} parameters from {P.path}")
+    
+    USER = P["USER"]
+    STRATEGY = P["STRATEGY"]
+    UNDERLYINGS = P["UNDERLYINGS"]
+    LEVEL = P["LEVEL"]
+    ABS_DAYS = P["ABS_DAYS"]
+    PCTILE_MAX = P["PCTILE_MAX"]
+    V_RANGE_MAX = P["V_RANGE_MAX"]
+    WINDOW = (P.time("WINDOW_START"), P.time("WINDOW_END"))
+    EXIT_AT = P.time("EXIT_AT")
+    STOP_PCT = P["STOP_PCT"]
+    TRAIL_TRIGGER_PCT = P["TRAIL_TRIGGER_PCT"]
+    PROFIT_LOCK_PCT = P["PROFIT_LOCK_PCT"]
+    TRAIL_STEP_PCT = P["TRAIL_STEP_PCT"]
+    TARGET_PCT = P["TARGET_PCT"]
+    STRADDLE_N = P["STRADDLE_N"]
+    ENGINE = P["ENGINE"]
+    MAX_PORTFOLIOS = P["MAX_PORTFOLIOS"]
+    UNSUB_AFTER_S = P["UNSUB_AFTER_S"]
+    TICK_EXITS = P["TICK_EXITS"]
+    FEED_TABLE = P["FEED_TABLE"]
+    FAIL_COOLDOWN_S = P["FAIL_COOLDOWN_S"]
     # ==========================================================================
 
     if not TICK_EXITS:

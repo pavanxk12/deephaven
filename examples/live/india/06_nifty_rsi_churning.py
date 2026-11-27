@@ -24,25 +24,91 @@ import pandas as pd
 from algo import current
 from algo.core.timeframe import parse_timeframe
 
+_INI_NAME = "params.ini"
+
+def _params(section):
+    """Every USER INPUT value of this script, from params.ini, section [section]. Values are Python
+    literals (ast.literal_eval): numbers, strings, True/False/None, lists, tuples, dicts. A value that is
+    not a literal is kept as text, which is how a time like 15:45 survives for P.time(). '#' is NOT an
+    inline comment here, so a value keeps any '#' it contains; put comments on their own line.
+    init.py exec()s this script, so __file__ may not exist: the file is looked for in $ALGO_PARAMS, then
+    the container's strategies folder, then beside this script, then the working directory."""
+    import ast, configparser, os
+
+    def _lit(text):
+        """A Python literal, also allowing dict(a=1, b=2) -- the shape the scripts already used. No other
+        call is accepted, so a params.ini can never run anything."""
+        class _D(ast.NodeTransformer):
+            def visit_Call(self, n):
+                self.generic_visit(n)
+                if isinstance(n.func, ast.Name) and n.func.id == "dict" and not n.args:
+                    return ast.Dict([ast.Constant(kw.arg) for kw in n.keywords], [kw.value for kw in n.keywords])
+                raise ValueError("only dict(...) may be called in a value")
+        tree = _D().visit(ast.parse(text.strip(), mode="eval"))
+        return ast.literal_eval(ast.fix_missing_locations(tree))
+    _here = globals().get("__file__")
+    cands = [os.environ.get("ALGO_PARAMS", ""),
+             "/app/scripts/strategies/" + _INI_NAME,
+             os.path.join(os.path.dirname(os.path.abspath(_here)), _INI_NAME) if _here else "",
+             _INI_NAME]
+    path = next((p for p in cands if p and os.path.isfile(p)), None)
+    if path is None:
+        raise FileNotFoundError(f"{_INI_NAME} not found: looked at $ALGO_PARAMS, /app/scripts/strategies/, "
+                                f"beside this script, and {os.getcwd()}")
+    cfg = configparser.ConfigParser(inline_comment_prefixes=None, interpolation=None)
+    cfg.optionxform = str                                          # keys stay UPPER CASE
+    with open(path, encoding="utf-8") as fh:
+        cfg.read_file(fh)
+    if not cfg.has_section(section):
+        raise KeyError(f"{path}: no section [{section}]; it has {cfg.sections()}")
+
+    class _P(dict):
+        path, section = "", ""
+        def __missing__(self, k):
+            raise KeyError(f"{self.path} [{self.section}]: {k} is not set")
+        def time(self, k):
+            """A HH:MM or HH:MM:SS value as a datetime.time."""
+            from datetime import time as _t
+            parts = [int(x) for x in str(self[k]).strip().split(":")]
+            if not 2 <= len(parts) <= 3:
+                raise ValueError(f"{self.path} [{self.section}]: {k} = {self[k]!r} is not HH:MM")
+            return _t(*parts)
+
+    out = _P()
+    out.path, out.section = path, section
+    for k, v in cfg.items(section):
+        v = v.strip()
+        try:
+            out[k] = _lit(v)
+        except (ValueError, SyntaxError, TypeError):
+            out[k] = v                                             # a time like 15:45, or plain text
+    return out
+
 # =============================== USER INPUT ===============================
-USER = 4                         # USER_ID
-STRATEGY = "nifty_churning"           # its name: recorded with every portfolio, the name of its sending switch and of its console window
-PF_START = 1300                  # PF_START
-ADD_QTY = 20                      # ADD_QTY
-UNDERLYING = "NIFTY"             # UNDERLYING
-EXPIRY_INDEX = 0                 # OPT_EXPIRY_IDX: 0 = the nearest expiry that has not passed
-N_STRIKES = 1                    # N_STRIKES
-STRIKE_MODE = "OTM"              # STRIKE_MODE: "OTM" (away from the money), "ITM" (into it) or "BOTH" (0, +1, -1, +2, -2 ...)
-STRIKE_GAP = 1                   # STRIKE_GAP: listed strikes between two slots
-RSI_BAR = "5min"                 # the bar the RSI is computed on
-RSI_N, RSI_HIGH, RSI_LOW = 9, 70, 30
-RSI_LIVE = True                  # True: the forming bar counts too (acts every minute); False: finished bars only
-FAIL_COOLDOWN_S = 30
-WINDOW = (dtime(9, 20), dtime(15, 20))          # TRADE_START, TRADE_END (India time)
-# what this script puts on subscribe / unsubscribe over the service's defaults (your SUB_PAYLOAD; the user ids are added by the service)
-SUBSCRIBE = {"strategyname": "Churning", "maxloss": -2000, "stoploss": -2000, "max_unhedge": 10,"gtw": 26286}
-SIZING = dict(ival_pct=0.01, range_pct=0.2, trp_pct=0.01, jval_frac=0.75, sval_mult=5,
-              jqty1=1, jqty2=1, target=6000, stoploss=-2000, maxloss=-2000, max_unhedge=10, PRNT=1)   # OPT_IVAL_PCT ... APPLY_PARAMS (read by order_params below)
+# Every value below is read from params.ini in this folder, section [nifty_churning].
+# Change a number there, not here; this block only names what the script needs.
+PARAMS_SECTION = "nifty_churning"
+P = _params(PARAMS_SECTION)
+print(f"{P.section}: {len(P)} parameters from {P.path}")
+
+USER = P["USER"]
+STRATEGY = P["STRATEGY"]
+PF_START = P["PF_START"]
+ADD_QTY = P["ADD_QTY"]
+UNDERLYING = P["UNDERLYING"]
+EXPIRY_INDEX = P["EXPIRY_INDEX"]
+N_STRIKES = P["N_STRIKES"]
+STRIKE_MODE = P["STRIKE_MODE"]
+STRIKE_GAP = P["STRIKE_GAP"]
+RSI_BAR = P["RSI_BAR"]
+RSI_N = P["RSI_N"]
+RSI_HIGH = P["RSI_HIGH"]
+RSI_LOW = P["RSI_LOW"]
+RSI_LIVE = P["RSI_LIVE"]
+FAIL_COOLDOWN_S = P["FAIL_COOLDOWN_S"]
+WINDOW = (P.time("WINDOW_START"), P.time("WINDOW_END"))
+SUBSCRIBE = P["SUBSCRIBE"]
+SIZING = P["SIZING"]
 # ==========================================================================
 if not (N_STRIKES >= 1 and STRIKE_GAP >= 1 and STRIKE_MODE in ("OTM", "ITM", "BOTH") and N_STRIKES < 100):
     raise ValueError("N_STRIKES 1 to 99, STRIKE_GAP >= 1 and STRIKE_MODE in OTM / ITM / BOTH are required")

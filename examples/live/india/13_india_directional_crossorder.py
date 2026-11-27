@@ -55,59 +55,108 @@ def run_directional():
         month_contract_without_nulls.skips_null_names = True
         absolute_module.month_contract = month_contract_without_nulls
 
+    _INI_NAME = "params.ini"
+    
+    def _params(section):
+        """Every USER INPUT value of this script, from params.ini, section [section]. Values are Python
+        literals (ast.literal_eval): numbers, strings, True/False/None, lists, tuples, dicts. A value that is
+        not a literal is kept as text, which is how a time like 15:45 survives for P.time(). '#' is NOT an
+        inline comment here, so a value keeps any '#' it contains; put comments on their own line.
+        init.py exec()s this script, so __file__ may not exist: the file is looked for in $ALGO_PARAMS, then
+        the container's strategies folder, then beside this script, then the working directory."""
+        import ast, configparser, os
+    
+        def _lit(text):
+            """A Python literal, also allowing dict(a=1, b=2) -- the shape the scripts already used. No other
+            call is accepted, so a params.ini can never run anything."""
+            class _D(ast.NodeTransformer):
+                def visit_Call(self, n):
+                    self.generic_visit(n)
+                    if isinstance(n.func, ast.Name) and n.func.id == "dict" and not n.args:
+                        return ast.Dict([ast.Constant(kw.arg) for kw in n.keywords], [kw.value for kw in n.keywords])
+                    raise ValueError("only dict(...) may be called in a value")
+            tree = _D().visit(ast.parse(text.strip(), mode="eval"))
+            return ast.literal_eval(ast.fix_missing_locations(tree))
+        _here = globals().get("__file__")
+        cands = [os.environ.get("ALGO_PARAMS", ""),
+                 "/app/scripts/strategies/" + _INI_NAME,
+                 os.path.join(os.path.dirname(os.path.abspath(_here)), _INI_NAME) if _here else "",
+                 _INI_NAME]
+        path = next((p for p in cands if p and os.path.isfile(p)), None)
+        if path is None:
+            raise FileNotFoundError(f"{_INI_NAME} not found: looked at $ALGO_PARAMS, /app/scripts/strategies/, "
+                                    f"beside this script, and {os.getcwd()}")
+        cfg = configparser.ConfigParser(inline_comment_prefixes=None, interpolation=None)
+        cfg.optionxform = str                                          # keys stay UPPER CASE
+        with open(path, encoding="utf-8") as fh:
+            cfg.read_file(fh)
+        if not cfg.has_section(section):
+            raise KeyError(f"{path}: no section [{section}]; it has {cfg.sections()}")
+    
+        class _P(dict):
+            path, section = "", ""
+            def __missing__(self, k):
+                raise KeyError(f"{self.path} [{self.section}]: {k} is not set")
+            def time(self, k):
+                """A HH:MM or HH:MM:SS value as a datetime.time."""
+                from datetime import time as _t
+                parts = [int(x) for x in str(self[k]).strip().split(":")]
+                if not 2 <= len(parts) <= 3:
+                    raise ValueError(f"{self.path} [{self.section}]: {k} = {self[k]!r} is not HH:MM")
+                return _t(*parts)
+    
+        out = _P()
+        out.path, out.section = path, section
+        for k, v in cfg.items(section):
+            v = v.strip()
+            try:
+                out[k] = _lit(v)
+            except (ValueError, SyntaxError, TypeError):
+                out[k] = v                                             # a time like 15:45, or plain text
+        return out
+    
     # =============================== USER INPUT ===============================
-    USER = 4
-    STRATEGY = "directional"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
-    INDEX_FUTURES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}      # index futures are left out: stock futures only
-    SECTOR_BASKETS = {                       # named baskets: a symbol is ranked only against the others of ITS named basket (at least 3 members each)
-        "bank":   ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK"],
-        "fin":    ["BAJFINANCE", "BAJAJFINSV", "SBILIFE", "HDFCLIFE", "BSE"],
-        "it":     ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM"],
-        "auto":   ["M&M", "MARUTI", "TMPV", "EICHERMOT", "BAJAJ-AUTO"],
-        "health":["SUNPHARMA","DRREDDY","CIPLA","APOLLOHOSP","MAXHEALTH"],
-        "consumer":["ITC","NESTLEIND","TITAN","HINDUNILVR","ETERNAL"],
-        "energy":["ONGC","BPCL","RELIANCE","NTPC","POWERGRID"],
-        "metals":["HINDALCO","JSWSTEEL","TATASTEEL","COALINDIA","NATIONALUM"],
-    }                                         # add/remove/comment out symbols or whole baskets here; empty = none
-    EXCLUDE = []                             # optional: underlyings to leave out (applied across every basket)
-    LEVEL = "intraday"                       # relative() level: today's open and VWAP
-    BASKAVG_LONG = 0.5                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
-    BASKAVG_SHORT = -0.5                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
-    REL_BUY = {"pct_open": 80.0, "v": 70.0}         # relative(): BUY needs pct_open at least this; the straddle V % from open (if USE_V) needs to be at least this too
-    REL_SELL = {"pct_open": 20.0, "v": 80.0}        # relative(): SELL needs pct_open at or below this; the V % from open (if USE_V) needs to be at least this (its own threshold, not REL_BUY's)
-    ABS_BUY = {"pct_open": 80.0, "v": 70.0}         # absolute(): BUY needs pct_open at least this; the V % from open (if USE_V) needs to be at least this too
-    ABS_SELL = {"pct_open": 10.0, "v": 80.0}        # absolute(): SELL needs pct_open at or below this; the V % from open (if USE_V) needs to be at least this (its own threshold, not ABS_BUY's)
-    DIRECTION_MATCH = True                   # True: a BUY needs the REL_BUY/ABS_BUY side everywhere, a SELL the REL_SELL/ABS_SELL side.
-                                             # False: either side passes
-    USE_V = True                             # True: the straddle V's % change from the open must be high too (against the basket and against its own days). Needs the straddle running and
-                                             # straddle_<day> files. False: % from open only
-    STRADDLE_N = 0                           # straddle_start(STRADDLE_N) when the script starts it itself: 0 = the nearest expiry only (what the IV filters read)
-    DAY_EXTREME = True                       # True: filter 0, the latest SIGNAL_BAR close (5min) must be the highest (BUY) or the lowest (SELL) of today's SIGNAL_BAR closes so far (at least 2 bars today). False: off
-    ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
-    SIGNAL_BAR = "10min"                         # the bar filter 0 (TODAY) checks today's highest/lowest close on (made from the 1-minute candles)
-    ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an SIGNAL_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
-                                             # 1-minute close. False: look for an entry on every 1-minute candle
-    TARGET_PCT, STOP_PCT = 4.0, 1.0
-    TRAIL_TRIGGER_PCT = 1.0                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
-    PROFIT_LOCK_PCT = 0.5                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
-    TRAIL_STEP_PCT = 1.0                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
-                                             # move - TRAIL_STEP_PCT (never lowered), so once the move is up X% the lock is up (X - TRAIL_STEP_PCT)% -- it never gives back more than TRAIL_STEP_PCT
-    ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
-                                             # (the pasted script forgets this on a paste or a restart)
-    QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
-    ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 26286, "ACCOUNT": "", "ALGOID": "34500"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
-    WINDOW = (dtime(9, 45), dtime(13, 30))    # entries only inside it (India time, the session is 09:15 to 15:30); an exit is sent at any time
-    EXIT_AT = dtime(15, 10)                  # time exit (India time): 15 minutes before the 15:30 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
-    MAX_PORTFOLIOS = 32                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
-                                             # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.
-    UNSUB_AFTER_S = 60                       # a closed position's portfolio is unsubscribed this many seconds after its exit (take-profit, stop-loss, z-exit) so the engine frees the slot;
-                                             # the wait lets the plugin send and fill its closing order first. None = never (the slot is then held until the stop at the end of the day)
-    TICK_EXITS = True                        # True: target and stop-loss are also checked on every price tick of the live feed (FEED_TABLE) for the open positions only, not just on each 1-minute close.
-                                             # The candle check stays as the backup, and is used alone if the tick listener cannot be set up (it says so). Needs TARGET_PCT or STOP_PCT.
-    FEED_TABLE = "fo_market_data"            # the live feed: columns token and ltp (raw price; the contract's own divisor from the master turns it into the price)
-    FAIL_COOLDOWN_S = 30
-    RETRY_RANKING_S = 20                     # a ranking read that fails (a rare clash with the update cycle: "Previous values requested or inconsistent") is tried again on the next candle batches
-                                             # for this many seconds instead of giving up on that stock for the whole bar. 0 = no retry
+    # Every value below is read from params.ini in this folder, section [directional].
+    # Change a number there, not here; this block only names what the script needs.
+    PARAMS_SECTION = "directional"
+    P = _params(PARAMS_SECTION)
+    print(f"{P.section}: {len(P)} parameters from {P.path}")
+    
+    USER = P["USER"]
+    STRATEGY = P["STRATEGY"]
+    INDEX_FUTURES = P["INDEX_FUTURES"]
+    SECTOR_BASKETS = P["SECTOR_BASKETS"]
+    EXCLUDE = P["EXCLUDE"]
+    LEVEL = P["LEVEL"]
+    BASKAVG_LONG = P["BASKAVG_LONG"]
+    BASKAVG_SHORT = P["BASKAVG_SHORT"]
+    REL_BUY = P["REL_BUY"]
+    REL_SELL = P["REL_SELL"]
+    ABS_BUY = P["ABS_BUY"]
+    ABS_SELL = P["ABS_SELL"]
+    DIRECTION_MATCH = P["DIRECTION_MATCH"]
+    USE_V = P["USE_V"]
+    STRADDLE_N = P["STRADDLE_N"]
+    DAY_EXTREME = P["DAY_EXTREME"]
+    ABS_DAYS = P["ABS_DAYS"]
+    SIGNAL_BAR = P["SIGNAL_BAR"]
+    ACT_ON_BAR_END = P["ACT_ON_BAR_END"]
+    TARGET_PCT = P["TARGET_PCT"]
+    STOP_PCT = P["STOP_PCT"]
+    TRAIL_TRIGGER_PCT = P["TRAIL_TRIGGER_PCT"]
+    PROFIT_LOCK_PCT = P["PROFIT_LOCK_PCT"]
+    TRAIL_STEP_PCT = P["TRAIL_STEP_PCT"]
+    ONE_ENTRY_PER_STOCK = P["ONE_ENTRY_PER_STOCK"]
+    QTY = P["QTY"]
+    ENGINE = P["ENGINE"]
+    WINDOW = (P.time("WINDOW_START"), P.time("WINDOW_END"))
+    EXIT_AT = P.time("EXIT_AT")
+    MAX_PORTFOLIOS = P["MAX_PORTFOLIOS"]
+    UNSUB_AFTER_S = P["UNSUB_AFTER_S"]
+    TICK_EXITS = P["TICK_EXITS"]
+    FEED_TABLE = P["FEED_TABLE"]
+    FAIL_COOLDOWN_S = P["FAIL_COOLDOWN_S"]
+    RETRY_RANKING_S = P["RETRY_RANKING_S"]
     # ==========================================================================
 
     def make_baskets():

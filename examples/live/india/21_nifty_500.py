@@ -67,139 +67,111 @@ def run_nifty_500_directional():
         month_contract_without_nulls.skips_null_names = True
         absolute_module.month_contract = month_contract_without_nulls
 
+    _INI_NAME = "params.ini"
+    
+    def _params(section):
+        """Every USER INPUT value of this script, from params.ini, section [section]. Values are Python
+        literals (ast.literal_eval): numbers, strings, True/False/None, lists, tuples, dicts. A value that is
+        not a literal is kept as text, which is how a time like 15:45 survives for P.time(). '#' is NOT an
+        inline comment here, so a value keeps any '#' it contains; put comments on their own line.
+        init.py exec()s this script, so __file__ may not exist: the file is looked for in $ALGO_PARAMS, then
+        the container's strategies folder, then beside this script, then the working directory."""
+        import ast, configparser, os
+    
+        def _lit(text):
+            """A Python literal, also allowing dict(a=1, b=2) -- the shape the scripts already used. No other
+            call is accepted, so a params.ini can never run anything."""
+            class _D(ast.NodeTransformer):
+                def visit_Call(self, n):
+                    self.generic_visit(n)
+                    if isinstance(n.func, ast.Name) and n.func.id == "dict" and not n.args:
+                        return ast.Dict([ast.Constant(kw.arg) for kw in n.keywords], [kw.value for kw in n.keywords])
+                    raise ValueError("only dict(...) may be called in a value")
+            tree = _D().visit(ast.parse(text.strip(), mode="eval"))
+            return ast.literal_eval(ast.fix_missing_locations(tree))
+        _here = globals().get("__file__")
+        cands = [os.environ.get("ALGO_PARAMS", ""),
+                 "/app/scripts/strategies/" + _INI_NAME,
+                 os.path.join(os.path.dirname(os.path.abspath(_here)), _INI_NAME) if _here else "",
+                 _INI_NAME]
+        path = next((p for p in cands if p and os.path.isfile(p)), None)
+        if path is None:
+            raise FileNotFoundError(f"{_INI_NAME} not found: looked at $ALGO_PARAMS, /app/scripts/strategies/, "
+                                    f"beside this script, and {os.getcwd()}")
+        cfg = configparser.ConfigParser(inline_comment_prefixes=None, interpolation=None)
+        cfg.optionxform = str                                          # keys stay UPPER CASE
+        with open(path, encoding="utf-8") as fh:
+            cfg.read_file(fh)
+        if not cfg.has_section(section):
+            raise KeyError(f"{path}: no section [{section}]; it has {cfg.sections()}")
+    
+        class _P(dict):
+            path, section = "", ""
+            def __missing__(self, k):
+                raise KeyError(f"{self.path} [{self.section}]: {k} is not set")
+            def time(self, k):
+                """A HH:MM or HH:MM:SS value as a datetime.time."""
+                from datetime import time as _t
+                parts = [int(x) for x in str(self[k]).strip().split(":")]
+                if not 2 <= len(parts) <= 3:
+                    raise ValueError(f"{self.path} [{self.section}]: {k} = {self[k]!r} is not HH:MM")
+                return _t(*parts)
+    
+        out = _P()
+        out.path, out.section = path, section
+        for k, v in cfg.items(section):
+            v = v.strip()
+            try:
+                out[k] = _lit(v)
+            except (ValueError, SyntaxError, TypeError):
+                out[k] = v                                             # a time like 15:45, or plain text
+        return out
+    
     # =============================== USER INPUT ===============================
-    USER = 3
-    STRATEGY = "nifty_500_directional"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
-    INDEX_FUTURES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}      # index futures are left out: stock futures only
-    SECTOR_BASKETS = {                       # the 50 NIFTY 500 sub-sectors. A symbol is ranked only against the others of ITS sub-sector. Names with no cash listing are dropped at
-                                             # startup, and a basket left under MIN_BASKET goes with them. Comment out whole baskets here to trade fewer sectors.
-        "amc_wealth_broking":      ["360ONE", "ABSLAMC", "ANANDRATHI", "ANGELONE", "CHOICEIN", "GROWW", "HDFCAMC",
-                                    "ICICIAMC", "JMFINANCIL", "MOTILALOFS", "NAM-INDIA", "NUVAMA", "UTIAMC"],
-        "auto_ancillary":          ["ARE&M", "ASAHIINDIA", "BELRISE", "BHARATFORG", "BOSCHLTD", "CIEINDIA",
-                                    "CRAFTSMAN", "ENDURANCE", "EXIDEIND", "GABRIEL", "JBMA", "MINDACORP", "MOTHERSON",
-                                    "MSUMI", "RKFORGE", "SANSERA", "SCHAEFFLER", "SHRIPISTON", "SONACOMS", "TENNIND",
-                                    "TIINDIA", "UNOMINDA", "ZFCVINDIA"],
-        "auto_oem_2w_cv_ev":       ["ASHOKLEY", "ATHERENERG", "BAJAJ-AUTO", "EICHERMOT", "HEROMOTOCO", "OLAELEC",
-                                    "OLECTRA", "TMCV", "TVSMOTOR"],
-        "auto_oem_passenger":      ["FORCEMOT", "HYUNDAI", "M&M", "MARUTI", "TMPV"],
-        "bank_psu":                ["BANKBARODA", "BANKINDIA", "CANBK", "CENTRALBK", "INDIANB", "IOB", "MAHABANK",
-                                    "PNB", "SBIN", "UCOBANK", "UNIONBANK"],
-        "bank_private":            ["AUBANK", "AXISBANK", "BANDHANBNK", "CUB", "FEDERALBNK", "HDFCBANK", "ICICIBANK",
-                                    "IDBI", "IDFCFIRSTB", "INDUSINDBK", "J&KBANK", "KARURVYSYA", "KOTAKBANK",
-                                    "RBLBANK", "YESBANK"],
-        "bearings_abrasives_refractories": ["AIAENG", "CARBORUNIV", "GRAPHITE", "HEGAM", "RHIM", "TEGA", "TIMKEN"],
-        "beverages":               ["ABDL", "RADICO", "UBL", "UNITDSPR", "VBL"],
-        "cables_wires":            ["APARINDS", "FINCABLES", "KEI", "POLYCAB", "RRKABEL"],
-        "cement":                  ["ACC", "AMBUJACEM", "DALBHARAT", "GRASIM", "INDIACEM", "JKCEMENT", "JSWCEMENT",
-                                    "NUVOCO", "RAMCOCEM", "SHREECEM", "ULTRACEMCO"],
-        "defence_shipyards":       ["AZAD", "BDL", "BEL", "BEML", "COCHINSHIP", "DATAPATTNS", "GRSE", "HAL",
-                                    "MAZDOCK", "MTARTECH", "PTCIL", "ZENTEC"],
-        "epc_diversified":         ["AFCONS", "CEMPRO", "IRB", "KEC", "KPIL", "LT", "NCC", "TECHNOE"],
-        "electronics_appliances":  ["AMBER", "BLUESTARCO", "CPPLUS", "CROMPTON", "DIXON", "HAVELLS", "HONAUT",
-                                    "KAYNES", "LGEINDIA", "PGEL", "SYRMA", "VOLTAS", "WHIRLPOOL"],
-        "fertilisers_agrochem":    ["CHAMBLFERT", "COROMANDEL", "DEEPAKFERT", "FACT", "PARADEEP", "PIIND", "UPL"],
-        "food_agri_tobacco":       ["AVANTIFEED", "AWL", "BALRAMCHIN", "BRITANNIA", "CCL", "EIDPARRY", "GODFRYPHLP",
-                                    "ITC", "LTFOODS", "NESTLEIND", "PATANJALI", "TATACONSUM"],
-        "gas_distribution_lng":    ["AEGISLOG", "AEGISVOPAK", "ATGL", "GAIL", "IGL", "MGL", "PETRONET"],
-        "holding_investment":      ["ABCAPITAL", "AIIL", "BAJAJFINSV", "BAJAJHLDNG", "CHOLAHLDNG", "IFCI", "JIOFIN",
-                                    "TATAINVEST"],
-        "hospitals_diagnostics":   ["APOLLOHOSP", "ASTERDM", "FORTIS", "KIMS", "LALPATHLAB", "MAXHEALTH", "MEDANTA",
-                                    "NH", "POLYMED", "RAINBOW", "VIJAYA"],
-        "hotels_travel_restaurants": ["BLS", "DEVYANI", "EIHOTEL", "INDHOTEL", "IRCTC", "ITCHOTELS", "JUBLFOOD",
-                                      "LEMONTREE"],
-        "housing_finance":         ["AADHARHFC", "AAVAS", "APTUS", "BAJAJHFL", "CANFINHOME", "HOMEFIRST", "LICHSGFIN",
-                                    "PNBHOUSING"],
-        "it_er&d":                 ["CYIENT", "KPITTECH", "LTTS", "TATAELXSI", "TATATECH"],
-        "it_services_large":       ["HCLTECH", "INFY", "LTM", "TCS", "TECHM", "WIPRO"],
-        "it_services_mid":         ["AFFLE", "BBOX", "BSOFT", "COFORGE", "ECLERX", "FRACTAL", "FSL", "HEXT", "IKS",
-                                    "INTELLECT", "MPHASIS", "NETWEB", "OFSS", "PERSISTENT", "SAGILITY", "ZENSARTECH"],
-        "industrial_machinery":    ["ACE", "CUMMINSIND", "ELECON", "ELGIEQUIP", "ESCORTS", "INOXINDIA", "JWL",
-                                    "JYOTICNC", "KIRLOSBROS", "KIRLOSENG", "KSB", "TITAGARH"],
-        "infra_psu_lending":       ["HUDCO", "IREDA", "IRFC", "PFC", "RECLTD"],
-        "insurance":               ["CANHLIFE", "GICRE", "HDFCLIFE", "ICICIGI", "ICICILIFE", "LICI", "MFSL", "NIACL",
-                                    "SBILIFE", "STARHEALTH"],
-        "internet_platforms":      ["CARTRADE", "ETERNAL", "FIRSTCRY", "INDIAMART", "MEESHO", "NAUKRI", "NYKAA",
-                                    "PWL", "SWIGGY", "TBOTEK", "URBANCO"],
-        "market_infra_fintech":    ["BSE", "CAMS", "CDSL", "CRISIL", "IEX", "KFINTECH", "MCX", "PAYTM", "PINELABS",
-                                    "POLICYBZR", "SBICARD"],
-        "metals_ferrous_mining":   ["ADANIENT", "GMDCLTD", "JINDALSTEL", "JSL", "JSWSTEEL", "LLOYDSME", "NMDC",
-                                    "NSLNISP", "SAIL", "SARDAEN", "TATASTEEL", "VISL"],
-        "metals_non_ferrous":      ["GRAVITA", "HINDALCO", "HINDCOPPER", "HINDZINC", "JAINREC", "NATIONALUM", "VAML",
-                                    "VEDL"],
-        "nbfc_diversified":        ["BAJFINANCE", "CGCL", "CHOLAFIN", "CREDITACC", "FIVESTAR", "HDBFS", "IIFL", "LTF",
-                                    "M&MFIN", "MANAPPURAM", "MUTHOOTFIN", "PIRAMALFIN", "POONAWALLA", "SAMMAANCAP",
-                                    "SHRIRAMFIN", "SUNDARMFIN", "TATACAP"],
-        "oil_gas_refining":        ["BPCL", "CASTROLIND", "CHENNPETRO", "HINDPETRO", "IOC", "MRPL", "RELIANCE"],
-        "oil_gas_upstream_coal":   ["BHARATCOAL", "COALINDIA", "OIL", "ONGC", "VOGL"],
-        "psu_infra_railways":      ["ENGINERSIN", "IRCON", "NBCC", "RITES", "RVNL"],
-        "paints_building_products": ["ASIANPAINT", "ASTRAL", "BERGEPAINT", "KAJARIACER", "SUPREMEIND"],
-        "personal_household":      ["COLPAL", "CUPID", "DABUR", "DOMS", "EMAMILTD", "GILLETTE", "GODREJCP",
-                                    "HINDUNILVR", "HONASA", "MARICO", "ZYDUSWELL"],
-        "pharma_api_cdmo":         ["ACUTAAS", "ANTHEM", "COHANCE", "CONCORDBIO", "DIVISLAB", "GLAND", "LAURUSLABS",
-                                    "NEULANDLAB", "SAILIFE", "SYNGENE"],
-        "pharma_formulations":     ["ABBOTINDIA", "AJANTPHARM", "ALKEM", "AUROPHARMA", "BIOCON", "CAPLIPOINT",
-                                    "CIPLA", "DRREDDY", "EMCURE", "GLAXO", "GLENMARK", "GRANULES", "IPCALAB", "LUPIN",
-                                    "MANKIND", "NATCOPHARM", "ONESOURCE", "PPLPHARMA", "RUBICON", "SUNPHARMA",
-                                    "TORNTPHARM", "WOCKPHARMA", "ZYDUSLIFE"],
-        "power_generation_transmission": ["ADANIENSOL", "ADANIPOWER", "CESC", "JPPOWER", "JSWENERGY", "NAVA",
-                                          "NLCINDIA", "NTPC", "POWERGRID", "RPOWER", "TATAPOWER", "TORNTPOWER",
-                                          "VEDPOWER"],
-        "power_renewables":        ["ACMESOLAR", "ADANIGREEN", "CLEANMAX", "NHPC", "NTPCGREEN", "SJVN"],
-        "power_equipment_t&d":     ["ABB", "BHEL", "CGPOWER", "ENRIN", "GVT&D", "HBLENGINE", "POWERINDIA",
-                                    "SCHNEIDER", "SIEMENS", "TARIL", "TDPOWERSYS", "THERMAX", "TRITURBINE"],
-        "realty":                  ["ABREL", "ANANTRAJ", "BRIGADE", "DLF", "GODREJPROP", "LODHA", "OBEROIRLTY",
-                                    "PHOENIXLTD", "PRESTIGE", "SIGNATURE", "SOBHA"],
-        "renewable_equipment":     ["EMMVEE", "INOXWIND", "PREMIERENE", "SUZLON", "WAAREEENER"],
-        "retail_jewellery_footwear": ["BATAINDIA", "DMART", "KALYANKJIL", "LENSKART", "THANGAMAYL", "TITAN", "TRENT",
-                                      "VMM"],
-        "specialty_chemicals":     ["AARTIIND", "AETHER", "ANURAS", "ATUL", "CLEAN", "DEEPAKNTR", "FLUOROCHEM",
-                                    "GODREJIND", "HSCL", "JUBLINGREA", "LINDEINDIA", "NAVINFLUOR", "PCBL",
-                                    "PIDILITIND", "PRIVISCL", "SOLARINDS", "SRF", "SUMICHEM", "SWANCORP", "TATACHEM"],
-        "steel_products_pipes":    ["APLAPOLLO", "GALLANTT", "GPIL", "JINDALSAW", "SHYAMMETL", "USHAMART", "WELCORP"],
-        "telecom_media":           ["BHARTIARTL", "BHARTIHEXA", "IDEA", "INDUSTOWER", "ITI", "PFOCUS", "PVRINOX",
-                                    "RAILTEL", "SUNTV", "TATACOMM", "TEJASNET", "TTML", "ZEEL"],
-        "textiles":                ["KPRMILL", "PAGEIND", "TRIDENT", "VTL", "WELSPUNLIV"],
-        "transport_logistics_services": ["ADANIPORTS", "CMPDI", "CONCOR", "DELHIVERY", "GESHIP", "GMRAIRPORT", "IGIL",
-                                         "INDIGO", "JSWINFRA", "MMTC", "REDINGTON", "SCI"],
-        "tyres":                   ["APOLLOTYRE", "BALKRISIND", "CEATLTD", "JKTYRE", "MRF"],    }
-    EXCLUDE = []                             # optional: underlyings to leave out (applied across every basket)
-    MIN_BASKET = 3                           # a basket needs at least this many LIVE cash equities to be used; the others are dropped at startup (said, not an error)
-    LEVEL = "intraday"                       # relative() level: today's open and VWAP
-    BASKAVG_LONG = 0.2                       # filter 1: BUY needs the basket's AVERAGE % change from the open to be at least this
-    BASKAVG_SHORT = -0.2                     # filter 1: SELL needs the basket's AVERAGE % change from the open to be at or below this
-    RTURNOVER_MIN = 12.0                      # filter 2: the stock's cumulative traded VALUE (price x volume) from today's open must be at least this many times its own
-                                             # average at the SAME minute over RTURNOVER_DAYS earlier days. None = the gate is off. Not backtested separately from RVOL (see above).
-    RTURNOVER_DAYS = 22                      # how many earlier days the RTURNOVER average is taken over (the same 22 as absolute()); absolute()'s own rule applies: fewer
-                                             # than half of them in the saved files and it cannot be told (no trade)
-    REL_BUY = 80.0                           # filter 3, relative(): BUY needs the stock's pct_open percentile in its basket to be at least this
-    REL_SELL = 20.0                          # filter 3, relative(): SELL needs it at or below this
-    ABS_BUY = 80.0                           # filter 4, absolute(): BUY needs the pct_open percentile against its own days to be at least this
-    ABS_SELL = 20.0                          # filter 4, absolute(): SELL needs it at or below this
-    DIRECTION_MATCH = True                   # True: a BUY needs the REL_BUY/ABS_BUY side everywhere, a SELL the REL_SELL/ABS_SELL side. False: either side passes
-    SIDES = (1, 2)                           # which sides may be taken at all: (1, 2) both, (2,) SHORT ONLY, (1,) long only.
-                                             # The backtest's shorts were worth +0.109% a trade at a 50% win rate against the longs' +0.062% at 45%.
-    DAY_EXTREME = True                       # True: filter 0, the latest SIGNAL_BAR close must be the highest (BUY) or the lowest (SELL) of today's SIGNAL_BAR closes so far
-                                             # (at least 2 bars today). False: off
-    ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
-    SIGNAL_BAR = "1min"                      # the bar filter 0 (TODAY) checks today's highest/lowest close on (made from the 1-minute candles)
-    ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends a SIGNAL_BAR bar. Take-profit and stop-loss are still checked on every
-                                             # 1-minute close. False: look for an entry on every 1-minute candle
-    TARGET_PCT, STOP_PCT = 10.0, 2.0       # NOTE: the +10% target did not fire ONCE in the backtest, and the median trade was the -0.75% stop
-    TRAIL_TRIGGER_PCT = 2.0                  # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
-    PROFIT_LOCK_PCT = 0.5                    # the new stop level once TRAIL_TRIGGER_PCT is reached; must be set together with TRAIL_TRIGGER_PCT
-    TRAIL_STEP_PCT = 2.0                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock follows the move, held at
-                                             # move - TRAIL_STEP_PCT (never lowered)
-    ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once entered, a take-profit, stop-loss or any exit ends its trading. False: it may be entered again
-    ENTRY_VALUE = 100000.0                    # rupees to put into EACH entry: the number of shares sent is ENTRY_VALUE / the price at entry, rounded to a whole share (minimum 1)
-    ENGINE = {"strategyname": "CrossOrder", "SERVERCODE": 26286, "ACCOUNT": "", "ALGOID": "34500"}      # "CrossOrder" is the engine's name for the CrossOrder plugin
-    WINDOW = (dtime(9, 20), dtime(10, 0))    # entries only inside it (India time, the session is 09:15 to 15:30); an exit is sent at any time
-    EXIT_AT = dtime(15, 10)                  # time exit (India time): the automation is stopped like algo_stop and no entry is made after it
-    MAX_PORTFOLIOS = 32                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe
-    UNSUB_AFTER_S = 60                       # a closed position's portfolio is unsubscribed this many seconds after its exit so the engine frees the slot. None = never
-    TICK_EXITS = True                        # True: target and stop-loss are also checked on every price tick of the live feed (FEED_TABLE) for the open positions only
-    FEED_TABLE = "fo_market_data"            # the live feed: columns token and ltp (raw price; the contract's own divisor from the master turns it into the price)
-    FAIL_COOLDOWN_S = 30
-    RETRY_RANKING_S = 20                     # a ranking read that fails is tried again on the next candle batches for this many seconds. 0 = no retry
+    # Every value below is read from params.ini in this folder, section [nifty_500_directional].
+    # Change a number there, not here; this block only names what the script needs.
+    PARAMS_SECTION = "nifty_500_directional"
+    P = _params(PARAMS_SECTION)
+    print(f"{P.section}: {len(P)} parameters from {P.path}")
+    
+    USER = P["USER"]
+    STRATEGY = P["STRATEGY"]
+    INDEX_FUTURES = P["INDEX_FUTURES"]
+    SECTOR_BASKETS = P["SECTOR_BASKETS"]
+    EXCLUDE = P["EXCLUDE"]
+    MIN_BASKET = P["MIN_BASKET"]
+    ONE_BASKET = P["ONE_BASKET"]
+    LEVEL = P["LEVEL"]
+    BASKAVG_LONG = P["BASKAVG_LONG"]
+    BASKAVG_SHORT = P["BASKAVG_SHORT"]
+    RTURNOVER_MIN = P["RTURNOVER_MIN"]
+    RTURNOVER_DAYS = P["RTURNOVER_DAYS"]
+    REL_BUY = P["REL_BUY"]
+    REL_SELL = P["REL_SELL"]
+    ABS_BUY = P["ABS_BUY"]
+    ABS_SELL = P["ABS_SELL"]
+    DIRECTION_MATCH = P["DIRECTION_MATCH"]
+    SIDES = P["SIDES"]
+    DAY_EXTREME = P["DAY_EXTREME"]
+    ABS_DAYS = P["ABS_DAYS"]
+    SIGNAL_BAR = P["SIGNAL_BAR"]
+    ACT_ON_BAR_END = P["ACT_ON_BAR_END"]
+    TARGET_PCT = P["TARGET_PCT"]
+    STOP_PCT = P["STOP_PCT"]
+    TRAIL_TRIGGER_PCT = P["TRAIL_TRIGGER_PCT"]
+    PROFIT_LOCK_PCT = P["PROFIT_LOCK_PCT"]
+    TRAIL_STEP_PCT = P["TRAIL_STEP_PCT"]
+    ONE_ENTRY_PER_STOCK = P["ONE_ENTRY_PER_STOCK"]
+    ENTRY_VALUE = P["ENTRY_VALUE"]
+    ENGINE = P["ENGINE"]
+    WINDOW = (P.time("WINDOW_START"), P.time("WINDOW_END"))
+    EXIT_AT = P.time("EXIT_AT")
+    MAX_PORTFOLIOS = P["MAX_PORTFOLIOS"]
+    UNSUB_AFTER_S = P["UNSUB_AFTER_S"]
+    TICK_EXITS = P["TICK_EXITS"]
+    FEED_TABLE = P["FEED_TABLE"]
+    FAIL_COOLDOWN_S = P["FAIL_COOLDOWN_S"]
+    RETRY_RANKING_S = P["RETRY_RANKING_S"]
     # ==========================================================================
 
     def make_baskets():
@@ -219,6 +191,11 @@ def run_nifty_500_directional():
         return baskets
 
     BASKETS = make_baskets()
+    if ONE_BASKET:                                                 # rank every stock against the WHOLE NIFTY 500 instead of its own sub-sector.
+        members = sorted({s for v in BASKETS.values() for s in v})  # the set also dedupes, so the "in two baskets" guard below cannot trip on it.
+        print(f"{STRATEGY}: ONE_BASKET -- the {len(BASKETS)} sub-sectors are merged into one basket of {len(members)} equities; "
+              f"REL_BUY/REL_SELL are now a rank against the whole market, so 80/20 would mean the top/bottom 100 names")
+        BASKETS = {"all": members}
     if not (BASKAVG_SHORT < BASKAVG_LONG and 0 <= REL_SELL < REL_BUY <= 100 and 0 <= ABS_SELL < ABS_BUY <= 100
             and TARGET_PCT > 0 and STOP_PCT > 0 and ENTRY_VALUE > 0 and BASKETS and all(len(v) >= MIN_BASKET for v in BASKETS.values())
             and (RTURNOVER_MIN is None or (RTURNOVER_MIN > 0 and isinstance(RTURNOVER_DAYS, int) and 1 <= RTURNOVER_DAYS <= 400))
@@ -386,15 +363,27 @@ def run_nifty_500_directional():
             return set()
         return sides_of(p >= buy, p <= sell)
 
-    def basket_avg_sides(symbol):
-        """Filter 1: the basket's own AVERAGE % change from the open (across every member). BUY needs it at least BASKAVG_LONG; SELL needs it at or below BASKAVG_SHORT."""
-        members = BASKETS[basket_of[symbol]]
+    _avg_cache = {}                                                # (basket, bar) -> the sides that basket's average allows on that bar
+
+    def basket_avg_sides(symbol, bar):
+        """Filter 1: the basket's own AVERAGE % change from the open (across every member). BUY needs it at least BASKAVG_LONG; SELL needs it at or below BASKAVG_SHORT.
+        The average is the SAME number for every member of a basket, so it is read ONCE a bar and kept: with ONE_BASKET the member list is the whole NIFTY 500, and
+        reading a 500-name ranking once per stock per bar is what makes the ranking fall behind. A "cannot tell" is never cached, so it is retried."""
+        name = basket_of[symbol]
+        hit = _avg_cache.get((name, bar))
+        if hit is not None:
+            return hit
+        if len(_avg_cache) > 400:                                  # only today's bars matter; this keeps it from growing all session
+            _avg_cache.clear()
+        members = BASKETS[name]
         with exec_ctx:
             result = relative("pct", LEVEL, symbol, members, ref="open")
         if result[1] < 0:
             return set()
         avg = float(np.mean(result[0]))                            # result[0]: every basket member's own % change from the open, right now
-        return sides_of(avg >= BASKAVG_LONG, avg <= BASKAVG_SHORT)
+        out = sides_of(avg >= BASKAVG_LONG, avg <= BASKAVG_SHORT)
+        _avg_cache[(name, bar)] = out
+        return out
 
     def relative_sides(symbol):
         """Filter 3, relative(): the ranking of pct_open among the OTHER symbols of ITS basket, against REL_BUY / REL_SELL."""
@@ -625,7 +614,7 @@ def run_nifty_500_directional():
             if not today:
                 count("not the high/low of the day")
                 return
-            sides = today & basket_avg_sides(symbol_of[token])     # 1. basket avg: the basket's own average % move from the open
+            sides = today & basket_avg_sides(symbol_of[token], bar)  # 1. basket avg: the basket's own average % move from the open (one read a bar)
             if not sides:
                 count("refused by basket avg")
                 return

@@ -52,57 +52,109 @@ def run_meanrevert():
     from algo.core.timeframe import parse_timeframe
     from algo.ui.filters import PF_PER_USER             # orders_trade's own PF column is wire-level: USER * PF_PER_USER + the book's pf (31002 = user 3, book pf 1002)
 
+    _INI_NAME = "params.ini"
+    
+    def _params(section):
+        """Every USER INPUT value of this script, from params.ini, section [section]. Values are Python
+        literals (ast.literal_eval): numbers, strings, True/False/None, lists, tuples, dicts. A value that is
+        not a literal is kept as text, which is how a time like 15:45 survives for P.time(). '#' is NOT an
+        inline comment here, so a value keeps any '#' it contains; put comments on their own line.
+        init.py exec()s this script, so __file__ may not exist: the file is looked for in $ALGO_PARAMS, then
+        the container's strategies folder, then beside this script, then the working directory."""
+        import ast, configparser, os
+    
+        def _lit(text):
+            """A Python literal, also allowing dict(a=1, b=2) -- the shape the scripts already used. No other
+            call is accepted, so a params.ini can never run anything."""
+            class _D(ast.NodeTransformer):
+                def visit_Call(self, n):
+                    self.generic_visit(n)
+                    if isinstance(n.func, ast.Name) and n.func.id == "dict" and not n.args:
+                        return ast.Dict([ast.Constant(kw.arg) for kw in n.keywords], [kw.value for kw in n.keywords])
+                    raise ValueError("only dict(...) may be called in a value")
+            tree = _D().visit(ast.parse(text.strip(), mode="eval"))
+            return ast.literal_eval(ast.fix_missing_locations(tree))
+        _here = globals().get("__file__")
+        cands = [os.environ.get("ALGO_PARAMS", ""),
+                 "/app/scripts/strategies/" + _INI_NAME,
+                 os.path.join(os.path.dirname(os.path.abspath(_here)), _INI_NAME) if _here else "",
+                 _INI_NAME]
+        path = next((p for p in cands if p and os.path.isfile(p)), None)
+        if path is None:
+            raise FileNotFoundError(f"{_INI_NAME} not found: looked at $ALGO_PARAMS, /app/scripts/strategies/, "
+                                    f"beside this script, and {os.getcwd()}")
+        cfg = configparser.ConfigParser(inline_comment_prefixes=None, interpolation=None)
+        cfg.optionxform = str                                          # keys stay UPPER CASE
+        with open(path, encoding="utf-8") as fh:
+            cfg.read_file(fh)
+        if not cfg.has_section(section):
+            raise KeyError(f"{path}: no section [{section}]; it has {cfg.sections()}")
+    
+        class _P(dict):
+            path, section = "", ""
+            def __missing__(self, k):
+                raise KeyError(f"{self.path} [{self.section}]: {k} is not set")
+            def time(self, k):
+                """A HH:MM or HH:MM:SS value as a datetime.time."""
+                from datetime import time as _t
+                parts = [int(x) for x in str(self[k]).strip().split(":")]
+                if not 2 <= len(parts) <= 3:
+                    raise ValueError(f"{self.path} [{self.section}]: {k} = {self[k]!r} is not HH:MM")
+                return _t(*parts)
+    
+        out = _P()
+        out.path, out.section = path, section
+        for k, v in cfg.items(section):
+            v = v.strip()
+            try:
+                out[k] = _lit(v)
+            except (ValueError, SyntaxError, TypeError):
+                out[k] = v                                             # a time like 15:45, or plain text
+        return out
+    
     # =============================== USER INPUT ===============================
-    USER = 3
-    STRATEGY = "meanrevert"               # its name: recorded with every portfolio, the name of its sending switch and of its console window
-    BASKETS = {                              # named sector baskets: a symbol is ranked only against the OTHERS of ITS basket (each saved as its own basket.txt entry)
-        "us":   ["MSFT", "GOOG", "META", "AMZN", "NFLX", "SHOP", "CRWD", "PANW", "PLTR", "AAPL", "TSLA","WMT", "COST", "PEP", "AMGN", "LIN", "GILD", "SPCX","NVDA", "AVGO", "AMD", "MU", "ASML", "INTC", "AMAT", "MRVL", "KLAC", "ADI", "QCOM", "ARM", "SNDK", "TXN", "CSCO"],
-    }
-
-    TRADE_AS = {}                            # optional: {"AAPL": "<another contract name or token>"} trade another contract than the basket entry
-    LEVEL = "intraday"                       # relative() level: today's open and VWAP
-    REL_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # relative(): pct_open's percentile among the basket must land inside its (low, high) band (Q2 to Q3);
-                                              # pct_vwap's percentile among the basket must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD)
-    ABS_DAYS = 22                            # absolute(): compare the stock with itself at the same minute of its previous 22 trading days (saved files); 0 = off
-    ABS_ZONE = {"pct_open": (25.0, 75.0), "pct_vwap": (25.0, 75.0)}      # absolute(): pct_open's percentile against its own days must land inside its (low, high) band (Q2 to Q3);
-                                              # pct_vwap's percentile against its own days must be ABOVE its high for a SELL (OVERBOUGHT), or BELOW its low for a BUY (OVERSOLD)
-    RSI_BAR = "5min"                         # the bar the RSI is computed on (made from the 1-minute candles)
-    RSI_N, RSI_HIGH, RSI_LOW = 9, 70, 30
-    RSI_LIVE = False                          # True: the bar still forming counts too (acts every minute); False: finished bars only
-    ACT_ON_BAR_END = True                    # True: look for an ENTRY only on the 1-minute candle that ends an RSI_BAR bar (:05, :10, :15 ... for 5min). Take-profit and stop-loss are still checked on every
-                                             # 1-minute close. False: look for an entry on every 1-minute candle
-    HIST_DAYS = 1                            # how many earlier saved days seed the RSI (0 = none)
-    TARGET_PCT, STOP_PCT = 3.0, 0.5
-    TRAIL_TRIGGER_PCT = 1.25                 # None: plain TARGET_PCT / STOP_PCT. A number: once the move in its favour reaches this, the stop shifts from -STOP_PCT to PROFIT_LOCK_PCT
-    PROFIT_LOCK_PCT = 1.0                   # the new stop level once TRAIL_TRIGGER_PCT is reached (e.g. 0.3 locks in at least +0.3%); must be set together with TRAIL_TRIGGER_PCT
-    TRAIL_STEP_PCT = 0.2                     # None: the lock stays at PROFIT_LOCK_PCT once trailing starts. A number: from then on the lock continuously follows the move, held at
-                                             # move - TRAIL_STEP_PCT (never lowered), so once the move is up X% the lock is up (X - TRAIL_STEP_PCT)% -- it never gives back more than TRAIL_STEP_PCT
-    ONE_ENTRY_PER_STOCK = True               # True: each stock gets ONE entry; once it has been entered, a take-profit, stop-loss or any exit ends its trading (no new entry in it). False: it may be entered again
-                                             # (the pasted script forgets this on a paste or a restart)
-    QTY = 1                                  # in LOTS (the plugin multiplies it by the contract's lot size)
-    ENTRY_VALUE = 5000                       # None: every entry is QTY lots. A number (dollars): the quantity at entry is int(ENTRY_VALUE / the last 1-minute close), QTY is then not used;
-                                             # if one share costs more than ENTRY_VALUE the quantity would be 0 and that entry is skipped (it says so)
-    ENGINE = {"strategyname": "LimitOrder", "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1","MAX_TRIES":5}      # "CrossOrder" is the engine's name for the CrossOrder plugin
-    WINDOW = (dtime(10, 0), dtime(15, 0))   # entries only inside it (New York time, the regular session is 09:30 to 16:00); an exit is sent at any time
-    EXIT_AT = dtime(15, 45)                  # time exit (New York time): 5 minutes before the 16:00 close, the automation is stopped like algo_stop (pause, square up, unsubscribe every portfolio) and no entry is made after it
-    MAX_PORTFOLIOS = 28                      # portfolios this script may hold in the engine at once: open positions plus closed ones waiting for their unsubscribe. The engine seems to keep about
-                                             # 32 plugin instances in all (all scripts together), so two scripts at the same time need smaller numbers. No entry while the script is at the limit.
-    UNSUB_AFTER_S = 60                       # a closed position's portfolio is unsubscribed this many seconds after its exit (take-profit, stop-loss, z-exit) so the engine frees the slot;
-                                             # the wait lets the plugin send and fill its closing order first. None = never (the slot is then held until the stop at the end of the day)
-    TICK_EXITS = True                        # True: target and stop-loss are also checked on every price tick of the live feed (FEED_TABLE) for the open positions only, not just on each 1-minute close.
-                                             # The candle check stays as the backup, and is used alone if the tick listener cannot be set up (it says so). Needs TARGET_PCT or STOP_PCT.
-    FEED_TABLE = "fo_market_data"            # the live feed: columns token, ltp, b0p (best bid), a0p (best ask) (raw price; the contract's own divisor from the master turns it into the price)
-    SPREAD_MAX = 0.30                        # entry and exit both wait for the live spread (best ask - ltp for a BUY-side order, ltp - best bid for a SELL-side order) to be at
-                                             # most this (in price units, after the divisor) before the LimitOrder is actually sent, instead of firing it the instant the signal passes.
-    SPREAD_WAIT_S = 60                       # how long an entry may wait for SPREAD_MAX before it is given up on (no trade this signal). An EXIT instead falls back to firing anyway
-                                             # at the best price seen once this runs out: a stop-loss/target must not just hang unsent.
-    CHASE_TRIES = 3                          # once a LimitOrder is resting, up to this many times it is re-priced ("apply", not a new subscribe) to the current best price, each time
-                                             # the spread is still SPREAD_MAX-ok AND the price has moved since the last one sent. After CHASE_TRIES it is cancelled (paused) and,
-                                             # for an entry, unsubscribed -- nothing more is tried for that signal.
-    CHASE_EVERY_S = 3                        # how often (seconds) a resting order's chase re-checks the best price
-    FAIL_COOLDOWN_S = 30
-    RETRY_RANKING_S = 20                     # a ranking read that fails (a rare clash with the update cycle: "Previous values requested or inconsistent") is tried again on the next candle batches
-                                             # for this many seconds instead of giving up on that stock for the whole bar. 0 = no retry
+    # Every value below is read from params.ini in this folder, section [meanrevert].
+    # Change a number there, not here; this block only names what the script needs.
+    PARAMS_SECTION = "meanrevert"
+    P = _params(PARAMS_SECTION)
+    print(f"{P.section}: {len(P)} parameters from {P.path}")
+    
+    USER = P["USER"]
+    STRATEGY = P["STRATEGY"]
+    BASKETS = P["BASKETS"]
+    TRADE_AS = P["TRADE_AS"]
+    LEVEL = P["LEVEL"]
+    REL_ZONE = P["REL_ZONE"]
+    ABS_DAYS = P["ABS_DAYS"]
+    ABS_ZONE = P["ABS_ZONE"]
+    RSI_BAR = P["RSI_BAR"]
+    RSI_N = P["RSI_N"]
+    RSI_HIGH = P["RSI_HIGH"]
+    RSI_LOW = P["RSI_LOW"]
+    RSI_LIVE = P["RSI_LIVE"]
+    ACT_ON_BAR_END = P["ACT_ON_BAR_END"]
+    HIST_DAYS = P["HIST_DAYS"]
+    TARGET_PCT = P["TARGET_PCT"]
+    STOP_PCT = P["STOP_PCT"]
+    TRAIL_TRIGGER_PCT = P["TRAIL_TRIGGER_PCT"]
+    PROFIT_LOCK_PCT = P["PROFIT_LOCK_PCT"]
+    TRAIL_STEP_PCT = P["TRAIL_STEP_PCT"]
+    ONE_ENTRY_PER_STOCK = P["ONE_ENTRY_PER_STOCK"]
+    QTY = P["QTY"]
+    ENTRY_VALUE = P["ENTRY_VALUE"]
+    ENGINE = P["ENGINE"]
+    WINDOW = (P.time("WINDOW_START"), P.time("WINDOW_END"))
+    EXIT_AT = P.time("EXIT_AT")
+    MAX_PORTFOLIOS = P["MAX_PORTFOLIOS"]
+    UNSUB_AFTER_S = P["UNSUB_AFTER_S"]
+    TICK_EXITS = P["TICK_EXITS"]
+    FEED_TABLE = P["FEED_TABLE"]
+    SPREAD_MAX = P["SPREAD_MAX"]
+    SPREAD_WAIT_S = P["SPREAD_WAIT_S"]
+    CHASE_TRIES = P["CHASE_TRIES"]
+    CHASE_EVERY_S = P["CHASE_EVERY_S"]
+    FAIL_COOLDOWN_S = P["FAIL_COOLDOWN_S"]
+    RETRY_RANKING_S = P["RETRY_RANKING_S"]
     # ==========================================================================
     REFS = ("pct_open", "pct_vwap")
     if not (all(0 <= ZONE[ref][0] < ZONE[ref][1] <= 100 for ZONE in (REL_ZONE, ABS_ZONE) for ref in REFS)
