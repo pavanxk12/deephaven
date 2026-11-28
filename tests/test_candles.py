@@ -37,7 +37,26 @@ def test_candle_ohlc_and_volume_delta():
     # first tick of the minute starts the candle; the next minute closes it
     assert out == [(1, 60, 10, 12, 9, 11, 40, 0.0)]          # volume 140 - first_vol 100
     agg.flush(180)
-    assert out[1] == (1, 120, 20, 20, 20, 20, 10)       # 150 - 140 carried from the previous candle
+    assert out[1] == (1, 120, 20, 20, 20, 20, 10, 0.0)  # 150 - 140 carried from the previous candle; CVD stays 0.0 because these ticks carry no ltq
+
+
+def test_cvd_is_the_tick_rule_running_total_of_ltq_and_carries_across_bars():
+    """CVD is built from `ltq` (each individual trade's size), not from the volume delta: +ltq on an up-tick,
+    -ltq on a down-tick, and an unchanged price keeps the direction of the last move. It is cumulative from
+    the start of the day -- a fresh aggregator is built each day -- so it is NOT reset at a bar boundary."""
+    out, emit = collect()
+    agg = CandleAggregator(emit, start_min=0)
+    for sec, price, vol, ltq in ((60, 10, 100, 5),      # the day's first tick: no previous price, so direction 0
+                                 (70, 12, 110, 3),      # up   -> +3
+                                 (80, 9, 130, 4),       # down -> -4
+                                 (90, 9, 134, 2)):      # unchanged -> keeps the last direction (down) -> -2
+        agg.tick(1, price, vol, sec, ltq)
+    agg.flush(120)
+    assert out[0][:7] == (1, 60, 10, 12, 9, 9, 34) and out[0][7] == -3.0
+
+    agg.tick(1, 11, 140, 125, 6)                        # up -> +6, carried on from -3
+    agg.flush(180)
+    assert out[1][7] == 3.0
 
 
 def test_ticks_before_start_build_nothing_but_track_volume():

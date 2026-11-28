@@ -147,7 +147,7 @@ def dh(monkeypatch):
 
 def test_the_master_picks_the_cash_the_rolling_future_or_the_month(dh):
     app, candles = dh
-    today_bars, _, _, _, contract_of = deephaven_readers(app)
+    today_bars, _, _, _, contract_of, *_ = deephaven_readers(app)
     today_bars(("cash", "SBIN"), TODAY)
     assert candles.where_expr == "token = 7"
     today_bars(("fut", "NIFTY"), "2026-03-09")

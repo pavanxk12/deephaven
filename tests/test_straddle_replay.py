@@ -64,6 +64,25 @@ def new_way(engine, ts, token, close, bucket, cadence, offset):
     return out
 
 
+def same_rows(a, b):
+    """Row lists are equal, counting NaN as equal to NaN. The straddle's last column is `IV`, which is NaN
+    whenever there are no option prices to imply it from -- as in these replays -- and plain `==` on the row
+    tuples would then be False even for byte-identical rows, because NaN != NaN."""
+    import math
+    if len(a) != len(b):
+        return False
+    for ra, rb in zip(a, b):
+        if len(ra) != len(rb):
+            return False
+        for x, y in zip(ra, rb):
+            if x is y or x == y:
+                continue
+            if isinstance(x, float) and isinstance(y, float) and math.isnan(x) and math.isnan(y):
+                continue
+            return False
+    return True
+
+
 @pytest.mark.parametrize("seed", range(6))
 @pytest.mark.parametrize("bucket,cadence", [(60, 60), (60, 300), (300, 300)])
 def test_same_rows_as_the_old_logic(seed, bucket, cadence):
@@ -71,7 +90,7 @@ def test_same_rows_as_the_old_logic(seed, bucket, cadence):
     a = old_way(StraddleEngine(defs(), StraddleConfig()), ts, tok, close, bucket, cadence, 2)
     eng = StraddleEngine(defs(), StraddleConfig())
     b = new_way(eng, ts, tok, close, bucket, cadence, 2)
-    assert a == b and len(a) > 0
+    assert same_rows(a, b) and len(a) > 0
 
 
 def test_the_prices_left_in_the_engine_are_identical_too():
@@ -79,7 +98,8 @@ def test_the_prices_left_in_the_engine_are_identical_too():
     e1, e2 = StraddleEngine(defs(), StraddleConfig()), StraddleEngine(defs(), StraddleConfig())
     old_way(e1, ts, tok, close, 60, 60, 2)
     new_way(e2, ts, tok, close, 60, 60, 2)
-    assert e1.px == e2.px and 999 not in e2.px
+    assert e1.px.keys() == e2.px.keys() and 999 not in e2.px
+    assert same_rows([e1.px[k] for k in e1.px], [e2.px[k] for k in e1.px])      # the prices themselves, NaN-aware
 
 
 def test_unsorted_candles_give_the_same_result():
@@ -87,7 +107,7 @@ def test_unsorted_candles_give_the_same_result():
     order = np.random.default_rng(0).permutation(len(ts))
     sorted_rows = new_way(StraddleEngine(defs(), StraddleConfig()), ts, tok, close, 60, 60, 2)
     shuffled = new_way(StraddleEngine(defs(), StraddleConfig()), ts[order], tok[order], close[order], 60, 60, 2)
-    assert sorted_rows == shuffled
+    assert same_rows(sorted_rows, shuffled)
 
 
 def test_nothing_comes_out_before_the_session_or_for_empty_input():

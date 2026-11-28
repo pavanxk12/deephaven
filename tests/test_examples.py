@@ -23,7 +23,32 @@ from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 from tests.test_nats_service import Wire
 from tests.test_lookup import session, tables  # noqa: F401  (pytest fixtures: a console with a master and candles)
 
-EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
+class _Examples:
+    """examples/, and the live scripts that now sit in examples/live/india/ and examples/live/us/.
+    `EXAMPLES / "14_us_directional_crossorder.py"` finds one wherever it lives, so a test does not
+    have to know which folder a script was moved into."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def __truediv__(self, name):
+        here = self.root / name
+        if here.exists():
+            return here
+        for sub in sorted(self.root.glob("live/*")):
+            there = sub / name
+            if there.exists():
+                return there
+        return here                      # missing: let the caller raise with the plain path
+
+    def __fspath__(self):
+        return str(self.root)
+
+    def __repr__(self):
+        return f"EXAMPLES({self.root})"
+
+
+EXAMPLES = _Examples(Path(__file__).resolve().parents[1] / "examples")
 
 OLD_STOCKS_SUB = {"T1": 0, "gtw": 32395, "PRNT": 1, "code": "", "ival": 1, "jval": 0.75, "side": "BUY", "sval": 3, "trp": 0,
                   "jqty1": 1, "jqty2": 1, "openq": 0, "maxqty": 0, "target": 1000, "maxloss": -1000, "stoploss": -1000,
@@ -36,7 +61,7 @@ def run_example(name, monkeypatch):
     calls, plugins = [], []
     ns = {n: (lambda *a, _n=n, **k: calls.append((_n, a, k))) for n in names}
     monkeypatch.setattr(algo, "current", lambda: types.SimpleNamespace(run=lambda p: plugins.append(p)))
-    src = (EXAMPLES / name).read_text(encoding="utf-8")
+    src = inline_params(EXAMPLES / name)        # the live scripts read params.ini; exec() of a string has no __file__, so the values are inlined
     exec(compile(src, name, "exec"), ns)
     return {c[0]: c for c in calls}, plugins, [c[0] for c in calls]
 
@@ -139,14 +164,66 @@ def console_with_services(tmp_path, monkeypatch, status="ok", history=None):
         app.tables["candles"] = FakeTable(pd.DataFrame({"token": [FUT] * len(history), "Close": [float(c) for c in history],
                                                         "Minute": [f"09:{15 + i:02d}" for i in range(len(history))]}))
     ns["candles"] = app.tables["candles"]
+    # The live scripts (08/14/20) gate every entry and exit on the live spread and chase the resting order,
+    # both driven by `fo_market_data`, and they read the REAL filled size from `orders_trade`. Without these
+    # two in the session a script says "live ticks not available" and never sends anything, so the harness
+    # provides them: `quote()` opens the spread gate, `fills()` reports what actually filled.
+    from tests.test_plugins_wiring import FakeTable
+    ns["fo_market_data"] = FakeTable("fo_market_data")
+    ns["orders_trade"] = FakeTable("orders_trade")
     return ns, app, svc, wire
 
 
+class Rows:
+    """One batch of added rows for a listener: Rows(token=[1], ltp=[100.0]). `modified` is empty, which is
+    what a script sees for a brand-new row; use Rows(..., modified=True) for an updated one (the live feed is
+    a last_by table, so every tick after a token's first arrives as a MODIFIED row)."""
+
+    def __init__(self, modified=False, **cols):
+        self.cols, self.is_mod = {k: list(v) for k, v in cols.items()}, modified
+
+    def _take(self, names):
+        return {n: self.cols.get(n, [None] * len(next(iter(self.cols.values())))) for n in names}
+
+    def added(self, names):
+        return None if self.is_mod else self._take(names)
+
+    def modified(self, names):
+        return self._take(names) if self.is_mod else None
+
+
+def listener_on(listeners, name):
+    """The handle whose table is the FakeTable called `name` (its chain returns the same object), newest first
+    so a re-paste gets the live one. None if that listener was never registered."""
+    for h in reversed(listeners):
+        t = getattr(h, "table", None)
+        if getattr(t, "name", None) == name and not h.stopped:
+            return h
+    return None
+
+
+def quote(listeners, token, ltp, bid=None, ask=None, modified=True):
+    """One tick of `token` on the feed: this is what opens the spread gate and drives the chase.
+    bid/ask default to ltp, i.e. a zero spread, which passes any SPREAD_MAX."""
+    h = listener_on(listeners, "fo_market_data")
+    assert h is not None, "the script did not listen to fo_market_data (spread gate / chase are off)"
+    h.fn(Rows(token=[int(token)], ltp=[float(ltp)],
+              b0p=[float(ltp if bid is None else bid)], a0p=[float(ltp if ask is None else ask)],
+              modified=modified), False)
+
+
+def fills(listeners, wire_pf, side, qty):
+    """A fill on `wire_pf` (USER * PF_PER_USER + the book's pf), as orders_trade reports it. The scripts net
+    these against the side that opened the portfolio, so this is also how a squareup's closing fill is told."""
+    h = listener_on(listeners, "orders_trade")
+    assert h is not None, "the script did not listen to orders_trade (it cannot see real fills)"
+    h.fn(Rows(PF=[int(wire_pf)], buy_sell=[int(side)], fill_quantity=[int(qty)],
+              fill_price=[0.0], token=[0]), False)
+
+
 def run_script(ns, name, **replace):
-    src = (EXAMPLES / name).read_text(encoding="utf-8")
-    for old, new in replace.items():
-        assert old in src, old
-        src = src.replace(old, new)
+    src = inline_params(EXAMPLES / name)        # the live scripts read params.ini; exec() of a string has no __file__, so the values are inlined
+    src = apply_replace(src, replace)
     exec(compile(src, name, "exec"), ns)
 
 
@@ -374,7 +451,7 @@ def test_the_multistrike_script_computes_its_rsi_from_the_futures_candles_only(t
 
 # ---- 01 and 02: plain function calls, run for real in an installed console ----------------------------------------------------
 def run_in_console(ns, name):
-    src = (EXAMPLES / name).read_text(encoding="utf-8")
+    src = inline_params(EXAMPLES / name)        # the live scripts read params.ini; exec() of a string has no __file__, so the values are inlined
     exec(compile(src, name, "exec"), ns)
 
 
@@ -571,3 +648,126 @@ def test_the_rsi_script_sends_nothing_while_it_is_off_and_pasting_it_again_keeps
     run_script(ns, "06_nifty_rsi_churning.py")                              # pasted again
     assert len(fake_dh) == 1 or all(w.stopped for w in fake_dh[:-1]) if hasattr(fake_dh[0], "stopped") else True
     svc.on_stop()
+
+
+# ---- the live scripts read their parameters from params.ini (examples/live/*/params.ini) -----------
+# The tests below were written against the older scripts, which held those values as literals in a
+# USER INPUT block, and they patch them by rewriting that text (BASKETS, WINDOW, EXIT_AT, ...).
+# inline_params() puts the literals back: it reads the script's own section of params.ini and writes
+# each value into the block in the shape it used to have, and drops the reader with it. The script
+# under test then needs no params.ini at all, and every regex in these tests keeps working.
+def _py(v):
+    """A value as the scripts used to spell it: double-quoted strings, so '"strategyname": "LimitOrder"'
+    still matches, and real Python for True / None / tuples (which json would get wrong)."""
+    if isinstance(v, str):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if isinstance(v, dict):
+        return "{" + ", ".join(f"{_py(k)}: {_py(x)}" for k, x in v.items()) + "}"
+    if isinstance(v, list):
+        return "[" + ", ".join(_py(x) for x in v) + "]"
+    if isinstance(v, tuple):
+        return "(" + ", ".join(_py(x) for x in v) + ("," if len(v) == 1 else "") + ")"
+    return repr(v)
+
+
+def _dtime_call(text):
+    return "dtime(" + ", ".join(str(int(x)) for x in str(text).strip().split(":")) + ")"
+
+
+def inline_params(path):
+    """The script's source with its params.ini values written back in as literals."""
+    import ast as _ast
+    import configparser
+    import re as _re
+    from pathlib import Path as _Path
+
+    path = _Path(path)
+    src = path.read_text(encoding="utf-8")
+    lines = src.splitlines(keepends=True)
+
+    opens = [n for n, l in enumerate(lines) if _re.match(r"^(\s*)# =+ USER INPUT =+\s*$", l)]
+    if not opens:
+        return src                                          # a script with no USER INPUT block: nothing to inline
+    start = opens[0]
+    ind = _re.match(r"^(\s*)#", lines[start]).group(1)
+    close = next(n for n, l in enumerate(lines) if n > start and _re.match(r"^\s*# ={20,}\s*$", l))
+
+    sec = _re.search(r'PARAMS_SECTION = "([^"]+)"', "".join(lines[start:close]))
+    if sec is None:
+        return src                                          # a script that still holds its own literals
+    section = sec.group(1)
+
+    cfg = configparser.ConfigParser(inline_comment_prefixes=None, interpolation=None)
+    cfg.optionxform = str
+    with open(path.parent / "params.ini", encoding="utf-8") as fh:
+        cfg.read_file(fh)
+    raw = dict(cfg.items(section))
+
+    def value(key):
+        text = raw[key].strip()
+        try:                                                # dict(a=1) too, as the scripts' own reader allows
+            class _D(_ast.NodeTransformer):
+                def visit_Call(self, n):
+                    self.generic_visit(n)
+                    if isinstance(n.func, _ast.Name) and n.func.id == "dict" and not n.args:
+                        return _ast.Dict([_ast.Constant(k.arg) for k in n.keywords], [k.value for k in n.keywords])
+                    raise ValueError("only dict(...)")
+            return _py(_ast.literal_eval(_ast.fix_missing_locations(_D().visit(_ast.parse(text, mode="eval")))))
+        except (ValueError, SyntaxError, TypeError):
+            return text                                     # a time: handled by the caller
+
+    out = []
+    for line in lines[start + 1:close]:
+        body = line.strip()
+        if not body or body.startswith("#") or body.startswith("PARAMS_SECTION") \
+                or body.startswith("P = _params"):
+            continue
+        m = _re.match(r'^([A-Z][A-Z0-9_]*) = P\["([A-Z0-9_]+)"\]$', body)
+        if m:
+            out.append(f"{ind}{m.group(1)} = {value(m.group(2))}\n")
+            continue
+        m = _re.match(r'^([A-Z][A-Z0-9_]*) = _ptime\(P, "([A-Z0-9_]+)"\)$', body)
+        if m:
+            out.append(f"{ind}{m.group(1)} = {_dtime_call(raw[m.group(2)])}\n")
+            continue
+        m = _re.match(r'^([A-Z][A-Z0-9_]*) = \(_ptime\(P, "([A-Z0-9_]+)"\), _ptime\(P, "([A-Z0-9_]+)"\)\)$', body)
+        if m:
+            out.append(f"{ind}{m.group(1)} = ({_dtime_call(raw[m.group(2)])}, {_dtime_call(raw[m.group(3)])})\n")
+            continue
+        out.append(line)                                    # anything the generator left alone
+
+    reader = next((n for n, l in enumerate(lines) if l.strip().startswith("_INI_NAME =")), start)
+    return "".join(lines[:reader]) + lines[start] + "".join(out) + "".join(lines[close:])
+
+
+def apply_replace(src, replace):
+    """The {old: new} parameter edits these tests use. `old` may be the exact text, as it always could be,
+    or just the assignment it names: the live scripts now read their values from params.ini, so a line no
+    longer carries the comment padding many of these keys were written against ("ABS_DAYS = 22      ").
+    A key of the form "NAME = ..." therefore replaces that whole assignment line inside the USER INPUT
+    block, and "A, B = x, y" replaces A's line and drops B's."""
+    import re as _re
+
+    for old, new in replace.items():
+        if old in src:                                           # the exact text is still there: as before
+            src = src.replace(old, new)
+            continue
+
+        m = _re.match(r"\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*=(?!=)", old)
+        assert m, f"not an assignment, and not in the script: {old!r}"
+        names = [n.strip() for n in m.group(1).split(",")]
+
+        lo, hi = 0, len(src)                                     # keep to the parameter block if there is one
+        o = _re.search(r"^[ \t]*# =+ USER INPUT =+[ \t]*$", src, _re.M)
+        if o:
+            c = _re.search(r"^[ \t]*# ={20,}[ \t]*$", src[o.end():], _re.M)
+            lo, hi = o.end(), o.end() + (c.start() if c else 0)
+
+        head, body, tail = src[:lo], src[lo:hi], src[hi:]
+        first = _re.compile(rf"^([ \t]*){_re.escape(names[0])}[ \t]*=(?!=)[^\n]*\n", _re.M)
+        assert first.search(body), f"{names[0]} is not set in the script: {old!r}"
+        body = first.sub(lambda mm: f"{mm.group(1)}{new.strip()}\n", body, count=1)
+        for extra in names[1:]:                                  # A, B = x, y -> A's line carries both now
+            body = _re.sub(rf"^[ \t]*{_re.escape(extra)}[ \t]*=(?!=)[^\n]*\n", "", body, count=1, flags=_re.M)
+        src = head + body + tail
+    return src

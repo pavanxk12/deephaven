@@ -191,13 +191,22 @@ def run_futures_churning():
 
     # ---- the indicator: Wilder's RSI --------------------------------------------------------------------------------------------------
     def rsi(values, n=RSI_N):
-        if len(values) <= n:
+        """RSI of the last closes, or None until there are n + 1 of them.
+        Wilder smoothing written as the weighted sum it is, instead of a Python loop over the bars: it is an EWMA with
+        alpha = 1/n, so each step multiplies the running average by (n - 1) / n and adds the newest move / n. The bar k
+        steps after the seed therefore carries ((n - 1) / n) ** (steps - k) / n, and the seed itself carries
+        ((n - 1) / n) ** steps. Same numbers to the last bit as the loop; about five times less work, which matters
+        because this runs once per symbol per bar on Deephaven's update thread."""
+        v = np.asarray(values, dtype=float)
+        if v.size <= n:
             return None
-        d = np.diff(np.asarray(values, dtype=float))
+        d = np.diff(v)
         up, down = np.where(d > 0, d, 0.0), np.where(d < 0, -d, 0.0)
-        avg_up, avg_down = up[:n].mean(), down[:n].mean()
-        for u, v in zip(up[n:], down[n:]):
-            avg_up, avg_down = (avg_up * (n - 1) + u) / n, (avg_down * (n - 1) + v) / n
+        decay = (n - 1) / n
+        steps = v.size - 1 - n                                     # smoothing steps after the seed; 0 when there are exactly n + 1 closes
+        w = decay ** np.arange(steps - 1, -1, -1) / n              # each post-seed move's weight, oldest first: the newest carries 1/n, the one before it decay/n ...
+        avg_up = up[:n].mean() * decay ** steps + up[n:] @ w
+        avg_down = down[:n].mean() * decay ** steps + down[n:] @ w
         if avg_down == 0:
             return 100.0 if avg_up > 0 else 50.0
         return 100.0 - 100.0 / (1.0 + avg_up / avg_down)

@@ -110,7 +110,7 @@ def test_a_price_is_carried_forward_only_for_max_age_minutes():
 def test_a_day_holds_the_close_the_running_vwap_sums_and_the_open():
     d = build_day([0, 1, 5], [10, 11, 15], [12, 13, 16], [9, 10, 14], [11, 12, 15], [100, 200, 300], 8, 2)
     assert d.open == 10 and np.allclose(d.close, [11, 12, 12, 12, nan, 15, 15, 15], equal_nan=True)
-    typ = [(12 + 9 + 11) / 3, (13 + 10 + 12) / 3, (16 + 14 + 15) / 3]
+    typ = [(10 + 12 + 9 + 11) / 4, (11 + 13 + 10 + 12) / 4, (15 + 16 + 14 + 15) / 4]      # OHLC4, not (H+L+C)/3
     assert np.allclose(d.cum_v, [100, 300, 300, 300, 300, 600, 600, 600]) and np.isclose(d.pv, 100 * typ[0] + 200 * typ[1] + 300 * typ[2], rtol=1e-6)
     assert build_day([-3, 999], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1], 8, 2) is None             # nothing inside the session
 

@@ -12,14 +12,14 @@ from algo.core.config import NSE
 from algo.data.master import classify, normalise
 from algo.series.absolute import Absolute, Relative
 from tests.conftest import secs
-from tests.test_examples import EXAMPLES, FUT, Update, console_with_services, wait_for
+from tests.test_examples import apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 
 pa = pytest.importorskip("pyarrow")
 import pyarrow.parquet as pq  # noqa: E402
 
-RSI = (EXAMPLES / "11_india_fut_rsi_crossorder.py").read_text(encoding="utf-8")
-Z = (EXAMPLES / "12_india_fut_zscore_crossorder.py").read_text(encoding="utf-8")
+RSI = inline_params(EXAMPLES / "11_india_fut_rsi_crossorder.py")
+Z = inline_params(EXAMPLES / "12_india_fut_zscore_crossorder.py")
 ENGINE_NAME = re.search(r'^    ENGINE = [{]"strategyname": "([^"]+)"', RSI, re.M).group(1)                                       # whatever plugin name the owner has typed (CrossOrder or single)
 USER_ID = int(re.search(r"^    USER = (\d+)", RSI, re.M).group(1))
 ALWAYS_OPEN = "WINDOW = (dtime(0, 0), dtime(23, 59, 59))"
@@ -62,14 +62,12 @@ def start(src_text, name, tmp_path, monkeypatch, unders=STOCKS, rel=None, extra_
     src_text = re.sub(r"^    ONLY = \[.*?\]", "    ONLY = []", src_text, count=1, flags=re.M | re.S)                    # the owner's own list of stocks: the tests use the fake futures
     src_text = re.sub(r"^    SECTOR_BASKETS = \{.*?\n    \}", f"    SECTOR_BASKETS = {{\"all\": {list(unders)!r}}}", src_text, count=1, flags=re.M | re.S)   # one basket of the fake futures
     src = re.sub(r"^    WINDOW = \(dtime\([^)]*\), dtime\([^)]*\)\)", f"    {ALWAYS_OPEN}", src_text, count=1, flags=re.M)        # whatever hours the script owns, tests run all day
-    src = src.replace("EXIT_AT = dtime(15, 15)", "EXIT_AT = dtime(23, 59, 59)")
+    src = re.sub(r"EXIT_AT = dtime\([^)]*\)", "EXIT_AT = dtime(23, 59, 59)", src)      # whatever the owner typed -> late, so the real clock never matters
     if "ACT_ON_BAR_END = True" not in replace:                                                      # the older tests feed any number of candles: they look at every minute
         src = src.replace("ACT_ON_BAR_END = True", "ACT_ON_BAR_END = False")
-    for old, new in replace.items():
-        if old == "N_BASKETS = 4" and old not in src:                                                  # scripts with SECTOR_BASKETS (one basket of the fake futures already) have no N_BASKETS
-            continue
-        assert old in src, old
-        src = src.replace(old, new)
+    replace = {k: v for k, v in replace.items()
+               if not (k == "N_BASKETS = 4" and "N_BASKETS" not in src)}                               # scripts with SECTOR_BASKETS (one basket of the fake futures already) have no N_BASKETS
+    src = apply_replace(src, replace)
     before = set(ns)
     exec(compile(src, name, "exec"), ns)
     return ns, app, svc, wire, saved, relative_calls, before
@@ -245,7 +243,7 @@ def test_no_entry_while_the_script_holds_as_many_portfolios_as_allowed(tmp_path,
     svc.on_stop()
 
 
-@pytest.mark.parametrize("text", [RSI, Z, (EXAMPLES / "08_us_basket_rsi_crossorder.py").read_text(encoding="utf-8"), (EXAMPLES / "10_us_zscore_crossorder.py").read_text(encoding="utf-8")], ids=["11", "12", "08", "10"])
+@pytest.mark.parametrize("text", [RSI, Z, inline_params(EXAMPLES / "08_us_basket_rsi_crossorder.py"), inline_params(EXAMPLES / "10_us_zscore_crossorder.py")], ids=["11", "12", "08", "10"])
 def test_all_four_scripts_release_a_closed_portfolio_and_have_the_limit(text):
     import re as _re
     assert _re.search(r"^    MAX_PORTFOLIOS = \d+", text, _re.M) and _re.search(r"^    UNSUB_AFTER_S = \d+", text, _re.M)             # whatever numbers the owner has typed
@@ -318,7 +316,7 @@ def test_the_tick_exit_edits_the_token_table_from_a_worker_thread_and_a_tick_clo
     svc.on_stop()
 
 
-@pytest.mark.parametrize("text", [RSI, Z, (EXAMPLES / "13_india_directional_crossorder.py").read_text(encoding="utf-8")], ids=["11", "12", "13"])
+@pytest.mark.parametrize("text", [RSI, Z, inline_params(EXAMPLES / "13_india_directional_crossorder.py")], ids=["11", "12", "13"])
 def test_the_india_scripts_have_the_one_entry_per_stock_rule(text):
     for needle in ("ONE_ENTRY_PER_STOCK = True", "entered.add(token)", "entered.discard(token)", "ONE_ENTRY_PER_STOCK and token in entered"):
         assert needle in text, needle
@@ -365,7 +363,7 @@ ALL_SIX = ["08_us_basket_rsi_crossorder.py", "10_us_zscore_crossorder.py", "11_i
 
 @pytest.mark.parametrize("name", ALL_SIX, ids=[n[:2] for n in ALL_SIX])
 def test_every_ranking_script_retries_a_failed_ranking_and_counts_where_signals_go(name):
-    text = (EXAMPLES / name).read_text(encoding="utf-8")
+    text = inline_params(EXAMPLES / name)
     for needle in ("RETRY_RANKING_S = 20", "def ranking_failed(token, first, e):", "retry[token] = first", "due = list(retry.items())", 'count("signals")' if name[:2] in ("08", "10", "11", "12") else 'count("looked at")',
                    'count("entered")', 'count("ranking errors")', '"   signals: "'):
         assert needle in text, (name, needle)

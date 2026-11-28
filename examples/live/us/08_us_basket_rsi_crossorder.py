@@ -56,31 +56,45 @@ def run_meanrevert():
     
     def _params(section):
         """Every USER INPUT value of this script, from params.ini, section [section]. Values are Python
-        literals (ast.literal_eval): numbers, strings, True/False/None, lists, tuples, dicts. A value that is
-        not a literal is kept as text, which is how a time like 15:45 survives for P.time(). '#' is NOT an
-        inline comment here, so a value keeps any '#' it contains; put comments on their own line.
+        literals: numbers, strings, True/False/None, lists, tuples, dicts, and dict(a=1) -- no other call is
+        accepted, so a params.ini can never run anything. A value that is not a literal is kept as text, which
+        is how a time like 15:45 survives for _ptime(). '#' is NOT an inline comment here, so a value keeps any
+        '#' it contains; put comments on their own line.
         init.py exec()s this script, so __file__ may not exist: the file is looked for in $ALGO_PARAMS, then
         the container's strategies folder, then beside this script, then the working directory."""
         import ast, configparser, os
     
-        def _lit(text):
-            """A Python literal, also allowing dict(a=1, b=2) -- the shape the scripts already used. No other
-            call is accepted, so a params.ini can never run anything."""
-            class _D(ast.NodeTransformer):
-                def visit_Call(self, n):
-                    self.generic_visit(n)
-                    if isinstance(n.func, ast.Name) and n.func.id == "dict" and not n.args:
-                        return ast.Dict([ast.Constant(kw.arg) for kw in n.keywords], [kw.value for kw in n.keywords])
-                    raise ValueError("only dict(...) may be called in a value")
-            tree = _D().visit(ast.parse(text.strip(), mode="eval"))
-            return ast.literal_eval(ast.fix_missing_locations(tree))
-        _here = globals().get("__file__")
-        cands = [os.environ.get("ALGO_PARAMS", ""),
-                 "/app/scripts/strategies/" + _INI_NAME,
-                 os.path.join(os.path.dirname(os.path.abspath(_here)), _INI_NAME) if _here else "",
-                 _INI_NAME]
-        path = next((p for p in cands if p and os.path.isfile(p)), None)
-        if path is None:
+        def value_of(n):
+            """One parsed node as a value. Literals, and dict(a=1) because the scripts already spelled some
+            settings that way. Any other call, name or operator is refused, so nothing in a params.ini runs."""
+            if isinstance(n, ast.Constant):
+                return n.value
+            if isinstance(n, ast.Dict):
+                return {value_of(k): value_of(v) for k, v in zip(n.keys, n.values)}
+            if isinstance(n, ast.List):
+                return [value_of(x) for x in n.elts]
+            if isinstance(n, ast.Tuple):
+                return tuple(value_of(x) for x in n.elts)
+            if isinstance(n, ast.Set):
+                return {value_of(x) for x in n.elts}
+            if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd)):
+                v = value_of(n.operand)                                # -2000, -0.1 ...
+                return -v if isinstance(n.op, ast.USub) else +v
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "dict" and not n.args:
+                return {kw.arg: value_of(kw.value) for kw in n.keywords}
+            raise ValueError(f"not a literal: {ast.dump(n)[:60]}")
+    
+        def literal(text):
+            return value_of(ast.parse(text.strip(), mode="eval").body)
+    
+        here = globals().get("__file__")
+        for path in (os.environ.get("ALGO_PARAMS", ""),
+                     "/app/scripts/strategies/" + _INI_NAME,
+                     os.path.join(os.path.dirname(os.path.abspath(here)), _INI_NAME) if here else "",
+                     _INI_NAME):
+            if path and os.path.isfile(path):
+                break
+        else:
             raise FileNotFoundError(f"{_INI_NAME} not found: looked at $ALGO_PARAMS, /app/scripts/strategies/, "
                                     f"beside this script, and {os.getcwd()}")
         cfg = configparser.ConfigParser(inline_comment_prefixes=None, interpolation=None)
@@ -89,35 +103,29 @@ def run_meanrevert():
             cfg.read_file(fh)
         if not cfg.has_section(section):
             raise KeyError(f"{path}: no section [{section}]; it has {cfg.sections()}")
-    
-        class _P(dict):
-            path, section = "", ""
-            def __missing__(self, k):
-                raise KeyError(f"{self.path} [{self.section}]: {k} is not set")
-            def time(self, k):
-                """A HH:MM or HH:MM:SS value as a datetime.time."""
-                from datetime import time as _t
-                parts = [int(x) for x in str(self[k]).strip().split(":")]
-                if not 2 <= len(parts) <= 3:
-                    raise ValueError(f"{self.path} [{self.section}]: {k} = {self[k]!r} is not HH:MM")
-                return _t(*parts)
-    
-        out = _P()
-        out.path, out.section = path, section
-        for k, v in cfg.items(section):
-            v = v.strip()
+        out = {}
+        for key, text in cfg.items(section):
+            text = text.strip()
             try:
-                out[k] = _lit(v)
+                out[key] = literal(text)
             except (ValueError, SyntaxError, TypeError):
-                out[k] = v                                             # a time like 15:45, or plain text
+                out[key] = text                                        # a time like 15:45, or plain text
+        print(f"{section}: {len(out)} parameters from {path}")
         return out
+    
+    def _ptime(P, key):
+        """A HH:MM or HH:MM:SS value from params.ini as a datetime.time."""
+        from datetime import time as _t
+        parts = [int(x) for x in str(P[key]).strip().split(":")]
+        if not 2 <= len(parts) <= 3:
+            raise ValueError(f"params.ini: {key} = {P[key]!r} is not HH:MM")
+        return _t(*parts)
     
     # =============================== USER INPUT ===============================
     # Every value below is read from params.ini in this folder, section [meanrevert].
     # Change a number there, not here; this block only names what the script needs.
     PARAMS_SECTION = "meanrevert"
     P = _params(PARAMS_SECTION)
-    print(f"{P.section}: {len(P)} parameters from {P.path}")
     
     USER = P["USER"]
     STRATEGY = P["STRATEGY"]
@@ -143,10 +151,11 @@ def run_meanrevert():
     QTY = P["QTY"]
     ENTRY_VALUE = P["ENTRY_VALUE"]
     ENGINE = P["ENGINE"]
-    WINDOW = (P.time("WINDOW_START"), P.time("WINDOW_END"))
-    EXIT_AT = P.time("EXIT_AT")
+    WINDOW = (_ptime(P, "WINDOW_START"), _ptime(P, "WINDOW_END"))
+    EXIT_AT = _ptime(P, "EXIT_AT")
     MAX_PORTFOLIOS = P["MAX_PORTFOLIOS"]
     UNSUB_AFTER_S = P["UNSUB_AFTER_S"]
+    EXIT_SETTLE_TRIES = P["EXIT_SETTLE_TRIES"]
     TICK_EXITS = P["TICK_EXITS"]
     FEED_TABLE = P["FEED_TABLE"]
     SPREAD_MAX = P["SPREAD_MAX"]
@@ -318,14 +327,22 @@ def run_meanrevert():
 
     # ---- the indicator: Wilder's RSI ------------------------------------------------------------------------------------------------
     def rsi(values, n=RSI_N):
-        """RSI of the last closes, or None until there are n + 1 of them."""
-        if len(values) <= n:
+        """RSI of the last closes, or None until there are n + 1 of them.
+        Wilder smoothing written as the weighted sum it is, instead of a Python loop over the bars: it is an EWMA with
+        alpha = 1/n, so each step multiplies the running average by (n - 1) / n and adds the newest move / n. The bar k
+        steps after the seed therefore carries ((n - 1) / n) ** (steps - k) / n, and the seed itself carries
+        ((n - 1) / n) ** steps. Same numbers to the last bit as the loop; about five times less work, which matters
+        because this runs once per symbol per bar on Deephaven's update thread."""
+        v = np.asarray(values, dtype=float)
+        if v.size <= n:
             return None
-        d = np.diff(np.asarray(values, dtype=float))
+        d = np.diff(v)
         up, down = np.where(d > 0, d, 0.0), np.where(d < 0, -d, 0.0)
-        avg_up, avg_down = up[:n].mean(), down[:n].mean()
-        for u, v in zip(up[n:], down[n:]):
-            avg_up, avg_down = (avg_up * (n - 1) + u) / n, (avg_down * (n - 1) + v) / n
+        decay = (n - 1) / n
+        steps = v.size - 1 - n                                     # smoothing steps after the seed; 0 when there are exactly n + 1 closes
+        w = decay ** np.arange(steps - 1, -1, -1) / n              # each post-seed move's weight, oldest first: the newest carries 1/n, the one before it decay/n ...
+        avg_up = up[:n].mean() * decay ** steps + up[n:] @ w
+        avg_down = down[:n].mean() * decay ** steps + down[n:] @ w
         if avg_down == 0:
             return 100.0 if avg_up > 0 else 50.0
         return 100.0 - 100.0 / (1.0 + avg_up / avg_down)
@@ -415,6 +432,44 @@ def run_meanrevert():
             return None
     at_limit_said = []                                             # the "at the limit" message is printed once until a slot frees
 
+    def release_exit(pf, token, qty, attempt=1):
+        """The exit portfolio, UNSUB_AFTER_S after its ack. An unsubscribe destroys the plugin instance and any order still working with it, so this only lets go once
+        the exit has actually filled. While the fills are short it waits again (up to EXIT_SETTLE_TRIES waits in all); if they never come it cancels what is left,
+        gives the slot back, and puts the position back to "open" with the amount still uncovered, so the next signal or tick exit sends a fresh exit. Before this, a
+        forced exit that never filled was unsubscribed anyway and the entry's shares were left open with nothing watching them until the time exit."""
+        got = filled.get(pf, 0)
+        if qty <= 0 or got >= qty:                                 # done: the position really is closed
+            position.pop(token, None)
+            maybe_untrack(token)
+            if UNSUB_AFTER_S is None:
+                live.discard(pf)                                   # the owner asked for the slot to be held until the stop
+            else:
+                release(pf, token)
+            return
+        if attempt < EXIT_SETTLE_TRIES:
+            print(f"{symbol_of[token]}: exit PF {pf} has filled {got} of {qty}; waiting before its unsubscribe ({attempt} of {EXIT_SETTLE_TRIES})")
+            timer = threading.Timer(UNSUB_AFTER_S if UNSUB_AFTER_S is not None else 60.0,
+                                    release_exit, (pf, token, qty, attempt + 1))
+            timer.daemon = True
+            timer.start()
+            return
+        chase.pop(pf, None)
+        send_cancel(pf)                                            # whatever is still resting goes, then the slot
+        if UNSUB_AFTER_S is None:
+            live.discard(pf)
+        else:
+            release(pf, token)
+        left = qty - got
+        pos = position.get(token)
+        if pos is not None:
+            pos["qty"], pos["state"] = left, "open"                # STILL OPEN: armed again on the next signal or tick exit
+            pos["closed"] = pos.get("closed", 0) + got             # so the next exit asks for what is left, not for the whole entry again
+            pos.pop("exit_pf", None)
+            pos.pop("exit_qty", None)
+            print(f"{symbol_of[token]}: exit PF {pf} filled only {got} of {qty} after {EXIT_SETTLE_TRIES} waits; {left} is STILL OPEN and will be exited again")
+        else:
+            print(f"{STRATEGY}: exit PF {pf} filled {got} of {qty} and the position is already gone; {left} may still be open -- check the book")
+
     def release(pf, token):
         """Unsubscribe a portfolio whose position is closed. It destroys the plugin instance, which frees one of the engine's slots (a squareup alone leaves it there, idle)."""
         try:
@@ -459,12 +514,16 @@ def run_meanrevert():
             arm_exit(token, f"{why} (tick)")
 
     def chase_check(pf):
-        """One CHASE_EVERY_S check of a resting order: re-price it (an "apply") if the spread is still ok AND the price moved since the last one sent; cancel (and, for an
-        entry, unsubscribe) once CHASE_TRIES is used up. Exit-side chasing is symmetric here, but the engine's LimitOrder plugin only actually MODIFYs an ENTRY order --
-        an exit's "apply" calls are harmless no-ops there (SquareUpEvent orders are never modified), kept only so an exit is cancelled the same way after CHASE_TRIES."""
+        """One check of a resting order, at most one re-price ("apply") every CHASE_EVERY_S: re-price it if the spread is still ok AND the price moved since the
+        last one sent; cancel (and, for an entry, unsubscribe) once CHASE_TRIES is used up. An EXIT is chased for real: it is a fresh `subscribe` on its own portfolio, so
+        that plugin instance is in its ENTRY state and onParamsUpdate MODIFYs its order exactly like an entry's. (Only a `squareup` order cannot be modified, and these
+        scripts never send one.) A FORCED exit does not wait for the spread -- it was forced because the spread never tightened."""
         c = chase.get(pf)
         if c is None:
             return
+        if time.time() - c["last"] < CHASE_EVERY_S:
+            return                                                  # on_tick calls this on EVERY tick of the token, so without this gate all CHASE_TRIES re-prices
+                                                                    # could be spent inside a fraction of a second on a fast-moving stock
         st = pf_state(pf)
         if st is not None and (st.paused or st.squared):            # the LimitOrder plugin's PauseUnPauseEvent(False) is a NO-OP ("staying paused until params are
             chase.pop(pf, None)                                     # sent again"), so an "apply" from the chase would UN-PAUSE it and re-arm the entry the
@@ -493,14 +552,19 @@ def run_meanrevert():
                     position.pop(c["token"], None)
                     maybe_untrack(c["token"])
             return
-        if not spread_ok(c["token"], c["side"]):
-            return                                                # spread went bad again: wait, this check doesn't count as a try
+        if not spread_ok(c["token"], c["side"]) and not c["forced"]:
+            return                                                # spread went bad again: wait, this check doesn't count as a try. A forced exit is exempt: its
+                                                                  # spread is bad by definition, so waiting for it would stall the chase of the one order that
+                                                                  # most needs to be re-priced -- a stop-loss already past its level
+        if not spread_ok(c["token"], c["side"]) and c["tries"] == 0 and c["kind"] == "exit":
+            print(f"{symbol_of[c['token']]}: chasing the forced exit on PF {pf} with the spread still wide")
         price = best_price(c["token"], c["side"])
         if price == c["price"]:
             return                                                # unchanged: wait, doesn't count as a try either
         send_modify(pf, c["qty"], price)
         c["price"] = price
         c["tries"] += 1
+        c["last"] = time.time()
 
     def maybe_untrack(token):
         """Stop following a token's ticks once nothing still needs them: no pending entry/exit, no open position, no live chase."""
@@ -541,7 +605,8 @@ def run_meanrevert():
         pf_side[pf] = side
         entered.add(token)
         position[token] = {"side": side, "entry": last_px[token], "qty": qty, "pf": pf, "state": "entering", "trailing": False, "lock": None}
-        chase[pf] = {"token": token, "side": side, "qty": qty, "price": price, "tries": 0, "kind": "entry"}
+        chase[pf] = {"token": token, "side": side, "qty": qty, "price": price, "tries": 0, "kind": "entry",
+                     "last": time.time(), "forced": False}      # `last`: CHASE_EVERY_S is measured from the last re-price, not from every tick
         print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {qty} lot(s) at {price} (LimitOrder) on PF {pf}")
         send_place(pf, token, side, qty, price).add_done_callback(lambda f: settled(token, f))
         return True
@@ -571,9 +636,10 @@ def run_meanrevert():
         live.add(pf)
         pf_side[pf] = closing_side
         pos["state"] = "exiting"
-        chase[pf] = {"token": token, "side": closing_side, "qty": qty, "price": price, "tries": 0, "kind": "exit"}
+        chase[pf] = {"token": token, "side": closing_side, "qty": qty, "price": price, "tries": 0, "kind": "exit",
+                     "last": time.time(), "forced": bool(forced)}   # a forced exit chases even while the spread is bad: that is why it was forced
         print(f"{symbol_of[token]}: closing {qty} on NEW PF {pf} at {price}{' (forced, spread never tightened)' if forced else ''}")
-        send_place(pf, token, closing_side, qty, price).add_done_callback(lambda f: settled_exit(token, pf, f))
+        send_place(pf, token, closing_side, qty, price).add_done_callback(lambda f: settled_exit(token, pf, f, qty))
 
     def arm_exit(token, why):
         if token in pending_exit:
@@ -588,7 +654,7 @@ def run_meanrevert():
             position.pop(token, None)
             maybe_untrack(token)
             return
-        qty_open = filled.get(pos["pf"], 0)
+        qty_open = filled.get(pos["pf"], 0) - pos.get("closed", 0)      # the entry's own fills, less whatever an earlier exit of this position already closed
         if qty_open <= 0:
             print(f"{symbol_of[token]}: {why}, but PF {pos['pf']} shows no confirmed fill yet; nothing to close")
             position.pop(token, None)
@@ -736,7 +802,7 @@ def run_meanrevert():
             entered.discard(token)                                 # nothing was opened: this stock may still be entered
             print(f"{symbol_of[token]}: entry FAILED ({why}); nothing is open")
 
-    def settled_exit(token, pf, future):
+    def settled_exit(token, pf, future, qty=0):
         """The exit's own pf answered (called from the NATS thread)."""
         try:
             ok = bool(future.result().ok)
@@ -744,14 +810,14 @@ def run_meanrevert():
         except Exception as e:
             ok, why = False, repr(e)
         if ok:
-            position.pop(token, None)                              # ack, not fill (the same approximation already used for entries): treated as closed from here
-            maybe_untrack(token)
-            if UNSUB_AFTER_S is not None:
-                timer = threading.Timer(UNSUB_AFTER_S, release, (pf, token))        # the slot is freed a little later: the plugin may still be filling it
-                timer.daemon = True
-                timer.start()
-            else:
-                live.discard(pf)
+            pos = position.get(token)
+            if pos is not None:                                    # an ack only says the order is WORKING. The position is NOT dropped here any more: it stays in
+                pos["state"] = "exiting"                           # "exiting" until the fills are in, so an exit that half-fills or never fills cannot be forgotten
+                pos["exit_pf"], pos["exit_qty"] = pf, qty          # while the entry portfolio still holds the shares
+            timer = threading.Timer(UNSUB_AFTER_S if UNSUB_AFTER_S is not None else 60.0,
+                                    release_exit, (pf, token, qty, 1))              # checks the fills before it lets the portfolio go
+            timer.daemon = True
+            timer.start()
         else:
             live.discard(pf)
             chase.pop(pf, None)

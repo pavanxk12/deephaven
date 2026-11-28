@@ -9,11 +9,11 @@ import numpy as np
 import pytest
 
 from algo.series.absolute import Absolute, Relative
-from tests.test_examples import EXAMPLES, FUT, console_with_services, wait_for
+from tests.test_examples import apply_replace, inline_params, EXAMPLES, FUT, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 from tests.test_us_basket_rsi import ALWAYS_OPEN, MY_BASKET, basket_block, feed
 
-SCRIPT = (EXAMPLES / "10_us_zscore_crossorder.py").read_text(encoding="utf-8")
+SCRIPT = inline_params(EXAMPLES / "10_us_zscore_crossorder.py")
 OPEN_WINDOW = re.search(r"WINDOW = [(]dtime[(]\d+, \d+[)], dtime[(]\d+, \d+[)][)]", SCRIPT).group(0)
 TODAY = date(2026, 10, 21)
 
@@ -52,10 +52,8 @@ def start(tmp_path, monkeypatch, pct, hist_dates=None, window=ALWAYS_OPEN, **rep
     ns["basket"] = lambda *a, **k: None
     _, b0, b1 = basket_block(SCRIPT)
     src = (SCRIPT[:b0] + MY_BASKET + SCRIPT[b1:]).replace(OPEN_WINDOW, window)
-    src = src.replace("EXIT_AT = dtime(15, 55)", "EXIT_AT = dtime(23, 59, 59)")                       # the real clock never matters here
-    for old, new in replace.items():
-        assert old in src, old
-        src = src.replace(old, new)
+    src = re.sub(r"EXIT_AT = dtime\([^)]*\)", "EXIT_AT = dtime(23, 59, 59)", src)                       # the real clock never matters here
+    src = apply_replace(src, replace)
     exec(compile(src, "10_us_zscore_crossorder.py", "exec"), ns)
     return ns, app, svc, wire, calls
 
@@ -69,7 +67,7 @@ def test_it_has_no_rsi_and_no_absolute_filter_and_the_z_inputs():
     for gone in ("RSI", "rsi(", "HIST_DAYS", "ABS_DAYS", "ABS_ZONE", "in_own_history", "load_history"):
         assert gone not in SCRIPT.replace("no RSI", "").replace("without the RSI", ""), gone
     assert "Z_DAYS = 90" in SCRIPT and "Z_MIN_DAYS = 20" in SCRIPT and "Z_ENTRY = 3.0" in SCRIPT and 'Z_BAR = "5min"' in SCRIPT and "Z_BAR_LIVE = False" in SCRIPT
-    assert "TARGET_PCT, STOP_PCT = None, None" in SCRIPT and "EXIT_AT = dtime(15, 55)" in SCRIPT
+    assert "TARGET_PCT = None" in SCRIPT and "STOP_PCT = None" in SCRIPT and re.search(r"EXIT_AT = dtime\([^)]*\)", SCRIPT)
     assert "def run_us_zscore()" in SCRIPT and "us_zscore_stop" in SCRIPT and "run_us_basket_rsi" not in SCRIPT
 
 

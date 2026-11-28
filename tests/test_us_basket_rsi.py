@@ -9,13 +9,13 @@ import pandas as pd
 import pytest
 
 from algo.series.absolute import Absolute, Relative
-from tests.test_examples import EXAMPLES, FUT, Update, console_with_services, wait_for
+from tests.test_examples import apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 
 pa = pytest.importorskip("pyarrow")
 import pyarrow.parquet as pq  # noqa: E402
 
-SCRIPT = (EXAMPLES / "08_us_basket_rsi_crossorder.py").read_text(encoding="utf-8")
+SCRIPT = inline_params(EXAMPLES / "08_us_basket_rsi_crossorder.py")
 def basket_block(src):
     """The text of the `    BASKETS = {...}` statement (one line or many) and its start and end in `src`."""
     start = src.index("\n    BASKETS = {") + 1
@@ -56,14 +56,12 @@ def start(tmp_path, monkeypatch, status="ok", window=ALWAYS_OPEN, basket=MY_BASK
     assert OPEN_WINDOW in SCRIPT and USER_ID in (3, 4)                                                # the test service allows users 3 and 4
     _, b0, b1 = basket_block(SCRIPT)
     src = (SCRIPT[:b0] + basket + SCRIPT[b1:]).replace(OPEN_WINDOW, window)
-    assert "EXIT_AT = dtime(15, 55)" in src, "the time exit input is missing"
-    src = src.replace("EXIT_AT = dtime(15, 55)", f"EXIT_AT = {exit_at}")                              # the tests choose when the time exit comes: late by default, so the real clock never matters
+    EXIT_LIT = re.search(r"EXIT_AT = dtime\([^)]*\)", src).group(0)   # whatever the owner has typed
+    src = src.replace(EXIT_LIT, f"EXIT_AT = {exit_at}")                              # the tests choose when the time exit comes: late by default, so the real clock never matters
     src = re.sub(r"RSI_LIVE = (True|False)", f"RSI_LIVE = {rsi_live}", src)
     src = re.sub(r"HIST_DAYS = \d+", "HIST_DAYS = 3", src)                                           # the tests need three history days, whatever the owner has typed
     src = src.replace("ACT_ON_BAR_END = True", f"ACT_ON_BAR_END = {act_on_bar_end}")                         # the older tests feed any number of candles: they look at every minute                            # the owner's choice is an input; each test says which it means
-    for old, new in replace.items():
-        assert old in src, old
-        src = src.replace(old, new)
+    src = apply_replace(src, replace)
     before = set(ns)
     exec(compile(src, "08_us_basket_rsi_crossorder.py", "exec"), ns)
     return ns, app, svc, wire, calls, before
@@ -220,7 +218,7 @@ def test_with_finished_bars_only_the_newest_bar_is_left_out_so_one_more_bar_is_n
 
 
 def test_the_time_exit_is_five_minutes_before_the_close_by_default():
-    assert "EXIT_AT = dtime(15, 55)" in SCRIPT and "time exit" in SCRIPT
+    assert re.search(r"EXIT_AT = dtime\([^)]*\)", SCRIPT) and "time exit" in SCRIPT
 
 
 def test_no_entry_is_made_once_the_time_exit_has_come_even_inside_the_window(tmp_path, fake_dh, monkeypatch):

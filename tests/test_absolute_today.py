@@ -123,7 +123,8 @@ def test_nothing_is_kept_between_calls_but_the_cache_and_there_is_no_thread_or_l
     s = service(src, now=lambda: epoch(TODAY, 11), today_bars=lambda spec, day: bars_of((0, 100, 100, 100, 100, 5), (10, 101, 101, 101, 101, 5)))
     for _ in range(3):
         s.absolute("pct_open", "intraday", "ABC", 5)
-    assert threading.active_count() == before and set(vars(s)) <= {"clock", "source", "cache", "max_age", "iv_max_age", "min_valid", "today_bars", "today_iv", "_now", "_days_cache", "baskets", "today_bars_many", "today_iv_many", "contract_of_today"}
+    assert threading.active_count() == before and set(vars(s)) <= {"clock", "source", "cache", "max_age", "iv_max_age", "min_valid", "today_bars", "today_iv", "_now", "_days_cache", "baskets", "today_bars_many", "today_iv_many", "contract_of_today",
+                              "today_v", "today_v_many"}      # the volume / turnover series readers
 
 
 # ---- the Deephaven readers (the tables are faked) -----------------------------------------------------------------------------------------------------
@@ -160,7 +161,7 @@ def readers(monkeypatch):
 
 def test_todays_bars_are_read_for_the_one_token_of_the_symbol(readers):
     app, candles, _ = readers
-    today_bars, _, _, _, _ = deephaven_readers(app)
+    today_bars, _, _, _, _, *_ = deephaven_readers(app)
     ts, o, h, l, c, v = today_bars(("cash", "ABC"), TODAY)
     assert candles.where_expr == "token = 7" and candles.view_cols[0] == "Ts = epochSeconds(Minute)"
     assert c.tolist() == [100.5, 101.5] and v.tolist() == [10.0, 20.0] and ts.dtype == np.int64
@@ -173,7 +174,7 @@ def test_todays_bars_are_read_for_the_one_token_of_the_symbol(readers):
 
 def test_todays_iv_is_the_nearest_expiry_as_minute_of_day_and_value(readers):
     app, _, straddle = readers
-    _, today_iv, _, _, _ = deephaven_readers(app)
+    _, today_iv, _, _, _, *_ = deephaven_readers(app)
     minute, iv = today_iv("NIFTY", TODAY)
     assert straddle.where_expr == "Symbol = `NIFTY`" and minute.tolist() == [9 * 60 + 25, 9 * 60 + 26] and iv.tolist() == [2.0, 2.5]
     assert today_iv("NIFTY`; drop", TODAY) is None                                                  # only plain names go into a query
@@ -182,7 +183,7 @@ def test_todays_iv_is_the_nearest_expiry_as_minute_of_day_and_value(readers):
 def test_a_missing_table_gives_none_so_the_saved_file_is_used(readers):
     app, _, _ = readers
     app.tables.clear()
-    today_bars, today_iv, _, _, _ = deephaven_readers(app)
+    today_bars, today_iv, _, _, _, *_ = deephaven_readers(app)
     assert today_bars(("cash", "ABC"), TODAY) is None and today_iv("NIFTY", TODAY) is None
 
 
@@ -232,7 +233,7 @@ def test_the_readers_make_one_read_of_the_candles_for_calls_in_the_same_cycle(re
     reads = []
     sys.modules["deephaven.pandas"].to_pandas = lambda t: (reads.append(1), t.df)[1]
     candles.size = 2
-    today_bars, _, _, _, _ = deephaven_readers(app)
+    today_bars, _, _, _, _, *_ = deephaven_readers(app)
     first = today_bars(("cash", "ABC"), TODAY)
     again = today_bars(("cash", "ABC"), TODAY)
     assert len(reads) == 1 and again is first                                                              # open and VWAP of one stock: one read
@@ -252,7 +253,7 @@ def test_the_futures_master_is_searched_once_per_stock_and_day(readers):
             return super().__getitem__(key)
 
     app.master.futs = Futs(app.master.futs)
-    today_bars, _, _, _, _ = deephaven_readers(app)
+    today_bars, _, _, _, _, *_ = deephaven_readers(app)
     for _ in range(4):
         today_bars(("fut", "NIFTY"), "2026-03-18")
     assert len(searches) == 1
@@ -268,7 +269,7 @@ def test_the_iv_rows_are_read_once_per_change_and_an_underlying_reuses_the_read_
     sys.modules["deephaven.pandas"].to_table = lambda df: types.SimpleNamespace(df=df)
     straddle.where_in = lambda keys, col: straddle
     straddle.size = 3
-    _, today_iv, _, today_iv_many, _ = deephaven_readers(app)
+    _, today_iv, _, today_iv_many, _, *_ = deephaven_readers(app)
     first = today_iv_many(["NIFTY", "BANKNIFTY"], TODAY)
     assert today_iv_many(["BANKNIFTY", "NIFTY"], TODAY) is first and len(reads) == 1                    # the same basket in another order: one read
     minute, iv = today_iv("NIFTY", TODAY)                                                                # inside the basket's read: no read of its own
@@ -289,7 +290,7 @@ def test_one_stock_reuses_the_candles_read_of_its_basket(readers):
     sys.modules["deephaven.pandas"].to_table = lambda df: types.SimpleNamespace(df=df)
     candles.where_in = lambda keys, col: candles
     candles.size = 2
-    today_bars, _, today_bars_many, _, _ = deephaven_readers(app)
+    today_bars, _, today_bars_many, _, _, *_ = deephaven_readers(app)
     many = today_bars_many([("cash", "ABC")], TODAY)
     one = today_bars(("cash", "ABC"), TODAY)
     assert len(reads) == 1 and one[4].tolist() == many[("cash", "ABC")][4].tolist()

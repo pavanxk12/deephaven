@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from algo.series.absolute import Relative
-from tests.test_examples import EXAMPLES, FUT, Update, console_with_services, wait_for
+from tests.test_examples import apply_replace, EXAMPLES, FUT, Update, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 
 BASKETS_RX = re.compile(r'"banks": \[[^\n]*\],\n        "it": \[[^\n]*\],')
@@ -29,9 +29,7 @@ def start(tmp_path, monkeypatch, status="ok", pct=None, window=ALWAYS_OPEN, bask
     src = (EXAMPLES / "07_basket_rsi_crossorder.py").read_text(encoding="utf-8")
     assert BASKETS_RX.search(src) and OPEN_WINDOW in src
     src = BASKETS_RX.sub(baskets, src).replace(OPEN_WINDOW, window)
-    for old, new in replace.items():
-        assert old in src, old
-        src = src.replace(old, new)
+    src = apply_replace(src, replace)
     before = set(ns)
     exec(compile(src, "07_basket_rsi_crossorder.py", "exec"), ns)
     return ns, app, svc, wire, calls, ranks, before

@@ -8,13 +8,13 @@ import numpy as np
 import pytest
 
 from algo.series.absolute import Absolute, Relative
-from tests.test_examples import EXAMPLES, FUT, Update, console_with_services, wait_for
+from tests.test_examples import apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 from tests.test_us_basket_rsi import ALWAYS_OPEN, DAY0, MY_BASKET, basket_block, write_history
 
 pytest.importorskip("pyarrow")
 
-SCRIPT = (EXAMPLES / "14_us_directional_crossorder.py").read_text(encoding="utf-8")
+SCRIPT = inline_params(EXAMPLES / "14_us_directional_crossorder.py")
 OPEN_WINDOW = re.search(r"WINDOW = [(]dtime[(]\d+, \d+[)], dtime[(]\d+, \d+[)][)]", SCRIPT).group(0)
 
 
@@ -37,11 +37,9 @@ def start(tmp_path, monkeypatch, pct=50.0, iv_cannot=False, rvol_now=10.0, **rep
     ns["relative"], ns["absolute"], ns["basket"] = relative, absolute, (lambda *a, **k: None)
     _, b0, b1 = basket_block(SCRIPT)
     src = (SCRIPT[:b0] + MY_BASKET + SCRIPT[b1:]).replace(OPEN_WINDOW, ALWAYS_OPEN)
-    assert "EXIT_AT = dtime(15, 55)" in src
-    src = src.replace("EXIT_AT = dtime(15, 55)", "EXIT_AT = dtime(23, 59, 59)")                           # late: the real clock never matters
-    for old, new in replace.items():
-        assert old in src, old
-        src = src.replace(old, new)
+    assert re.search(r"EXIT_AT = dtime\([^)]*\)", src), "the time exit input is missing"
+    src = re.sub(r"EXIT_AT = dtime\([^)]*\)", "EXIT_AT = dtime(23, 59, 59)", src)                           # late: the real clock never matters
+    src = apply_replace(src, replace)
     exec(compile(src, "14_us_directional_crossorder.py", "exec"), ns)
     return ns, svc, wire, calls
 

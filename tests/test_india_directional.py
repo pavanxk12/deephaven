@@ -6,13 +6,13 @@ import time
 import numpy as np
 import pytest
 
-from tests.test_examples import EXAMPLES, Update, wait_for
+from tests.test_examples import inline_params, EXAMPLES, Update, wait_for
 from tests.test_india_fut import DAY0, start, write_two_contracts
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 
 pytest.importorskip("pyarrow")
 
-SCRIPT = (EXAMPLES / "13_india_directional_crossorder.py").read_text(encoding="utf-8")
+SCRIPT = inline_params(EXAMPLES / "13_india_directional_crossorder.py")
 SETTINGS = {"ACT_ON_BAR_END = True": "ACT_ON_BAR_END = True"}                                                   # keeps the helper from switching bar-end entries off
 NAME = "13_india_directional_crossorder.py"
 
