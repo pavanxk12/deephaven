@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from algo.series.absolute import Absolute, Relative
-from tests.test_examples import apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
+from tests.test_examples import listener_on, quote, candle_feed, apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 
 pa = pytest.importorskip("pyarrow")
@@ -35,17 +35,30 @@ MY_BASKET = '    BASKETS = {"us_stocks": ["NIFTY", "A1", "A2"]}\n'              
 DAY0 = np.datetime64("2026-10-19T14:00")                                                # the first live minute (UTC), after the history days
 
 
-def start(tmp_path, monkeypatch, status="ok", window=ALWAYS_OPEN, basket=MY_BASKET, abs_pct=50.0, abs_idx=11, rsi_live=True, exit_at="dtime(23, 59, 59)", act_on_bar_end=False, **replace):
+# OVERSOLD for a zone script: pct_open inside REL_ZONE/ABS_ZONE's (25, 75) band, pct_vwap below its low.
+OVERSOLD = {"open": 50.0, "vwap": 10.0}
+OVERBOUGHT = {"open": 50.0, "vwap": 90.0}
+
+def start(tmp_path, monkeypatch, status="ok", window=ALWAYS_OPEN, basket=MY_BASKET, abs_pct=OVERSOLD, abs_idx=11, rsi_live=True, exit_at="dtime(23, 59, 59)", act_on_bar_end=False, rel_pct=OVERSOLD, **replace):
     ns, app, svc, wire = console_with_services(tmp_path, monkeypatch, status)
     calls = []
 
+    def per_ref(value, ref):
+        """A percentile per reference. 08 reads REL_ZONE / ABS_ZONE bands: an OVERSOLD stock has pct_open INSIDE
+        the band and pct_vwap BELOW its low, so one number for every reference can never describe a trade. A plain
+        number still means the same percentile everywhere, which is how the "middle of the band" tests read."""
+        return float(value[ref]) if isinstance(value, dict) else float(value)
+
     def relative(series, level, symbol, basket=None, ref=None, **kw):
         calls.append((symbol, tuple(basket), ref))
-        return Relative(np.array([1.0, 2.0, 3.0]), 3, now=0.5, n_valid=7, pctile=50.0, symbols=list(basket), series=series, level=level, symbol=symbol)
+        return Relative(np.array([1.0, 2.0, 3.0]), 3, now=0.5, n_valid=7, pctile=per_ref(rel_pct, ref or "open"),
+                        symbols=list(basket), series=series, level=level, symbol=symbol)
 
     def absolute(series, level, symbol, n=22, ref=None, **kw):
         absolute.calls.append((series, level, symbol, n, ref))
-        return Absolute(np.arange(float(n)), abs_idx, now=0.5, n_valid=n if abs_idx >= 0 else 3, pctile=abs_pct if abs_idx >= 0 else float("nan"), series=series, level=level, symbol=symbol)
+        return Absolute(np.arange(float(n)), abs_idx, now=0.5, n_valid=n if abs_idx >= 0 else 3,
+                        pctile=per_ref(abs_pct, ref or "open") if abs_idx >= 0 else float("nan"),
+                        series=series, level=level, symbol=symbol)
 
     absolute.calls = []
     absolute.warmed = []
@@ -67,10 +80,16 @@ def start(tmp_path, monkeypatch, status="ok", window=ALWAYS_OPEN, basket=MY_BASK
     return ns, app, svc, wire, calls, before
 
 
-def feed(fake_dh, closes, first=0):
-    """The traded stock's 1-minute closes, one candle each, from DAY0 + `first` minutes."""
+def feed(fake_dh, closes, first=0, tick=True):
+    """The traded stock's 1-minute closes, one candle each, from DAY0 + `first` minutes.
+    Each candle is followed by a tick of the same price on the live feed, because the script no longer sends
+    anything straight from a candle: a signal only ARMS the entry, and the order goes out on the first tick
+    whose spread is inside SPREAD_MAX. bid = ask = ltp here, a zero spread, so the gate always opens.
+    Pass tick=False to feed candles alone and watch an entry sit armed."""
     for i, c in enumerate(closes):
-        fake_dh[0].fn(Update(added={"token": [FUT], "Close": [float(c)], "Minute": [DAY0 + np.timedelta64(first + i, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [float(c)], "Minute": [DAY0 + np.timedelta64(first + i, "m")]}), False)
+        if tick and listener_on(fake_dh, "fo_market_data") is not None:
+            quote(fake_dh, FUT, float(c))
 
 
 def write_history(folder, days, start_px=200.0, step=-0.25, symbol="NIFTY", minutes=60):

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from algo.series.absolute import Relative
-from tests.test_examples import apply_replace, EXAMPLES, FUT, Update, console_with_services, wait_for
+from tests.test_examples import candle_feed, apply_replace, EXAMPLES, FUT, Update, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 
 BASKETS_RX = re.compile(r'"banks": \[[^\n]*\],\n        "it": \[[^\n]*\],')
@@ -37,7 +37,7 @@ def start(tmp_path, monkeypatch, status="ok", pct=None, window=ALWAYS_OPEN, bask
 
 def bars(fake_dh, closes):
     for c in closes:
-        fake_dh[0].fn(Update(added={"token": [FUT], "Close": [float(c)]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [float(c)]}), False)
 
 
 def fall(n=12, start=100.0, step=1.0):

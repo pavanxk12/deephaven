@@ -352,7 +352,7 @@ def feed(fake_dh, closes):
     base = prices()
     others = [t for t in base if t != FUT]
     for close in closes:
-        fake_dh[0].fn(Update(added={"token": [FUT, *others], "Close": [float(close), *[base[t] for t in others]]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [FUT, *others], "Close": [float(close), *[base[t] for t in others]]}), False)
 
 
 def falling(n, start=25100.0, step=10.0):
@@ -370,7 +370,7 @@ def test_the_template_is_a_complete_working_automation(tmp_path, fake_dh, monkey
     feed(fake_dh, falling(5))
     time.sleep(0.1)
     assert wire.sent == [] and ns["rsi"](ns["closes"]) is None                        # not enough candles for an RSI(9) yet
-    fake_dh[0].fn(Update(added={"token": [999], "Close": [1.0]}), False)             # another instrument's candle is no signal for the future
+    candle_feed(fake_dh).fn(Update(added={"token": [999], "Close": [1.0]}), False)             # another instrument's candle is no signal for the future
     feed(fake_dh, falling(10, start=25050.0, step=5.0)[5:])                            # the RSI of a straight fall is 0: oversold -> a CALL
     assert wait_for(lambda: len(wire.sent) == 4)
     assert [lab for _, lab, _ in wire.sent] == ["subscribe", "pause_unpause:Pause", "apply", "pause_unpause:UnPause"]
@@ -415,8 +415,8 @@ def test_the_template_starts_its_rsi_from_the_candles_already_built(tmp_path, fa
     ns, app, svc, wire = console_with_services(tmp_path, monkeypatch, history=falling(12, start=25200.0, step=15.0))
     run_script(ns, "03_algo_template.py")
     assert len(ns["closes"]) == 12                                                      # seeded from last_candles at start
-    fake_dh[0].fn(Update(added={"token": [CE(5), PE(5)], "Close": [120.0, 100.0]}), False)    # option prices first
-    fake_dh[0].fn(Update(added={"token": [FUT], "Close": [25010.0]}), False)             # the first live candle: oversold at once, no warm-up
+    candle_feed(fake_dh).fn(Update(added={"token": [CE(5), PE(5)], "Close": [120.0, 100.0]}), False)    # option prices first
+    candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [25010.0]}), False)             # the first live candle: oversold at once, no warm-up
     assert wait_for(lambda: len(wire.sent) == 4) and wire.sent[0][2]["T1"] == CE(5)
     svc.on_stop()
 
@@ -438,7 +438,7 @@ def test_the_multistrike_script_computes_its_rsi_from_the_futures_candles_only(t
     ns["ltp"].clear()
     feed(fake_dh, falling(9))
     assert seen == [] and len(ns["closes"]) == 9                                       # 9 closes: not enough for an RSI(9) yet
-    fake_dh[0].fn(Update(added={"token": [999, 7], "Close": [1.0, float("nan")]}), False)    # other instruments, and a bad price
+    candle_feed(fake_dh).fn(Update(added={"token": [999, 7], "Close": [1.0, float("nan")]}), False)    # other instruments, and a bad price
     assert seen == [] and 7 not in ns["ltp"] and 999 in ns["ltp"] and len(ns["closes"]) == 9
     feed(fake_dh, falling(10)[9:])                                                     # the 10th close of the fall: oversold
     assert seen == ["OVERSOLD"]
@@ -551,7 +551,7 @@ def test_pasting_a_script_again_replaces_its_candle_listener_instead_of_adding_a
     assert len(fake_dh) == 2 and fake_dh[0].stopped and not fake_dh[1].stopped                  # the first listener was stopped
     ns["WINDOW"] = (dtime(0, 0), dtime(23, 59, 59))
     for close in falling(10, start=25100.0):
-        fake_dh[1].fn(Update(added={"token": [FUT], "Close": [float(close)]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [float(close)]}), False)
     assert len(ns["closes"]) == 10                                                             # each candle counted once
     ns["algo_stop"]("nifty_sma")
     assert fake_dh[1].stopped                                                                  # stopping the automation stops its listener
@@ -584,7 +584,7 @@ def feed_minutes(fake_dh, closes, first=0):
     t0 = np.datetime64("2026-01-05T03:45")
     for i, close in enumerate(closes):
         minute = t0 + np.timedelta64(first + i, "m")
-        fake_dh[0].fn(Update(added={"token": [FUT, *others], "Close": [float(close), *[base[t] for t in others]], "Minute": [minute] * (1 + len(others))}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [FUT, *others], "Close": [float(close), *[base[t] for t in others]], "Minute": [minute] * (1 + len(others))}), False)
 
 
 def test_the_rsi_is_computed_on_five_minute_bars_made_from_the_one_minute_candles(tmp_path, fake_dh, monkeypatch):
@@ -771,3 +771,16 @@ def apply_replace(src, replace):
             body = _re.sub(rf"^[ \t]*{_re.escape(extra)}[ \t]*=(?!=)[^\n]*\n", "", body, count=1, flags=_re.M)
         src = head + body + tail
     return src
+
+
+def candle_feed(listeners):
+    """The script's candle listener. These tests used to take fake_dh[0] or fake_dh[-1], but the live scripts
+    now also listen to `orders_trade` (real fill tracking) and `fo_market_data` (the spread gate and the chase),
+    so a position in the list no longer identifies the candle one. Pick the newest listener that is on neither
+    of those two tables."""
+    for h in reversed(listeners):
+        name = getattr(getattr(h, "table", None), "name", None)
+        if name in ("orders_trade", "fo_market_data") or h.stopped:
+            continue
+        return h
+    raise AssertionError("no candle listener was registered")

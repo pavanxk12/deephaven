@@ -12,7 +12,7 @@ from algo.core.config import NSE
 from algo.data.master import classify, normalise
 from algo.series.absolute import Absolute, Relative
 from tests.conftest import secs
-from tests.test_examples import apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
+from tests.test_examples import candle_feed, apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 
 pa = pytest.importorskip("pyarrow")
@@ -39,7 +39,16 @@ def india_master(unders=STOCKS):
     return classify(normalise(pd.DataFrame(rows), NSE))
 
 
-def start(src_text, name, tmp_path, monkeypatch, unders=STOCKS, rel=None, extra_ns=None, pct=50.0, iv_cannot=False, **replace):
+# The default percentiles say "oversold" for both filter designs these scripts use: a zone script (11, 08:
+# REL_ZONE / ABS_ZONE) wants pct_open INSIDE the band and pct_vwap BELOW its low, which is a BUY; a threshold
+# script reads pct_open on its own. A test that wants another picture passes pct= itself.
+OVERSOLD = {"open": 60.0, "vwap": 10.0}      # open: inside REL_ZONE/ABS_ZONE's (25, 75) band, and far enough above 50 that the
+                                             # fake basket's average, (open - 50) / 25 = 0.4, clears BASKET_AVG_PCT = 0.1 for a BUY.
+                                             # vwap: below the band's low, which is what OVERSOLD means to a zone script.
+OVERBOUGHT = {"open": 40.0, "vwap": 90.0}    # the mirror: basket average (40 - 50) / 25 = -0.4, below -BASKET_AVG_PCT, and
+                                             # pct_vwap above the band's high -- a SELL.
+
+def start(src_text, name, tmp_path, monkeypatch, unders=STOCKS, rel=None, extra_ns=None, pct=OVERSOLD, iv_cannot=False, **replace):
     ns, app, svc, wire = console_with_services(tmp_path, monkeypatch, "ok")
     if extra_ns:
         ns.update(extra_ns)                                                                          # names the script finds in the terminal, such as the live feed table
@@ -47,24 +56,36 @@ def start(src_text, name, tmp_path, monkeypatch, unders=STOCKS, rel=None, extra_
     saved, relative_calls, straddle_calls = [], [], []
     ns["_straddle_calls"] = straddle_calls
 
+    def pct_for(ref):
+        """`pct` may be one number for every reference, or {"open": .., "vwap": .., "v": ..} per reference.
+        The zone scripts (11's REL_ZONE / ABS_ZONE) need pct_open INSIDE the band and pct_vwap OUTSIDE it,
+        which a single number can never express."""
+        return float(pct[ref]) if isinstance(pct, dict) else float(pct)
+
     def relative(series, level, symbol, basket=None, ref=None, **kw):
         relative_calls.append((symbol, tuple(basket), ref))
-        offset = (pct - 50.0) / 25.0                                  # so the basket's own average tracks pct too: positive above 50, negative below, ~0 at the middle
-        return Relative(np.array([-1.0, 0.0, 1.0]) + offset, -1 if (series == "iv" and iv_cannot) else 3, now=0.5, n_valid=7, pctile=pct, symbols=list(basket), series=series, level=level, symbol=symbol)
+        this = pct_for(ref if (isinstance(pct, dict) and ref in pct) else series if (isinstance(pct, dict) and series in pct) else "open")
+        offset = (this - 50.0) / 25.0                                 # so the basket's own average tracks pct too: positive above 50, negative below, ~0 at the middle
+        return Relative(np.array([-1.0, 0.0, 1.0]) + offset, -1 if (series in ("iv", "v") and iv_cannot) else 3, now=0.5, n_valid=7, pctile=this, symbols=list(basket), series=series, level=level, symbol=symbol)
 
     def absolute(series, level, symbol, n=22, ref=None, **kw):
-        return Absolute(np.arange(float(n)), -1 if (series == "iv" and iv_cannot) else 11, now=0.5, n_valid=n, pctile=pct, series=series, level=level, symbol=symbol)
+        this = pct_for(ref if (isinstance(pct, dict) and ref in pct) else series if (isinstance(pct, dict) and series in pct) else "open")
+        return Absolute(np.arange(float(n)), -1 if (series in ("iv", "v") and iv_cannot) else 11, now=0.5, n_valid=n, pctile=this, series=series, level=level, symbol=symbol)
 
     ns["absolute_warm"] = lambda *a, **k: None
     ns["straddle_start"] = lambda n=0, **k: straddle_calls.append(n)                                  # the script may start the straddle itself
     ns["relative"], ns["absolute"] = relative, absolute
     ns["basket"] = lambda n, members, **k: saved.append((n, list(members)))
     src_text = re.sub(r"^    ONLY = \[.*?\]", "    ONLY = []", src_text, count=1, flags=re.M | re.S)                    # the owner's own list of stocks: the tests use the fake futures
-    src_text = re.sub(r"^    SECTOR_BASKETS = \{.*?\n    \}", f"    SECTOR_BASKETS = {{\"all\": {list(unders)!r}}}", src_text, count=1, flags=re.M | re.S)   # one basket of the fake futures
+    # one basket of the fake futures. The closing brace may be on its own line (a script that still holds its
+    # own literals) or at the end of the line (one whose values come back from params.ini on a single line).
+    src_text = re.sub(r"^    SECTOR_BASKETS = \{.*?\}[ \t]*$", f"    SECTOR_BASKETS = {{\"all\": {list(unders)!r}}}", src_text, count=1, flags=re.M | re.S)
     src = re.sub(r"^    WINDOW = \(dtime\([^)]*\), dtime\([^)]*\)\)", f"    {ALWAYS_OPEN}", src_text, count=1, flags=re.M)        # whatever hours the script owns, tests run all day
     src = re.sub(r"EXIT_AT = dtime\([^)]*\)", "EXIT_AT = dtime(23, 59, 59)", src)      # whatever the owner typed -> late, so the real clock never matters
     if "ACT_ON_BAR_END = True" not in replace:                                                      # the older tests feed any number of candles: they look at every minute
         src = src.replace("ACT_ON_BAR_END = True", "ACT_ON_BAR_END = False")
+    src = re.sub(r"HIST_DAYS = \d+", "HIST_DAYS = 3", src)                                          # three history days, whatever the owner has typed (the RSI needs
+                                                                                                    # RSI_N + 1 bars before it says anything), as test_us_basket_rsi does
     replace = {k: v for k, v in replace.items()
                if not (k == "N_BASKETS = 4" and "N_BASKETS" not in src)}                               # scripts with SECTOR_BASKETS (one basket of the fake futures already) have no N_BASKETS
     src = apply_replace(src, replace)
@@ -106,13 +127,17 @@ def test_11_builds_named_sector_baskets_from_sector_baskets_and_excludes(tmp_pat
         start(RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=STOCKS[:2])
 
 
-@pytest.mark.parametrize("text,name,tag", [(RSI, "11_india_fut_rsi_crossorder.py", "india_fut_rsi"), (Z, "12_india_fut_zscore_crossorder.py", "india_fut_zscore")], ids=["11", "12"])
+# the tag is the prefix each script puts in the terminal, which is its STRATEGY name: 11 is "meanrevert" now, not "india_fut_rsi"
+@pytest.mark.parametrize("text,name,tag", [(RSI, "11_india_fut_rsi_crossorder.py", "meanrevert"), (Z, "12_india_fut_zscore_crossorder.py", "india_fut_zscore")], ids=["11", "12"])
 def test_it_trades_the_nearest_future_with_the_india_plugin_fields_and_leaks_no_names(text, name, tag, tmp_path, fake_dh, monkeypatch):
     ns, app, svc, wire, saved, rel, before = start(text, name, tmp_path, monkeypatch)
     leaked = sorted(n for n in set(ns) - before if not n.startswith(tag) and n != f"run_{tag}" and not n.startswith("__"))
     assert leaked == []
     assert "Asia/Kolkata" in text and "America/New_York" not in text and "TRADE_AS" not in text
-    assert f'"strategyname": "{ENGINE_NAME}"' in text and f"USER = {USER_ID}" in text and USER_ID in (3, 4)       # both scripts send as the same user, with the same plugin name
+    # the same engine plugin, and each script's own user (11 and 12 no longer share one: 4 and 3)
+    assert f'"strategyname": "{ENGINE_NAME}"' in text
+    own_user = int(re.search(r"^    USER = (\d+)", text, re.M).group(1))
+    assert own_user in (3, 4)                                                                       # the test NATS service allows users 3 and 4
     svc.on_stop()
 
 
@@ -137,10 +162,10 @@ def test_the_rsi_history_is_seeded_from_each_days_nearest_future_only(tmp_path, 
                                                     **{"N_BASKETS = 4": "N_BASKETS = 1", "RSI_LIVE = False": "RSI_LIVE = True"})
     out = capsys.readouterr().out
     assert "history: 3 earlier day(s)" in out
-    ns["india_fut_rsi_status"]()
+    ns["meanrevert_status"]()
     assert "RSI is ready for 1 of 3" in capsys.readouterr().out or "RSI is ready for 1 of" in out                     # only S00 has history
     token = 100                                                                                              # S00's nearest future
-    fake_dh[0].fn(Update(added={"token": [token], "Close": [last - 0.25], "Minute": [DAY0]}), False)       # one more falling minute: oversold through the near contract's prices
+    candle_feed(fake_dh).fn(Update(added={"token": [token], "Close": [last - 0.25], "Minute": [DAY0]}), False)       # one more falling minute: oversold through the near contract's prices
     assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][1] == "subscribe"
     assert wire.sent[0][2]["TOKEN"] == token and wire.sent[0][2]["strategyname"] == ENGINE_NAME and wire.sent[0][2]["SIDE"] == 1
     svc.on_stop()
@@ -150,10 +175,10 @@ def test_after_a_roll_the_next_contract_becomes_the_nearest_for_the_days_after_t
     """The near contract expired on 2020-01-30. The days 2020-01-31 and later seed from the FAR one, and the days before from the near one."""
     write_two_contracts(tmp_path, ["2020-01-29"], "30JAN20", "27FEB20", start_px=200.0, step=-0.25)           # falling near contract, rising far one
     last = write_two_contracts(tmp_path, ["2020-01-31"], "30JAN20", "27FEB20", start_px=500.0, step=-0.25)    # on this day the nearest is 27FEB20 (rising: 1000 + 5 i)
-    ns, app, svc, wire, saved, rel, before = start(RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S00", "S01", "S02"],
+    ns, app, svc, wire, saved, rel, before = start(RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S00", "S01", "S02"], pct=OVERBOUGHT,
                                                     **{"N_BASKETS = 4": "N_BASKETS = 1", "RSI_LIVE = False": "RSI_LIVE = True", "HIST_DAYS = 3": "HIST_DAYS = 2"})
     assert "history: 2 earlier day(s) (2020-01-29, 2020-01-31)" in capsys.readouterr().out
-    fake_dh[0].fn(Update(added={"token": [100], "Close": [1300.0], "Minute": [DAY0]}), False)                  # the far contract keeps rising: overbought -> SELL
+    candle_feed(fake_dh).fn(Update(added={"token": [100], "Close": [1300.0], "Minute": [DAY0]}), False)                  # the far contract keeps rising: overbought -> SELL
     assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][2]["SIDE"] == 2                              # had the near (falling) contract been used on the 31st, it would be a BUY
     svc.on_stop()
 
@@ -183,7 +208,7 @@ def test_at_the_time_exit_script_11_stops_like_algo_stop_and_the_others_use_the_
         RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S00", "S01", "S02"],
         **{"N_BASKETS = 4": "N_BASKETS = 1", "RSI_LIVE = False": "RSI_LIVE = True", "algo_start(USER, STRATEGY)": "algo_start(USER, STRATEGY, squareup_settle_s=0)",
            "EXIT_AT = dtime(23, 59, 59)": f"EXIT_AT = dtime({when.hour}, {when.minute}, {when.second})"})
-    feeder = fake_dh[-1].fn                                                                            # the listener of the second run
+    feeder = candle_feed(fake_dh).fn                                                                            # the listener of the second run
     feeder(Update(added={"token": [100], "Close": [last - 0.25], "Minute": [DAY0]}), False)            # the entry, before the exit time
     assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][1] == "subscribe"
     end = time.time() + 8
@@ -218,10 +243,10 @@ def test_after_a_take_profit_the_portfolio_is_unsubscribed_so_the_engine_slot_is
         RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S00", "S01", "S02"],
         **{"N_BASKETS = 4": "N_BASKETS = 1", "RSI_LIVE = False": "RSI_LIVE = True", "UNSUB_AFTER_S = 60": "UNSUB_AFTER_S = 0.3"})
     entry = last - 0.25
-    fake_dh[-1].fn(Update(added={"token": [100], "Close": [entry], "Minute": [DAY0]}), False)
+    candle_feed(fake_dh).fn(Update(added={"token": [100], "Close": [entry], "Minute": [DAY0]}), False)
     assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][1] == "subscribe"
     for i in range(1, 60):                                                                           # +3%: the target (1.5%). A candle before the reply opens the position is ignored, so repeat until the exit goes out
-        fake_dh[-1].fn(Update(added={"token": [100], "Close": [entry * 1.03], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [100], "Close": [entry * 1.03], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
         if any(lab == "squareup" for _, lab, _ in wire.sent):
             break
         time.sleep(0.1)
@@ -236,7 +261,7 @@ def test_no_entry_while_the_script_holds_as_many_portfolios_as_allowed(tmp_path,
     ns, app, svc, wire, saved, rel, before = start(
         RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S00", "S01", "S02"],
         **{"N_BASKETS = 4": "N_BASKETS = 1", "RSI_LIVE = False": "RSI_LIVE = True", re.search(r"MAX_PORTFOLIOS = \d+", RSI).group(0): "MAX_PORTFOLIOS = 0"})
-    fake_dh[-1].fn(Update(added={"token": [100], "Close": [last - 0.25], "Minute": [DAY0]}), False)       # oversold: it would buy
+    candle_feed(fake_dh).fn(Update(added={"token": [100], "Close": [last - 0.25], "Minute": [DAY0]}), False)       # oversold: it would buy
     time.sleep(0.3)
     assert wire.sent == []
     assert "MAX_PORTFOLIOS 0" in capsys.readouterr().out
@@ -247,7 +272,11 @@ def test_no_entry_while_the_script_holds_as_many_portfolios_as_allowed(tmp_path,
 def test_all_four_scripts_release_a_closed_portfolio_and_have_the_limit(text):
     import re as _re
     assert _re.search(r"^    MAX_PORTFOLIOS = \d+", text, _re.M) and _re.search(r"^    UNSUB_AFTER_S = \d+", text, _re.M)             # whatever numbers the owner has typed
-    for needle in ("def release(pf, token):", "threading.Timer(UNSUB_AFTER_S, release", "if len(live) >= MAX_PORTFOLIOS", "live.add(a[\"pf\"])"):
+    # 08 and 14 schedule release_exit() instead, which checks the fills before it lets the portfolio go, so the
+    # timer's first argument is written differently there; both forms arm a timer on UNSUB_AFTER_S.
+    assert "threading.Timer(UNSUB_AFTER_S, release" in text or "release_exit, (pf, token, qty, 1)" in text
+    assert 'live.add(a["pf"])' in text or "live.add(pf)" in text          # the rewritten scripts unpack the portfolio first
+    for needle in ("def release(pf, token):", "if len(live) >= MAX_PORTFOLIOS"):
         assert needle in text, needle
 
 
@@ -256,7 +285,7 @@ def test_script_11_looks_for_an_entry_only_on_the_candle_that_ends_a_bar_when_as
     ns, app, svc, wire, saved, rel, before = start(
         RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S00", "S01", "S02"],
         **{"N_BASKETS = 4": "N_BASKETS = 1", "RSI_LIVE = False": "RSI_LIVE = True", "ACT_ON_BAR_END = True": "ACT_ON_BAR_END = True"})
-    feed = fake_dh[-1].fn
+    feed = candle_feed(fake_dh).fn
     for i, px in enumerate([last - 0.25, last - 0.5, last - 0.75, last - 1.0]):                      # :00 to :03 of a 5-minute bar: oversold, but not the end of a bar
         feed(Update(added={"token": [100], "Close": [px], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
     time.sleep(0.3)
@@ -300,7 +329,7 @@ def test_the_tick_exit_edits_the_token_table_from_a_worker_thread_and_a_tick_clo
     ns, app, svc, wire, saved, rel, before = start(
         RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S00", "S01", "S02"], extra_ns={"fo_market_data": Feed()},
         **{"N_BASKETS = 4": "N_BASKETS = 1", "RSI_LIVE = False": "RSI_LIVE = True", "UNSUB_AFTER_S = 60": "UNSUB_AFTER_S = 30"})
-    on_tick, on_candle = fake_dh[0].fn, fake_dh[1].fn                                                 # the tick listener is made first, then the candle one
+    on_tick, on_candle = candle_feed(fake_dh).fn, candle_feed(fake_dh).fn                                                 # the tick listener is made first, then the candle one
     entry = last - 0.25
     on_candle(Update(added={"token": [100], "Close": [entry], "Minute": [DAY0]}), False)              # the entry, made inside the candle listener
     assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][1] == "subscribe"
@@ -329,21 +358,21 @@ def one_entry_run(tmp_path, fake_dh, monkeypatch, **replace):
         RSI, "11_india_fut_rsi_crossorder.py", tmp_path, monkeypatch, unders=["S00", "S01", "S02"],
         **{"N_BASKETS = 4": "N_BASKETS = 1", "RSI_LIVE = False": "RSI_LIVE = True", "ACT_ON_BAR_END = True": "ACT_ON_BAR_END = False", "UNSUB_AFTER_S = 60": "UNSUB_AFTER_S = 0.3", **replace})
     entry = last - 0.25
-    fake_dh[-1].fn(Update(added={"token": [100], "Close": [entry], "Minute": [DAY0]}), False)
+    candle_feed(fake_dh).fn(Update(added={"token": [100], "Close": [entry], "Minute": [DAY0]}), False)
     assert wait_for(lambda: len(wire.sent) == 1) and wire.sent[0][1] == "subscribe"
     for i in range(1, 60):                                                                           # +3%: the target; repeat until the exit goes out
-        fake_dh[-1].fn(Update(added={"token": [100], "Close": [entry * 1.03], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [100], "Close": [entry * 1.03], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
         if any(lab == "squareup" for _, lab, _ in wire.sent):
             break
         time.sleep(0.1)
     assert wait_for(lambda: [lab for _, lab, _ in wire.sent][:3] == ["subscribe", "squareup", "unsubscribe"])
     top, minute = entry * 1.03, 100
     for k in range(1, 16):                                                                           # the RSI leaves the oversold zone
-        fake_dh[-1].fn(Update(added={"token": [100], "Close": [top + 0.5 * k], "Minute": [DAY0 + np.timedelta64(minute, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [100], "Close": [top + 0.5 * k], "Minute": [DAY0 + np.timedelta64(minute, "m")]}), False)
         minute += 1
     peak = top + 7.5
     for k in range(1, 70):                                                                           # and falls into it again
-        fake_dh[-1].fn(Update(added={"token": [100], "Close": [peak - 0.25 * k], "Minute": [DAY0 + np.timedelta64(minute, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [100], "Close": [peak - 0.25 * k], "Minute": [DAY0 + np.timedelta64(minute, "m")]}), False)
         minute += 1
     time.sleep(0.5)
     svc.on_stop()
@@ -365,6 +394,8 @@ ALL_SIX = ["08_us_basket_rsi_crossorder.py", "10_us_zscore_crossorder.py", "11_i
 def test_every_ranking_script_retries_a_failed_ranking_and_counts_where_signals_go(name):
     text = inline_params(EXAMPLES / name)
     for needle in ("RETRY_RANKING_S = 20", "def ranking_failed(token, first, e):", "retry[token] = first", "due = list(retry.items())", 'count("signals")' if name[:2] in ("08", "10", "11", "12") else 'count("looked at")',
-                   'count("entered")', 'count("ranking errors")', '"   signals: "'):
+                   'count("ranking errors")', '"   signals: "'):
         assert needle in text, (name, needle)
+    # the spread-gated scripts (08, 14) ARM an entry and send it when the spread tightens; the others enter straight away
+    assert 'count("entered")' in text or 'count("armed")' in text, (name, "entered/armed")
     assert "the ranking is not available ({e}); no trade" not in text                                    # the old one-shot message (with the whole stack trace) is gone

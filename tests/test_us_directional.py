@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from algo.series.absolute import Absolute, Relative
-from tests.test_examples import apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
+from tests.test_examples import candle_feed, apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 from tests.test_us_basket_rsi import ALWAYS_OPEN, DAY0, MY_BASKET, basket_block, write_history
 
@@ -52,7 +52,7 @@ def run(tmp_path, fake_dh, monkeypatch, up, pct=50.0, **kw):
     for i in range(40):                                                                                # 8 bars of one candle per minute
         price = last + (+10.0 if up else -10.0) * (i // 5 + 1) + (i % 5) * 0.01
         before = len(wire.sent)
-        fake_dh[0].fn(Update(added={"token": [FUT], "Close": [price], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [price], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
         time.sleep(0.05)
         if len(wire.sent) > before:
             entries.append(i)
@@ -124,7 +124,7 @@ def run_two_sides(tmp_path, fake_dh, monkeypatch, **replace):
     for i in range(80):
         bar = i // 5
         price = last + (10.0 * (bar + 1) if bar < 8 else 80.0 - 15.0 * (bar - 7)) + (i % 5) * 0.01             # 8 bars up, then 8 bars down to a new low of the day
-        fake_dh[0].fn(Update(added={"token": [FUT], "Close": [price], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [price], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
         time.sleep(0.05)
     time.sleep(0.3)
     svc.on_stop()
@@ -173,7 +173,7 @@ def two_bars(tmp_path, fake_dh, monkeypatch, first_offset, second_offset, up=Tru
     last = write_history(tmp_path, ["2020-01-13", "2020-01-14", "2020-01-15"], step=+0.25 if up else -0.25)
     ns, svc, wire, calls = start(tmp_path, monkeypatch, pct=100.0 if up else 10.0, **replace)
     for i, off in enumerate([first_offset] * 5 + [second_offset] * 5):
-        fake_dh[0].fn(Update(added={"token": [FUT], "Close": [last + off + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [last + off + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
         time.sleep(0.05)
     time.sleep(0.2)
     svc.on_stop()
@@ -217,7 +217,7 @@ def two_up_bars_with_a_flaky_ranking(tmp_path, fake_dh, monkeypatch, capsys, **r
     ns, svc, wire, calls = start(tmp_path, monkeypatch, pct=100.0, **replace)
     flaky_ranking(ns)
     for i in range(11):                                                                                 # bar 0, bar 1 (its last candle is i = 9) and one candle of bar 2
-        fake_dh[0].fn(Update(added={"token": [FUT], "Close": [last + (10.0 if i < 5 else 20.0 if i < 10 else 30.0) + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [last + (10.0 if i < 5 else 20.0 if i < 10 else 30.0) + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
         time.sleep(0.05)
     time.sleep(0.3)
     ns["us_directional_status"]()
@@ -242,7 +242,7 @@ def test_status_counts_where_the_signals_went(tmp_path, fake_dh, monkeypatch, ca
     last = write_history(tmp_path, ["2020-01-13", "2020-01-14", "2020-01-15"], step=+0.25)
     ns, svc, wire, calls = start(tmp_path, monkeypatch, pct=50.0)                                        # the middle band: relative refuses every look
     for i in range(10):
-        fake_dh[0].fn(Update(added={"token": [FUT], "Close": [last + (10.0 if i < 5 else 20.0) + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [last + (10.0 if i < 5 else 20.0) + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
     ns["us_directional_status"]()
     out = capsys.readouterr().out
     svc.on_stop()

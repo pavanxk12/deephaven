@@ -6,7 +6,7 @@ import time
 import numpy as np
 import pytest
 
-from tests.test_examples import inline_params, EXAMPLES, Update, wait_for
+from tests.test_examples import candle_feed, inline_params, EXAMPLES, Update, wait_for
 from tests.test_india_fut import DAY0, start, write_two_contracts
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 
@@ -21,7 +21,7 @@ def run(tmp_path, fake_dh, monkeypatch, up, pct=50.0, **replace):
     """Candles that rise (up) or fall, 10 per bar. Returns (svc, wire, entries), where entries = the candle minute at which each subscribe appeared."""
     last = write_two_contracts(tmp_path, ["2020-01-13", "2020-01-14", "2020-01-15"], "30JAN20", "27FEB20", step=+0.25 if up else -0.25)
     ns, app, svc, wire, saved, rel, before = start(SCRIPT, NAME, tmp_path, monkeypatch, unders=["S00", "S01", "S02"], pct=pct, **{**SETTINGS, **replace})
-    feed = fake_dh[-1].fn
+    feed = candle_feed(fake_dh).fn
     entries, price = [], last
     for i in range(40):                                                                                # 8 bars of one candle per minute
         bar = i // 5
@@ -50,17 +50,17 @@ def test_a_middle_percentile_stock_does_not_trade(tmp_path, fake_dh, monkeypatch
 
 def test_the_worst_of_the_basket_sells(tmp_path, fake_dh, monkeypatch):
     svc, wire, entries = run(tmp_path, fake_dh, monkeypatch, up=False, pct=0.0,                          # the worst of the basket (relative), and below 20 (absolute)
-                              **{"USE_IV = True": "USE_IV = False"})                                     # the IV gate needs its own high percentile: off here, it has its own test
+                              **{"USE_V = True": "USE_V = False"})                                     # the IV gate needs its own high percentile: off here, it has its own test
     subs = [p for _, lab, p in wire.sent if lab == "subscribe"]
     assert len(subs) == 1 and subs[0]["SIDE"] == 2 and entries[0] % 5 == 4
     svc.on_stop()
 
 
 def test_a_weak_ranking_is_refused_when_direction_must_match_and_taken_when_it_need_not(tmp_path, fake_dh, monkeypatch):
-    svc, wire, entries = run(tmp_path, fake_dh, monkeypatch, up=True, pct=0.0, **{"USE_IV = True": "USE_IV = False"})           # weak/worst ranking, but the day is making a new high
+    svc, wire, entries = run(tmp_path, fake_dh, monkeypatch, up=True, pct=0.0, **{"USE_V = True": "USE_V = False"})           # weak/worst ranking, but the day is making a new high
     assert wire.sent == []
     svc.on_stop()
-    svc, wire, entries = run(tmp_path, fake_dh, monkeypatch, up=True, pct=0.0, **{"USE_IV = True": "USE_IV = False", "DIRECTION_MATCH = True": "DIRECTION_MATCH = False"})
+    svc, wire, entries = run(tmp_path, fake_dh, monkeypatch, up=True, pct=0.0, **{"USE_V = True": "USE_V = False", "DIRECTION_MATCH = True": "DIRECTION_MATCH = False"})
     assert [p["SIDE"] for _, lab, p in wire.sent if lab == "subscribe"] == [1]                           # either side passes: the day's own high/low decides
     svc.on_stop()
 
@@ -69,7 +69,7 @@ def test_the_iv_must_be_extreme_too_and_an_iv_that_cannot_be_told_stops_the_entr
     svc, wire, entries = run(tmp_path, fake_dh, monkeypatch, up=True, pct=90.0, iv_cannot=True)
     assert wire.sent == []                                                                              # percentiles are strong, the IV says "cannot tell": no trade
     svc.on_stop()
-    svc, wire, entries = run(tmp_path, fake_dh, monkeypatch, up=True, pct=90.0, iv_cannot=True, **{"USE_IV = True": "USE_IV = False"})
+    svc, wire, entries = run(tmp_path, fake_dh, monkeypatch, up=True, pct=90.0, iv_cannot=True, **{"USE_V = True": "USE_V = False"})
     assert [p["SIDE"] for _, lab, p in wire.sent if lab == "subscribe"] == [1]                           # without the IV filter it trades
     svc.on_stop()
 
@@ -79,7 +79,7 @@ def test_the_script_starts_the_straddle_itself_unless_the_iv_is_off(tmp_path, fa
     ns, app, svc, wire, saved, rel, before = start(SCRIPT, NAME, tmp_path, monkeypatch, unders=["S00", "S01", "S02"], **SETTINGS)
     assert ns["_straddle_calls"] == [0]                                                                  # straddle_start(0) from the script
     svc.on_stop()
-    ns, app, svc, wire, saved, rel, before = start(SCRIPT, NAME, tmp_path, monkeypatch, unders=["S00", "S01", "S02"], **{**SETTINGS, "USE_IV = True": "USE_IV = False"})
+    ns, app, svc, wire, saved, rel, before = start(SCRIPT, NAME, tmp_path, monkeypatch, unders=["S00", "S01", "S02"], **{**SETTINGS, "USE_V = True": "USE_V = False"})
     assert ns["_straddle_calls"] == []
     svc.on_stop()
 
@@ -89,11 +89,11 @@ def run_two_sides(tmp_path, fake_dh, monkeypatch, **replace):
     then fall sharply (a new day's low -> SELL). Returns the subscribes sent."""
     last = write_two_contracts(tmp_path, ["2020-01-13", "2020-01-14", "2020-01-15"], "30JAN20", "27FEB20", step=+0.25)
     ns, app, svc, wire, saved, rel, before = start(SCRIPT, NAME, tmp_path, monkeypatch, unders=["S00", "S01", "S02"], pct=0.0,
-                                                   **{**SETTINGS, "DIRECTION_MATCH = True": "DIRECTION_MATCH = False", "USE_IV = True": "USE_IV = False", **replace})
+                                                   **{**SETTINGS, "DIRECTION_MATCH = True": "DIRECTION_MATCH = False", "USE_V = True": "USE_V = False", **replace})
     for i in range(80):
         bar = i // 5
         price = last + (10.0 * (bar + 1) if bar < 8 else 80.0 - 15.0 * (bar - 7)) + (i % 5) * 0.01             # 8 bars up, then 8 bars down to a new low of the day
-        fake_dh[-1].fn(Update(added={"token": [100], "Close": [price], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [100], "Close": [price], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
         time.sleep(0.05)
     time.sleep(0.3)
     svc.on_stop()
@@ -112,9 +112,12 @@ def two_bars(tmp_path, fake_dh, monkeypatch, first_offset, second_offset, up=Tru
     """Candles moving up (or down), then two 5-minute bars of live candles at last + first_offset and last + second_offset. Returns the subscribes."""
     last = write_two_contracts(tmp_path, ["2020-01-13", "2020-01-14", "2020-01-15"], "30JAN20", "27FEB20", step=+0.25 if up else -0.25)
     ns, app, svc, wire, saved, rel, before = start(SCRIPT, NAME, tmp_path, monkeypatch, unders=["S00", "S01", "S02"], pct=90.0 if up else 0.0,
-                                                   **{**SETTINGS, "USE_IV = True": "USE_IV = False", **replace})
+                                                   **{**SETTINGS, "USE_V = True": "USE_V = False",
+                                                      'SIGNAL_BAR = "5min"': 'SIGNAL_BAR = "5min"',   # this test feeds 5 + 5 candles, so it pins the bar it is
+                                                      **replace})                                      # about: the owner's own choice is 10min, which these ten
+                                                                                                       # candles would never complete twice (len(today) < 2 -> no trade)
     for i, off in enumerate([first_offset] * 5 + [second_offset] * 5):
-        fake_dh[-1].fn(Update(added={"token": [100], "Close": [last + off + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        candle_feed(fake_dh).fn(Update(added={"token": [100], "Close": [last + off + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
         time.sleep(0.05)
     time.sleep(0.2)
     svc.on_stop()

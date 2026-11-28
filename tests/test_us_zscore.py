@@ -67,7 +67,9 @@ def test_it_has_no_rsi_and_no_absolute_filter_and_the_z_inputs():
     for gone in ("RSI", "rsi(", "HIST_DAYS", "ABS_DAYS", "ABS_ZONE", "in_own_history", "load_history"):
         assert gone not in SCRIPT.replace("no RSI", "").replace("without the RSI", ""), gone
     assert "Z_DAYS = 90" in SCRIPT and "Z_MIN_DAYS = 20" in SCRIPT and "Z_ENTRY = 3.0" in SCRIPT and 'Z_BAR = "5min"' in SCRIPT and "Z_BAR_LIVE = False" in SCRIPT
-    assert "TARGET_PCT = None" in SCRIPT and "STOP_PCT = None" in SCRIPT and re.search(r"EXIT_AT = dtime\([^)]*\)", SCRIPT)
+    # one line each when the values come back from params.ini, the original tuple when the script still holds its own
+    assert ("TARGET_PCT = None" in SCRIPT and "STOP_PCT = None" in SCRIPT) or "TARGET_PCT, STOP_PCT = None, None" in SCRIPT
+    assert re.search(r"EXIT_AT = dtime\([^)]*\)", SCRIPT)
     assert "def run_us_zscore()" in SCRIPT and "us_zscore_stop" in SCRIPT and "run_us_basket_rsi" not in SCRIPT
 
 
