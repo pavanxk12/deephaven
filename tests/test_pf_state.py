@@ -117,7 +117,7 @@ def test_the_service_records_a_confirmed_command_with_who_sent_it_and_a_refused_
     assert st.paused and st.by == "operator"
     assert svc.pause(2001, user=3, client="mine").result(5).status == "off"               # refused: that client is not switched on
     assert svc.pf_state(2001, user=3) is None
-    svc.enable("mine")
+    svc.on(client="mine")
     svc.unpause(1001, user=3, client="mine").result(5)
     st = svc.pf_state(1001, user=3)
     assert not st.paused and st.by == "mine"

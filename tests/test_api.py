@@ -367,7 +367,7 @@ def test_nats_send_has_a_master_switch_and_one_for_each_algo(session, tmp_path, 
     assert bridge.sending and seen == ["recheck"]
     ns["nats_send"](True, client="bridge_niftyy")                      # a typo, or a strategy that was never started: refused, nothing is created
     out = capsys.readouterr().out
-    assert not svc.is_enabled("bridge_niftyy") and "no automation called 'bridge_niftyy' is running" in out and "Running: bridge_nifty" in out
+    assert not svc.is_on(client="bridge_niftyy") and "no automation called 'bridge_niftyy' is running" in out and "Running: bridge_nifty" in out
     ns["nats_send"](False, client="bridge_nifty")
     assert not bridge.sending                                          # only that one stopped
     ns["nats_send"](False)                                             # the master switch

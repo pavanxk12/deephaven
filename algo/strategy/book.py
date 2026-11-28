@@ -1,9 +1,10 @@
 """Portfolio bookkeeping shared by every strategy and by the console.
 
-One portfolio (PF) = one option contract for its whole life. A stock's PF is created lazily on its first signal and
-numbered `highest known + 1`; numbers are never reused. A book that has a `user` takes its numbers from the portfolio registry
+Every instrument is just a token here: equity, future or option, this book does not care which. One portfolio (PF) = one
+traded token for its whole life. A tracked token's PF is created lazily on its first signal and numbered `highest known +
+1`; numbers are never reused. A book that has a `user` takes its numbers from the portfolio registry
 (algo.strategy.registry), so no two strategies, and no screen, can be given the same number for that user. The two JSON files hold what must survive a restart:
-    pf_map  : future token -> PF          pf_sub : PF -> option token it is subscribed to
+    pf_map  : tracked token -> PF         pf_sub : PF -> the token it is subscribed to
 With ALGO_STATE_STORE=postgres (algo.core.statedb) they are the tables algo_pf_map and algo_pf_sub (keyed by the file's name), written first; the files are then written too, as a backup copy
 (a failure there is only logged). The files are read only once: when a table has no rows for the book they are imported.
 Everything else (caps, paused, live legs, allow switches) lives in memory and survives a plugin restart via `app.shared`.
@@ -52,15 +53,15 @@ class Portfolios:
         self.map_file, self.sub_file, self.pf_start = map_file, sub_file, pf_start
         self.db = db                                              # a StateDB: the two maps live in Postgres (the files are only imported once)
         self.registry, self.user, self.owner = registry, user, owner      # set: numbers come from the registry, as `user`
-        self.pf_map: dict[int, int] = self._load("algo_pf_map", map_file)        # future token -> PF   (persisted)
-        self.subscribed: dict[int, int] = self._load("algo_pf_sub", sub_file)    # PF -> option token   (persisted)
+        self.pf_map: dict[int, int] = self._load("algo_pf_map", map_file)        # tracked token -> PF   (persisted)
+        self.subscribed: dict[int, int] = self._load("algo_pf_sub", sub_file)    # PF -> the token it trades   (persisted)
         self.caps: dict[int, int] = {}                            # PF -> cumulative maxqty
         self.paused: set[int] = set()                             # PFs the bridge confirmed as paused
-        self.allow: dict[int, bool] = {}                          # future token -> automation may send params
-        self.live: dict[int, str | None] = {}                     # future token -> leg last started (CALL / PUT)
-        self.opt_of: dict[int, int] = {}                          # future token -> option token it trades
-        self.last_fail: dict[int, float] = {}                     # future token -> time of the last failed swap
-        self.tracked: set[int] = set()                            # future tokens some strategy follows this session
+        self.allow: dict[int, bool] = {}                          # tracked token -> automation may send params
+        self.live: dict[int, str | None] = {}                     # tracked token -> leg last started (CALL / PUT)
+        self.opt_of: dict[int, int] = {}                          # tracked token -> the token it trades
+        self.last_fail: dict[int, float] = {}                     # tracked token -> time of the last failed swap
+        self.tracked: set[int] = set()                            # tokens some strategy follows this session
         self.session_pfs: set[int] = set()                        # PFs touched this session (current and retired)
         self._listeners: list[Callable[[], None]] = []
         self._lock = threading.RLock()          # strategy threads, the bridge loop and the UI all change this state
@@ -79,7 +80,7 @@ class Portfolios:
 
     # ---- registration ------------------------------------------------------------------------
     def track(self, tokens) -> None:
-        """A strategy follows these future tokens: their existing PFs join this session."""
+        """A strategy follows these tokens: their existing PFs join this session."""
         with self._lock:
             for t in tokens:
                 self.tracked.add(t)
@@ -123,26 +124,26 @@ class Portfolios:
         return None
 
     def owner_of(self, token: int, symbol_of: Callable[[int], str]) -> int | None:
-        """The tracked future behind a net-positions row, which is the OPTION a portfolio trades.
+        """The tracked token behind a net-positions row, which is the token a portfolio trades.
         None if no portfolio trades this instrument."""
         current = self.current_pf_map()
         if token in current:
             return token
-        for pf, opt in self.subscribed.items():
-            if opt == token:
+        for pf, traded in self.subscribed.items():
+            if traded == token:
                 for u, p in current.items():
                     if p == pf:
                         return u
-        name = symbol_of(token).split()[0]               # old leg of a retired PF: same stock = same checkbox
+        name = symbol_of(token).split()[0]               # old leg of a retired PF: same instrument = same checkbox
         for u in current:
             if symbol_of(u).split()[0] == name:
                 return u
         return None
 
     def pf_for_row(self, token: int, symbol_of: Callable[[int], str]) -> int | None:
-        """PF of a net-positions row: the PF subscribed to exactly this option (newest if several),
-        else the current PF of the same stock."""
-        exact = [pf for pf, opt in self.subscribed.items() if opt == token]
+        """PF of a net-positions row: the PF subscribed to exactly this token (newest if several),
+        else the current PF of the same instrument."""
+        exact = [pf for pf, traded in self.subscribed.items() if traded == token]
         if exact:
             return max(exact)
         owner = self.owner_of(token, symbol_of)
@@ -165,21 +166,21 @@ class Portfolios:
         claims = [self.registry.register(self.user, pf, self.owner) for pf in mine]
         return [c for c in claims if not c.ok]
 
-    def plan(self, token: int, option: int) -> tuple[int | None, int | None]:
-        """What `assign` would do, changing nothing: (the stock's current portfolio or None, the portfolio that would be retired
-        or None). A stock that trades another option than the one its portfolio is subscribed to moves to a NEW portfolio and
-        the old one retires; a stock with none gets its first; otherwise the portfolio it has is kept."""
+    def plan(self, token: int, traded: int) -> tuple[int | None, int | None]:
+        """What `assign` would do, changing nothing: (the token's current portfolio or None, the portfolio that would be retired
+        or None). A token that now trades another token than the one its portfolio is subscribed to moves to a NEW portfolio and
+        the old one retires; a token with none gets its first; otherwise the portfolio it has is kept."""
         with self._lock:
             cur = self.pf_of(token)
-            moves = cur is not None and self.subscribed.get(cur) not in (None, option)
+            moves = cur is not None and self.subscribed.get(cur) not in (None, traded)
             return cur, (cur if moves else None)
 
-    def assign(self, token: int, option: int, name: str = "", algo: str = "") -> tuple[int, int | None, bool]:
-        """The portfolio an algo must use for this stock and option: (pf, old_pf, created).
-        The algo never picks a number. The book keeps the stock's portfolio, makes a new one (numbered by the registry, as this
-        book's user) when the stock has none or moves to another option, and says which one retires (`old_pf`)."""
+    def assign(self, token: int, traded: int, name: str = "", algo: str = "") -> tuple[int, int | None, bool]:
+        """The portfolio an algo must use for this token and the token it trades: (pf, old_pf, created).
+        The algo never picks a number. The book keeps the token's portfolio, makes a new one (numbered by the registry, as this
+        book's user) when the token has none or moves to another traded token, and says which one retires (`old_pf`)."""
         with self._lock:
-            cur, old_pf = self.plan(token, option)
+            cur, old_pf = self.plan(token, traded)
             if cur is None or old_pf is not None:
                 return self.create(token, name=name, algo=algo), old_pf, True
             self.label(cur, algo=algo, name=name)              # the registry always knows who uses it and what it trades
@@ -211,7 +212,7 @@ class Portfolios:
         return pf
 
     def revert(self, token: int, old_pf: int, new_pf: int) -> None:
-        """The new PF never reached the bridge: the stock goes back to its old PF."""
+        """The new PF never reached the bridge: the token goes back to its old PF."""
         with self._lock:
             self.pf_map[token] = old_pf
             self.save_map()
@@ -220,9 +221,9 @@ class Portfolios:
         self.changed()
 
     # ---- mutations ---------------------------------------------------------------------------
-    def subscribe(self, pf: int, option_token: int) -> None:
+    def subscribe(self, pf: int, token: int) -> None:
         with self._lock:
-            self.subscribed[pf] = option_token
+            self.subscribed[pf] = token
             self._store("algo_pf_sub", self.sub_file, self.subscribed)
         self.changed()
 
@@ -234,12 +235,12 @@ class Portfolios:
         self.allow[token] = bool(on)
         self.changed()
 
-    def set_live(self, token: int, leg: str | None, option: int | None = None) -> None:
+    def set_live(self, token: int, leg: str | None, traded: int | None = None) -> None:
         self.live[token] = leg
-        if option is None:
+        if traded is None:
             self.opt_of.pop(token, None)
         else:
-            self.opt_of[token] = option
+            self.opt_of[token] = traded
 
     def save_map(self) -> None:
         with self._lock:
@@ -315,4 +316,4 @@ class Book(Plugin):
 
     def describe(self) -> str:
         s = self.state
-        return f"{len(s.current_pf_map())} stocks with a PF, {len(s.paused)} paused" if s else ""
+        return f"{len(s.current_pf_map())} tokens with a PF, {len(s.paused)} paused" if s else ""

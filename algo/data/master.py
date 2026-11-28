@@ -133,6 +133,27 @@ class MasterData:
         f = self.futs[(self.futs["TckrSymb"] == symbol) & (self.futs["expiry"] >= today)].sort_values("expiry")
         return int(f["fut_token"].iloc[0]) if len(f) else None
 
+    # ---- simple get_* lookups -------------------------------------------------------------
+    def get_equity(self, symbol: str) -> int | None:
+        """Token of this underlying's cash / spot instrument, or None if it has none."""
+        return self.spot_of.get(symbol.upper())
+
+    def get_future(self, symbol: str, expiry: int = 0) -> int | None:
+        """Token of this underlying's future: expiry=0 is the nearest listed, 1 the next, and so on.
+        None past the last one listed (not a "not expired yet" check: use `nearest_future` for that)."""
+        f = self.futs[self.futs["TckrSymb"] == symbol.upper()].sort_values("expiry")
+        return int(f["fut_token"].iloc[expiry]) if 0 <= expiry < len(f) else None
+
+    def get_option(self, symbol: str, option_type: str, strike: float, expiry: int = 0) -> int | None:
+        """Token of this underlying's CE/PE option at this exact strike: expiry=0 is the nearest expiry that has
+        options of this type, 1 the next, and so on. None if that expiry, or that exact strike in it, does not exist."""
+        exps = self.expiries(symbol.upper(), option_type.upper())
+        if not 0 <= expiry < len(exps):
+            return None
+        strikes, tokens = self.strikes(symbol.upper(), exps[expiry], option_type.upper())
+        idx = np.searchsorted(strikes, strike)
+        return int(tokens[idx]) if idx < len(strikes) and strikes[idx] == strike else None
+
     # ---- (de)serialisation ------------------------------------------------------------------
     def as_dict(self) -> dict:
         return {"chain": self.chain, "opt": self.opt, "futs": self.futs, "eqs": self.eqs,

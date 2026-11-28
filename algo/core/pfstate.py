@@ -20,7 +20,7 @@ class PfState:
     __slots__ = ("option", "subscribed", "paused", "squared", "by", "cmd", "at")
 
     def __init__(self):
-        self.option: int | None = None      # the option token it is subscribed to
+        self.option: int | None = None      # the token it is subscribed to (equity, future or option: this layer does not care)
         self.subscribed = False             # the checkbox: True after subscribe, False after unsubscribe
         self.paused = False                 # the Pause / Resume button
         self.squared = False                # a square up went through and nothing has been applied since
@@ -49,7 +49,7 @@ class PfStates:
         return [(u, p, s) for (u, p), s in list(self._d.items()) if user is None or u == user]
 
     def by_option(self, user: int | None = None, keep: Callable[[int, int, PfState], bool] | None = None) -> dict:
-        """option token -> (user, pf, state): the portfolio that trades it. If several do, a subscribed one wins, then the latest change.
+        """token -> (user, pf, state): the portfolio that trades it. If several do, a subscribed one wins, then the latest change.
         `keep(user, pf, state)` may leave some out first (for instance another strategy's portfolios)."""
         out: dict = {}
         for u, p, s in self.items(user):

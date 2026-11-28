@@ -256,7 +256,7 @@ def test_the_nats_service_start_creates_its_tables_and_keeps_blocks_across_a_res
     wire = Wire()
     svc = app.run(NatsService(NatsConfig(users=(3, 4), send_on=True), transport_factory=lambda: wire))
     assert "cmd_queue_automated" in app.tables and "nats_events" in app.tables and svc.zone is not None
-    svc.block(user=4)
+    svc.off(user=4)
     assert svc.pause(1, user=3).result(5).ok and app.shared["cmd_writer"].rows[0][:2] == (1, "pause_unpause")
     again = app.run(NatsService(NatsConfig(users=(3, 4), send_on=True), transport_factory=lambda: wire))
     assert again is not svc and again.blocks() == {"users": [4], "portfolios": {}}          # the block outlived the restart
@@ -474,7 +474,7 @@ def test_owner_and_algo_names_are_shared_not_copied_for_every_portfolio(tmp_path
 def test_the_book_gives_an_algo_its_portfolio_and_says_when_one_retires(tmp_path, reg):
     book = _book(tmp_path, "stocks", reg, 3)
     book.track([10])
-    pf, old, created = book.assign(10, option=55, name="RELIANCE", algo="rsi_stocks")
+    pf, old, created = book.assign(10, traded=55, name="RELIANCE", algo="rsi_stocks")
     assert (pf, old, created) == (1111, None, True)                           # none yet: a new one, numbered by the registry
     assert reg.get(3, 1111)["algo"] == "rsi_stocks" and reg.get(3, 1111)["name"] == "RELIANCE"
     book.subscribe(pf, 55)                                                      # the bridge subscribed it to option 55

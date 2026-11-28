@@ -450,31 +450,31 @@ def test_one_configured_user_is_the_default_and_a_dry_run_still_checks_the_user(
 
 def test_blocking_a_user_stops_only_that_user_and_unblocking_restores_it():
     svc, wire = make(users=(3, 4))
-    svc.block(user=4)
+    svc.off(user=4)
     r = svc.pause(1, user=4).result(5)
     assert (r.ok, r.status) == (False, "blocked") and wire.sent == []
     assert svc.pause(2, user=3).result(5).ok                       # the other user is untouched
-    svc.unblock(user=4)
+    svc.on(user=4)
     assert svc.pause(1, user=4).result(5).ok and svc.blocks() == {"users": [], "portfolios": {}}
     svc.on_stop()
 
 
 def test_a_portfolio_is_blocked_under_its_own_user_only():
     svc, wire = make(users=(3, 4))
-    svc.block(user=4, pf=1913)
+    svc.off(user=4, pf=1913)
     assert svc.pause(1913, user=4).result(5).status == "blocked" and svc.squareup(1913, user=4).result(5).status == "blocked"
     assert svc.pause(1913, user=3).result(5).ok          # the same number under user 3 is another portfolio
     assert svc.pause(1914, user=4).result(5).ok          # and user 4's other portfolios are untouched
-    svc.unblock(user=4, pf=1913)
+    svc.on(user=4, pf=1913)
     assert svc.pause(1913, user=4).result(5).ok
-    svc.block(user=4, pf=[1, 2])                          # several portfolios of one user
+    svc.off(user=4, pf=[1, 2])                          # several portfolios of one user
     assert svc.blocks() == {"users": [], "portfolios": {4: [1, 2]}}
     svc.on_stop()
 
 
 def test_blocking_a_user_blocks_every_portfolio_under_that_user_even_ones_not_seen_yet():
     svc, wire = make(users=(3, 4))
-    svc.block(user=4)
+    svc.off(user=4)
     assert all(svc.pause(pf, user=4).result(5).status == "blocked" for pf in (1, 1913, 99999))
     assert svc.pause(1913, user=3).result(5).ok and len(wire.sent) == 1
     svc.on_stop()
@@ -482,10 +482,10 @@ def test_blocking_a_user_blocks_every_portfolio_under_that_user_even_ones_not_se
 
 def test_unblocking_a_user_lifts_every_portfolio_blocked_under_that_user_and_only_theirs():
     svc, wire = make(users=(3, 4))
-    svc.block(user=4)
-    svc.block(user=4, pf=[1, 2])
-    svc.block(user=3, pf=7)
-    svc.unblock(user=4)
+    svc.off(user=4)
+    svc.off(user=4, pf=[1, 2])
+    svc.off(user=3, pf=7)
+    svc.on(user=4)
     assert svc.blocks() == {"users": [], "portfolios": {3: [7]}}
     assert svc.pause(1, user=4).result(5).ok and svc.pause(2, user=4).result(5).ok
     assert svc.pause(7, user=3).result(5).status == "blocked"
@@ -494,10 +494,10 @@ def test_unblocking_a_user_lifts_every_portfolio_blocked_under_that_user_and_onl
 
 def test_unblocking_one_portfolio_does_not_lift_a_whole_user_block():
     svc, wire = make(users=(3, 4))
-    svc.block(user=4)
-    svc.unblock(user=4, pf=1913)
+    svc.off(user=4)
+    svc.on(user=4, pf=1913)
     assert svc.pause(1913, user=4).result(5).status == "blocked"
-    svc.unblock(user=4)
+    svc.on(user=4)
     assert svc.pause(1913, user=4).result(5).ok
     svc.on_stop()
 
@@ -505,8 +505,8 @@ def test_unblocking_one_portfolio_does_not_lift_a_whole_user_block():
 def test_a_portfolio_must_be_named_with_exactly_one_user():
     import pytest
     svc, _ = make(users=(3, 4))
-    for call in (lambda: svc.block(pf=1913), lambda: svc.unblock(pf=1913), lambda: svc.block(user=[3, 4], pf=1913),
-                 lambda: svc.unblock(user=[3, 4], pf=1913)):
+    for call in (lambda: svc.off(pf=1913), lambda: svc.on(pf=1913), lambda: svc.off(user=[3, 4], pf=1913),
+                 lambda: svc.on(user=[3, 4], pf=1913)):
         with pytest.raises(ValueError, match="user"):
             call()
     assert svc.blocks() == {"users": [], "portfolios": {}}
@@ -533,7 +533,7 @@ def test_a_block_stops_the_rest_of_a_sequence_that_is_already_under_way():
         return first, second
     fut = svc.submit(5, job, user=4)
     time.sleep(0.02)
-    svc.block(user=4)                                              # while the first command is on the wire
+    svc.off(user=4)                                              # while the first command is on the wire
     first, second = fut.result(5)
     assert first.ok and (second.ok, second.status) == (False, "blocked")
     assert [lab for _, lab, _ in wire.sent] == ["pause_unpause:Pause"]
@@ -545,9 +545,9 @@ def test_blocking_needs_a_user_or_a_portfolio_and_whole_numbers():
     svc, _ = make()
     for bad in (dict(), dict(user="x"), dict(pf=[1, "y"]), dict(user=True)):
         with pytest.raises(ValueError):
-            svc.block(**bad)
+            svc.off(**bad)
     with pytest.raises(ValueError):
-        svc.unblock()
+        svc.on()
     svc.on_stop()
 
 
@@ -555,8 +555,8 @@ def test_blocks_are_kept_in_the_shared_store_so_they_survive_a_restart_of_the_se
     shared = {}
     first = NatsService(NatsConfig(users=(3, 4)))
     first.adopt_blocks(shared)
-    first.block(user=4, pf=1913)
-    first.block(user=3)
+    first.off(user=4, pf=1913)
+    first.off(user=3)
     second = NatsService(NatsConfig(users=(3, 4)))         # the service is stopped and started again
     second.adopt_blocks(shared)
     assert second.blocks() == {"users": [3], "portfolios": {4: [1913]}}
@@ -591,14 +591,14 @@ def test_the_bridge_sends_as_its_own_user_and_has_to_name_one_when_there_are_sev
 
 def test_a_block_stays_through_a_nats_outage_and_the_reconnect():
     svc, wire = make(users=(3, 4))
-    svc.block(user=4)
+    svc.off(user=4)
     wire.is_connected = False                                      # the NATS server goes away
     assert svc.pause(1, user=4).result(5).status == "blocked"      # still blocked while it is down (not "disconnected")
     assert svc.pause(2, user=3).result(5).status == "disconnected"  # the other user just sees the outage
     wire.is_connected = True                                       # and comes back
     assert svc.pause(1, user=4).result(5).status == "blocked" and wire.sent == []
     assert svc.pause(2, user=3).result(5).ok
-    svc.unblock(user=4)
+    svc.on(user=4)
     assert svc.pause(1, user=4).result(5).ok
     svc.on_stop()
 
@@ -607,10 +607,10 @@ def test_naming_a_blocked_user_in_a_new_start_unblocks_that_user_and_their_portf
     shared = {}
     old = NatsService(NatsConfig(users=(3, 4, 5)))
     old.adopt_blocks(shared)
-    old.block(user=4)
-    old.block(user=4, pf=2000)
-    old.block(user=5, pf=1913)
-    old.block(user=3)
+    old.off(user=4)
+    old.off(user=4, pf=2000)
+    old.off(user=5, pf=1913)
+    old.off(user=3)
     new = NatsService(NatsConfig(users=(3, 4, 5)), lift_blocks=(4,))         # nats_start(users=[4, ...]) names user 4
     new.adopt_blocks(shared, new.lift_blocks)
     assert new.blocks() == {"users": [3], "portfolios": {5: [1913]}}           # 4 and all under 4 lifted; the rest stay
@@ -624,7 +624,7 @@ def test_a_start_that_names_no_users_keeps_every_block():
     shared = {}
     old = NatsService(NatsConfig(users=(3, 4)))
     old.adopt_blocks(shared)
-    old.block(user=4)
+    old.off(user=4)
     again = NatsService(NatsConfig(users=(3, 4)))                          # nats_start() with nothing: a plain reconnect
     again.adopt_blocks(shared, again.lift_blocks)
     assert again.blocks()["users"] == [4] and again.pause(1, user=4).result(1).status == "blocked"
@@ -673,7 +673,7 @@ def test_a_client_starts_off_and_only_its_own_switch_and_the_master_switch_let_i
     svc, wire = make()                                       # master switch on
     assert svc.pause(1, client="rsi_stocks").result(5).status == "off"          # the algo has not switched itself on
     assert "has not switched sending on" in svc.pause(1, client="rsi_stocks").result(5).data["detail"]
-    assert svc.enable("rsi_stocks") is True
+    assert svc.on(client="rsi_stocks") is True
     assert svc.pause(1, client="rsi_stocks").result(5).ok and len(wire.sent) == 1
     assert svc.pause(1).result(5).ok                                              # a typed command (no client): master switch only
     svc.send_off()                                                                # the master switch stops everyone
@@ -685,22 +685,22 @@ def test_a_client_starts_off_and_only_its_own_switch_and_the_master_switch_let_i
 
 def test_one_algo_switching_off_never_stops_another():
     svc, wire = make()
-    svc.enable("rsi_stocks")
-    svc.enable("rsi_nifty")
-    svc.disable("rsi_nifty")
+    svc.on(client="rsi_stocks")
+    svc.on(client="rsi_nifty")
+    svc.off(client="rsi_nifty")
     assert svc.pause(1, client="rsi_nifty").result(5).status == "off"
     assert svc.pause(2, client="rsi_stocks").result(5).ok                         # the other algo carries on
-    assert svc.is_enabled("rsi_stocks") and not svc.is_enabled("rsi_nifty")
+    assert svc.is_on(client="rsi_stocks") and not svc.is_on(client="rsi_nifty")
     svc.on_stop()
 
 
 def test_a_client_cannot_switch_on_without_a_connection_and_a_restart_switches_everyone_off():
     dry = NatsService(NatsConfig(dry_run=True))
-    assert dry.enable("rsi_stocks") is False and not dry.is_enabled("rsi_stocks")
+    assert dry.on(client="rsi_stocks") is False and not dry.is_on(client="rsi_stocks")
     first, _ = make()
-    first.enable("rsi_stocks")
+    first.on(client="rsi_stocks")
     second, _ = make()                                                            # a restarted service: a new object
-    assert second.is_enabled("rsi_stocks") is False                               # everyone has to say "send" again
+    assert second.is_on(client="rsi_stocks") is False                               # everyone has to say "send" again
     first.on_stop()
     second.on_stop()
 
@@ -736,5 +736,5 @@ def test_the_bridge_has_its_own_switch_and_the_stand_in_never_allows_sending(tmp
     svc.send_off()
     assert nifty.state == "off" and nifty.pause_pf(p2) is None                      # the master switch stops all
     svc.on_stop()
-    assert NO_SERVICE.enable("x") is False and NO_SERVICE.allowed("x") is False and NO_SERVICE.allowed() is False
+    assert NO_SERVICE.on(client="x") is False and NO_SERVICE.allowed("x") is False and NO_SERVICE.allowed() is False
     assert NO_SERVICE.pause(1, client="x").result(1).status == "service_down" and NO_SERVICE.go(asyncio.sleep(0), client="x") is None

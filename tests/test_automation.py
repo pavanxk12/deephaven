@@ -81,12 +81,12 @@ def test_a_started_automation_has_its_own_book_and_switch_and_starts_off(console
     app, svc, wire = console
     assert algo_start(4, "mine", pf_start=2000) is True
     assert {"mine", "mine_book", "mine_bridge"} <= set(app.plugins)
-    assert svc.is_enabled("mine") is False and app["mine"].nats.state == "off"
+    assert svc.is_on(client="mine") is False and app["mine"].nats.state == "off"
     on("mine")
-    assert svc.is_enabled("mine") and app["mine"].nats.state == "on"                  # the switch is named after the automation
+    assert svc.is_on(client="mine") and app["mine"].nats.state == "on"                  # the switch is named after the automation
     assert "user 4, 0 portfolios" in app["mine"].describe()
     api.nats_send(False, client="mine")
-    assert not svc.is_enabled("mine")
+    assert not svc.is_on(client="mine")
     algo_stop("mine")
     assert not {"mine", "mine_book", "mine_bridge"} & set(app.plugins)                # stopping it stops what it started
 
@@ -96,9 +96,9 @@ def test_restarting_an_automation_switches_it_off_again_and_keeps_its_portfolios
     algo_start(4, "mine", pf_start=2000)
     on("mine")
     pf = pf_assign("mine", 1, 55, name="NIFTY")["pf"]
-    assert svc.is_enabled("mine")
+    assert svc.is_on(client="mine")
     algo_start(4, "mine", pf_start=2000)                                              # re-pasted
-    assert svc.is_enabled("mine") is False and "mine_book" in app.plugins
+    assert svc.is_on(client="mine") is False and "mine_book" in app.plugins
     pf_track("mine", [1])
     df = algo_portfolios("mine")
     assert list(df["pf"]) == [pf] and list(df["name"]) == ["NIFTY"]                   # the number, and what it is, were remembered
@@ -386,7 +386,7 @@ def test_algo_stop_pauses_squares_up_and_unsubscribes_every_portfolio_then_stops
     for pf in (a["pf"], b["pf"]):
         assert labels(wire, pf) == ["pause_unpause:Pause", "squareup", "unsubscribe"], labels(wire, pf)        # in this order, on each portfolio
     assert not {"mine", "mine_book", "mine_bridge"} & set(app.plugins)                                     # and only then it stopped (it waited for them)
-    assert not svc.is_enabled("mine")
+    assert not svc.is_on(client="mine")
 
 
 def test_algo_stop_does_not_stop_while_the_portfolios_cannot_be_unsubscribed_and_can_be_forced(console, capsys):

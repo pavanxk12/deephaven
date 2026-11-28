@@ -496,7 +496,7 @@ def nats_connect(user: int | None = None, client: str | None = None) -> bool:
             return False
     line = f"connected to the NATS service: {svc.cfg.ip}:{svc.cfg.port}, users {list(svc.cfg.users)}, state {svc.state}"
     if client is not None:
-        line += f"; {client} sending {'ON' if svc.is_enabled(client) else 'OFF (switch it on: nats_send(True, client=...))'}"
+        line += f"; {client} sending {'ON' if svc.is_on(client=client) else 'OFF (switch it on: nats_send(True, client=...))'}"
     print(line)
     return True
 
@@ -602,7 +602,7 @@ def nats_block(user=None, pf=None) -> None:
     if user is None and pf is None:
         print(f"blocked: {svc.blocks()}")
         return
-    svc.block(user=user, pf=pf)
+    svc.off(user=user, pf=pf)
     print(f"blocked: {svc.blocks()}")
 
 
@@ -612,7 +612,7 @@ def nats_unblock(user=None, pf=None) -> None:
     svc = _nats()
     if svc is None:
         return _service_down("nats_unblock")
-    svc.unblock(user=user, pf=pf)
+    svc.on(user=user, pf=pf)
     print(f"blocked: {svc.blocks()}")
 
 

@@ -289,7 +289,7 @@ def rising(n, start=25000.0, step=60.0):
 def test_the_template_is_a_complete_working_automation(tmp_path, fake_dh, monkeypatch):
     ns, app, svc, wire = console_with_services(tmp_path, monkeypatch)
     run_script(ns, "03_algo_template.py")
-    assert svc.is_enabled("template") and len(fake_dh) == 1                           # the last line switched it on; one listener: the candles
+    assert svc.is_on(client="template") and len(fake_dh) == 1                           # the last line switched it on; one listener: the candles
     feed(fake_dh, falling(5))
     time.sleep(0.1)
     assert wire.sent == [] and ns["rsi"](ns["closes"]) is None                        # not enough candles for an RSI(9) yet
@@ -433,7 +433,7 @@ def start_sma(tmp_path, monkeypatch, history=None):
 
 def test_an_sma_crossing_up_churns_the_five_nearest_calls_and_down_replaces_them_with_puts(tmp_path, fake_dh, monkeypatch):
     ns, app, svc, wire = start_sma(tmp_path, monkeypatch)
-    assert svc.is_enabled("nifty_sma") and len(fake_dh) == 1
+    assert svc.is_on(client="nifty_sma") and len(fake_dh) == 1
     feed(fake_dh, falling(10, start=25100.0))                                        # the fast average sits under the slow one: no crossing yet
     time.sleep(0.1)
     assert wire.sent == [] and ns["state"]["side"] == -1

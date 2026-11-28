@@ -8,7 +8,7 @@ What is remembered for each portfolio:
 
     user      the user it belongs to                              (with the number, this is the unique id)
     pf        the portfolio number
-    name      what it trades, such as the stock "RELIANCE"        (may be empty)
+    name      what it trades, such as "RELIANCE"                  (may be empty)
     algo      the strategy or screen that uses it, "rsi_stocks"   (may be empty; updated when another algo takes it over)
     owner     the book that numbers it, "book_stocks"             (the number belongs to this book; others are refused)
     created   when it was first registered, and a free `note`

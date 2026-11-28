@@ -50,7 +50,7 @@ class Bridge(Plugin):
     # ---- lifecycle ---------------------------------------------------------------------------
     def start(self) -> None:
         self.bind(None, self.app[self.book_name].state)
-        self.nats.disable(self.client)                    # (this also hooks the shared portfolio states, see `nats`)                    # every start begins OFF, even a re-paste of an algo that was sending
+        self.nats.off(client=self.client)                    # (this also hooks the shared portfolio states, see `nats`)                    # every start begins OFF, even a re-paste of an algo that was sending
         self.log.info("sending through %s: %s", self.nats_name, self.nats.describe())
         book_user = getattr(self.book, "user", None)
         if self.cfg.user is not None and book_user is not None and self.cfg.user != book_user:
@@ -121,7 +121,7 @@ class Bridge(Plugin):
             self._unhook()
         self._hub = self._unhook = None
         try:
-            self.nats.disable(self.client)                # a stopped strategy is OFF: its console button must not keep showing ON
+            self.nats.off(client=self.client)                # a stopped strategy is OFF: its console button must not keep showing ON
         except Exception:
             self.log.exception("sending switch not turned off")
 
@@ -134,7 +134,7 @@ class Bridge(Plugin):
     def state(self) -> str:
         """For a UI: service_down, disconnected, dry, off or on (off also when this bridge has not switched sending on)."""
         base = self.nats.state
-        return "off" if base == "on" and not self.nats.is_enabled(self.client) else base
+        return "off" if base == "on" and not self.nats.is_on(client=self.client) else base
 
     async def _pause(self, call: Call, pf: int, action: str) -> Reply:
         """Pause or unpause; the book is told only after the bridge has answered ok."""
@@ -176,12 +176,12 @@ class Bridge(Plugin):
 
     def send_off(self) -> None:
         """This algo keeps computing signals but sends nothing; other algos are not affected. A swap in flight finishes."""
-        self.nats.disable(self.client)
+        self.nats.off(client=self.client)
         self.book.changed()
 
     def send_on(self) -> bool:
         """This algo may send (it starts OFF). The service's master switch must be on too."""
-        if not self.nats.enable(self.client):
+        if not self.nats.on(client=self.client):
             return False
         self.book.changed()
         for cb in list(self._enable_cbs):
@@ -198,8 +198,8 @@ class Bridge(Plugin):
         return {**self.nats.cfg.sub_payload, **self.cfg.subscribe, "T1": option}
 
     async def retire(self, old_pf: int) -> None:
-        """The stock moves to another option: pause the old portfolio, optionally square it up and unsubscribe it.
-        It keeps its number and option; a new portfolio takes over the stock."""
+        """The tracked token moves to another traded token: pause the old portfolio, optionally square it up and unsubscribe it.
+        It keeps its number and traded token; a new portfolio takes over the tracked token."""
         cfg = self.cfg
 
         async def job(call: Call) -> None:

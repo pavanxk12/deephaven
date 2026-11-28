@@ -48,7 +48,7 @@ def fall(n=12, start=100.0, step=1.0):
 
 def test_an_oversold_symbol_in_the_middle_sends_one_single_order_subscribe_and_the_target_closes_it_with_squareup(tmp_path, fake_dh, monkeypatch):
     ns, app, svc, wire, calls, ranks, before = start(tmp_path, monkeypatch)
-    assert svc.is_enabled("basket_rsi") and [c[1] for c in calls if c[0] == "basket"] == ["banks", "it"]               # each basket saved under its name
+    assert svc.is_on(client="basket_rsi") and [c[1] for c in calls if c[0] == "basket"] == ["banks", "it"]               # each basket saved under its name
     leaked = sorted(n for n in set(ns) - before if not n.startswith("basket_rsi") and n != "run_basket_rsi" and not n.startswith("__"))
     assert leaked == []                                                                                              # nothing that could overwrite another script's names
     bars(fake_dh, fall(9))

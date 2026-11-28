@@ -4,12 +4,13 @@
     nats.squareup(pf)              nats.apply(pf, {...})     nats.unsubscribe(pf, option)
 
 The service is started ONCE for everyone (nats_start); an algo or the UI only connects to it (nats_connect). Each of them is a
-named client and has its own sending switch, which starts OFF: `svc.enable("rsi_nifty")` / `svc.disable("rsi_nifty")`. Commands go
+named client and has its own sending switch, which starts OFF: `svc.on(client="rsi_nifty")` / `svc.off(client="rsi_nifty")`. Commands go
 out only while the service's master switch is on AND the client's own switch is on, so one algo stopping never stops another.
 
 Every command is sent AS a user (`user=3`; optional when the service has only one). The service is started with the users it
-allows, a command for any other user is refused, and `block(user=..)` / `block(user=.., pf=..)` stop a user (every portfolio under
-it) or some of one user's portfolios. A portfolio number belongs to a user: user + portfolio is the unique id.
+allows, a command for any other user is refused, and `svc.off(user=..)` / `svc.off(user=.., pf=..)` turn a user off (every
+portfolio under it) or some of one user's portfolios; `svc.on(...)` turns them back on. A portfolio number belongs to a
+user: user + portfolio is the unique id.
 
 Each call returns at once with a `concurrent.futures.Future[Reply]`, so a Deephaven listener or a UI callback is never
 held up by the network. `.result(timeout)` waits when you want the answer.
@@ -200,13 +201,13 @@ class NoService:
     def send_off(self) -> None:
         pass
 
-    def enable(self, client) -> bool:
+    def on(self, *, client=None, user=None, pf=None) -> bool:
         return False
 
-    def disable(self, client) -> None:
+    def off(self, *, client=None, user=None, pf=None) -> None:
         pass
 
-    def is_enabled(self, client) -> bool:
+    def is_on(self, *, client=None, user=None, pf=None) -> bool:
         return False
 
     def allowed(self, client=None) -> bool:
@@ -415,22 +416,70 @@ class NatsService(Plugin):
         self.sending = False
         self.log.info("sending OFF for everyone: no new commands are accepted")
 
-    # ---- the switch of each client (an algo, the UI) ---------------------------------------------------
-    def enable(self, client: str) -> bool:
-        """This client may send (it starts OFF). Only the master switch and this switch decide; other clients are not affected."""
-        if self.transport is None:
-            self.log.warning("%s: cannot turn sending ON: dry run or no NATS connection", client)
-            return False
-        self._enabled.add(client)
-        self.log.info("%s: sending ON", client)
+    # ---- the switch of each client (an algo, the UI), and of each user / portfolio -----------------------
+    def on(self, *, client: str | None = None, user=None, pf=None) -> bool:
+        """Turn one thing ON:
+
+            on(client="rsi_nifty")        this client may send (it starts OFF; master switch still applies)
+            on(user=4)                    user 4 and every portfolio under user 4
+            on(user=4, pf=1913)           only portfolio 1913 of user 4  (pf=[1913, 1914] for several)
+
+        Exactly one of `client` or `user` is given; `pf` only together with `user`."""
+        if client is not None:
+            if self.transport is None:
+                self.log.warning("%s: cannot turn ON: dry run or no NATS connection", client)
+                return False
+            self._enabled.add(client)
+            self.log.info("%s: ON", client)
+            return True
+        users, pfs = _ints(user), _ints(pf)
+        if not users:
+            raise ValueError("on(user=4) or on(user=4, pf=1913): a portfolio number belongs to a user, so name the user")
+        if pfs:
+            if len(users) != 1:
+                raise ValueError("a portfolio belongs to one user: on(user=4, pf=[1913, 1914]), one user at a time")
+            (u,) = users
+            self.blocked_pfs.difference_update((u, p) for p in pfs)
+            what = f"user {u} portfolios {sorted(pfs)}"
+        else:
+            self._lift(users)
+            what = f"users {sorted(users)} and every portfolio under them"
+        self.log.info("ON: %s", what)
+        self.note(0, "switch", "on", what)
         return True
 
-    def disable(self, client: str) -> None:
-        self._enabled.discard(client)
-        self.log.info("%s: sending OFF", client)
+    def off(self, *, client: str | None = None, user=None, pf=None) -> None:
+        """Turn one thing OFF: see `on()`. Also stops the rest of a sequence already under way for a user/portfolio, and a
+        squareup too: that is what OFF means. A user/portfolio OFF outlives a restart of the service but not of Deephaven."""
+        if client is not None:
+            self._enabled.discard(client)
+            self.log.info("%s: OFF", client)
+            return
+        users, pfs = _ints(user), _ints(pf)
+        if not users:
+            raise ValueError("off(user=4) or off(user=4, pf=1913): a portfolio number belongs to a user, so name the user")
+        if pfs:
+            if len(users) != 1:
+                raise ValueError("a portfolio belongs to one user: off(user=4, pf=[1913, 1914]), one user at a time")
+            (u,) = users
+            self.blocked_pfs.update((u, p) for p in pfs)
+            what = f"user {u} portfolios {sorted(pfs)}"
+        else:
+            self.blocked_users.update(users)
+            what = f"users {sorted(users)} (every portfolio under them)"
+        self.log.warning("OFF: %s", what)
+        self.note(0, "switch", "off", what)
 
-    def is_enabled(self, client: str) -> bool:
-        return client in self._enabled
+    def is_on(self, *, client: str | None = None, user=None, pf=None) -> bool:
+        """Is this client / user / (user, portfolio) currently ON? See `on()` for which argument means what."""
+        if client is not None:
+            return client in self._enabled
+        (u,) = _ints(user) or (None,)
+        if u is None:
+            raise ValueError("is_on(user=4) or is_on(user=4, pf=1913): name the user")
+        if u in self.blocked_users:
+            return False
+        return pf is None or (u, int(pf)) not in self.blocked_pfs
 
     def allowed(self, client: str | None = None) -> bool:
         """May a command from `client` go out? The master switch must be on, and the client's own switch if it names one."""
@@ -490,51 +539,7 @@ class NatsService(Plugin):
             raise RuntimeError(f"PF {pf}: {res.status}")
         return res
 
-    # ---- users and blocks -----------------------------------------------------------------------
-    def block(self, user=None, pf=None) -> None:
-        """Stop sending for a user, or for some of a user's portfolios. A portfolio number is only meaningful together with its
-        user (user + portfolio is the unique id), so:
-
-            block(user=4)                 user 4 and every portfolio under user 4
-            block(user=4, pf=1913)        only portfolio 1913 of user 4  (pf=[1913, 1914] for several)
-
-        `pf` without exactly one `user` is an error. A block also stops the rest of a sequence already under way, and a
-        squareup too: that is what blocking means. Blocks outlive a restart of the service but not of Deephaven."""
-        users, pfs = _ints(user), _ints(pf)
-        if not users:
-            raise ValueError("block(user=4) or block(user=4, pf=1913): a portfolio number belongs to a user, so name the user")
-        if pfs:
-            if len(users) != 1:
-                raise ValueError("a portfolio belongs to one user: block(user=4, pf=[1913, 1914]), one user at a time")
-            (u,) = users
-            self.blocked_pfs.update((u, p) for p in pfs)
-            what = f"user {u} portfolios {sorted(pfs)}"
-        else:
-            self.blocked_users.update(users)
-            what = f"users {sorted(users)} (every portfolio under them)"
-        self.log.warning("BLOCKED %s: nothing is sent for them", what)
-        self.note(0, "block", "blocked", what)
-
-    def unblock(self, user=None, pf=None) -> None:
-        """unblock(user=4) lifts user 4 and every portfolio blocked under user 4;
-        unblock(user=4, pf=1913) lifts only that portfolio (if the whole user is blocked, unblock the user first)."""
-        users, pfs = _ints(user), _ints(pf)
-        if not users:
-            raise ValueError("unblock(user=4) or unblock(user=4, pf=1913): a portfolio number belongs to a user, so name the user")
-        if pfs:
-            if len(users) != 1:
-                raise ValueError("a portfolio belongs to one user: unblock(user=4, pf=[1913, 1914]), one user at a time")
-            (u,) = users
-            self.blocked_pfs.difference_update((u, p) for p in pfs)
-            what = f"user {u} portfolios {sorted(pfs)}"
-            if u in self.blocked_users:
-                self.log.warning("user %s is blocked as a whole, so those portfolios stay blocked: unblock(user=%s)", u, u)
-        else:
-            self._lift(users)
-            what = f"users {sorted(users)} and every portfolio under them"
-        self.log.info("unblocked %s", what)
-        self.note(0, "block", "unblocked", what)
-
+    # ---- users and portfolios -------------------------------------------------------------------
     def _lift(self, users) -> list:
         """Remove the blocks of these users and of all their portfolios. Returns the users that had any."""
         users = set(users)

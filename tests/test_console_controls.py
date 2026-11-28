@@ -32,7 +32,7 @@ def test_a_strategy_switched_on_while_the_master_is_off_waits_for_the_master(con
     app, svc, wire = console
     algo_start(3, "a")
     set_sending(app, svc, None, False)
-    assert set_sending(app, svc, "a", True) == "" and svc.is_enabled("a")                 # its own switch is on ...
+    assert set_sending(app, svc, "a", True) == "" and svc.is_on(client="a")                 # its own switch is on ...
     assert not is_sending(svc, "a") and master_is_off(svc)                                 # ... but the button shows OFF and the window says the master is off
     set_sending(app, svc, None, True)
     assert is_sending(svc, "a")                                                            # it takes effect as soon as the master comes on
@@ -74,7 +74,7 @@ def test_a_stopped_strategy_reads_off_and_a_restart_begins_off(console):
     on("a")
     assert is_sending(svc, "a")
     algo_stop("a")
-    assert not is_sending(svc, "a") and not svc.is_enabled("a")                         # the button no longer shows ON for a strategy that is not running
+    assert not is_sending(svc, "a") and not svc.is_on(client="a")                         # the button no longer shows ON for a strategy that is not running
     assert "not running (algo_start)" in set_sending(app, svc, "a", True)               # and it cannot be switched on from the window
     algo_start(3, "a")
     assert not is_sending(svc, "a")                                                     # started again: OFF until it says so
