@@ -7,5 +7,6 @@ build/
 dist/
 history/
 
-# C++ parity-test fixtures (large SQLite market-data dumps)
-cpp/tests/parity/data/
+
+# server logins and other local settings at the repo root never go in git
+/*.ini
