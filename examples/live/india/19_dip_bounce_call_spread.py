@@ -55,6 +55,7 @@ def run_dipbounce():
 
     from algo import current
     from algo.comms.nats_service import NO_SERVICE
+    from algo.ui.filters import PF_PER_USER             # orders_trade's PF is wire-level: USER * PF_PER_USER + the book's pf
 
     _INI_NAME = "params.ini"
     
@@ -219,6 +220,10 @@ def run_dipbounce():
         }
 
     state = {}                                                     # underlying name -> setup() dict, plus the live tracking fields below
+    filled = {}                                                    # pf -> the REAL net filled quantity, from orders_trade, in the units the exchange reports
+    pf_side = {}                                                   # pf -> the side that OPENED that leg (1 the long CE, 2 the short CE). Fills are NETTED against it,
+                                                                   # so the closing fills of a squareup (ours, or an operator's) SUBTRACT instead of adding
+    trade_listener = [None]                                        # [handle] for orders_trade; None until it is up (it may not be in the session yet)
     for name in UNDERLYINGS:
         info = setup(name)
         if info is None:
@@ -501,6 +506,7 @@ def run_dipbounce():
                                 "long_strike": legs["long_strike"], "short_strike": legs["short_strike"],
                                 "entry_long": entry_long, "entry_short": entry_short, "entry_net": entry_long - entry_short,
                                 "state": "entering", "trailing": False, "lock": None, "long_ok": None, "short_ok": None}
+        pf_side[a_long["pf"]], pf_side[a_short["pf"]] = 1, 2       # so on_trade can net each leg's fills: the long CE is bought, the short CE sold
         tick_track((long_token, short_token), True)
         print(f"{name}: BUY {s['qty']} lot(s) {legs['long_strike']:g} CE at {entry_long:g}, SELL {s['qty']} lot(s) {legs['short_strike']:g} CE "
               f"at {entry_short:g} (net debit {pos['entry_net']:+.2f}), PF {a_long['pf']}/{a_short['pf']}")
@@ -603,6 +609,47 @@ def run_dipbounce():
         for name in list(state):
             leave(name, "exit_all")
 
+    def on_trade(update, is_replay):
+        """orders_trade: token, buy_sell, fill_quantity, fill_price, response_order_number, PF, activity_time. Its PF is wire-level
+        (USER * PF_PER_USER + the book's pf), converted back before matching. DISPLAY ONLY: both legs are closed with `squareup`, which
+        closes whatever the engine really holds, so no quantity decision depends on this -- it is here because status() used to show the
+        ORDERED size, which on a partly filled leg is simply wrong (and a spread can fill one leg and not the other)."""
+        ch = update.added(["PF", "buy_sell", "fill_quantity"])
+        if ch is None:
+            return
+        for wire_pf, bs, qty in zip(ch["PF"], ch["buy_sell"], ch["fill_quantity"]):
+            pf = int(wire_pf) - USER * PF_PER_USER
+            if pf in pf_side:
+                q = int(qty)
+                filled[pf] = filled.get(pf, 0) + (q if int(bs) == pf_side[pf] else -q)
+
+    def start_trade_listener(attempt=1):
+        """orders_trade is a plain console table, not a service's own, so it may not be in the session yet when this script starts.
+        Keep looking in the background rather than giving up: until it is found, status() says so instead of showing a wrong number."""
+        table = globals().get("orders_trade")
+        if table is None:
+            if attempt <= 60:                                      # about ten minutes of looking, then one line and no more
+                t = threading.Timer(10.0, start_trade_listener, (attempt + 1,))
+                t.daemon = True
+                t.start()
+            else:
+                print(f"{STRATEGY}: orders_trade never arrived; status() shows the ORDERED quantity, not the filled one")
+            return None
+        try:
+            from deephaven.table_listener import listen
+            trade_listener[0] = listen(table, on_trade, do_replay=False)
+            print(f"{STRATEGY}: following orders_trade -- status() shows the real filled quantity of each leg")
+        except Exception as e:
+            print(f"{STRATEGY}: could not follow orders_trade ({e}); status() shows the ORDERED quantity")
+        return trade_listener[0]
+
+    def legs_filled(pos):
+        """(long, short) really filled, or ('?', '?') while orders_trade is not being followed. A spread is only
+        properly on when BOTH legs filled: one leg short of the other is a naked option, so it is shown per leg."""
+        if trade_listener[0] is None:
+            return "?", "?"
+        return filled.get(pos["pf_long"], 0), filled.get(pos["pf_short"], 0)
+
     def status():
         open_n = sum(1 for s in state.values() if s["position"] is not None)
         print(f"{STRATEGY}: sending {'ON' if algo_sending(STRATEGY) else 'OFF'}, {open_n} open position(s), {len(state)} underlying(s)")
@@ -611,8 +658,9 @@ def run_dipbounce():
             if pos is not None:
                 long_px, short_px = last_px.get(pos["long_token"], float("nan")), last_px.get(pos["short_token"], float("nan"))
                 move = 100.0 * ((long_px - short_px) / pos["entry_net"] - 1.0) if pos["entry_net"] else float("nan")
-                print(f"   {name:12} {pos['qty']} lot(s) {pos['long_strike']:g}/{pos['short_strike']:g} CE net entry {pos['entry_net']:+.2f} "
-                      f"now {long_px - short_px:+.2f} ({move:+.2f}%) PF {pos['pf_long']}/{pos['pf_short']} {pos['state']}")
+                got_long, got_short = legs_filled(pos)
+                print(f"   {name:12} {pos['qty']} lot(s) ordered, filled {got_long}/{got_short} {pos['long_strike']:g}/{pos['short_strike']:g} CE "
+                      f"net entry {pos['entry_net']:+.2f} now {long_px - short_px:+.2f} ({move:+.2f}%) PF {pos['pf_long']}/{pos['pf_short']} {pos['state']}")
             else:
                 print(f"   {name:12} flat   synth% {s['last_synth_pct']!r} v% {s['last_v_pct']!r} v-range {s['last_range_pos']!r}")
         print("   signals: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none yet"))
@@ -632,7 +680,11 @@ def run_dipbounce():
     tick_start()
     straddle_listener = watch("straddle_series", on_straddle, owner=STRATEGY)
 
+    start_trade_listener()                                         # real fill tracking for status(), retried in the background if orders_trade is late
+
     def stop():
+        if trade_listener[0] is not None:
+            trade_listener[0].stop()
         straddle_listener.stop()
         tick_state[1].stop()
         tick_jobs.put(None)

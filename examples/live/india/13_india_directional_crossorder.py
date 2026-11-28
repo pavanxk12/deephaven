@@ -43,6 +43,7 @@ def run_directional():
 
     from algo import current
     from algo.comms.nats_service import NO_SERVICE
+    from algo.ui.filters import PF_PER_USER             # orders_trade's PF is wire-level: USER * PF_PER_USER + the book's pf
     from algo.core.timeframe import parse_timeframe
 
     import algo.series.absolute as absolute_module                 # the installed library crashes on a day file with a null Symbol (a token the master did not know, in an end-of-day save):
@@ -239,6 +240,10 @@ def run_directional():
     bars = {t: {} for t in symbol_of}                              # token -> {5-minute bar number: the last 1-minute close inside it}: what the TODAY filter checks
     last_px = {}                                                   # token -> the latest 1-minute close
     position = {}                                                  # token -> {side, entry, qty, pf, state}   state: entering | open | exiting
+    filled = {}                                                    # pf -> the REAL net filled quantity, from orders_trade, in the units the exchange reports
+    pf_side = {}                                                   # pf -> the side that OPENED the portfolio (1 BUY, 2 SELL). Fills are NETTED against it, so the
+                                                                   # closing fills of a squareup (ours, or an operator's from the console) SUBTRACT instead of adding
+    trade_listener = [None]                                        # [handle] for orders_trade; None until it is up (it may not be in the session yet)
     last_cross = {}                                                # token -> the bar it was last entered on: not twice on one bar
     entered = set()                                                # tokens already entered by this script: with ONE_ENTRY_PER_STOCK they are not entered again
     last_fail = {}
@@ -548,6 +553,7 @@ def run_directional():
         live.add(a["pf"])
         entered.add(token)
         position[token] = {"side": side, "entry": last_px[token], "qty": QTY, "pf": a["pf"], "state": "entering", "trailing": False, "lock": None}
+        pf_side[a["pf"]] = side                                    # so on_trade can net this portfolio's fills
         tick_track(token, True)
         print(f"{symbol_of[token]}: {'BUY' if side == 1 else 'SELL'} {QTY} lot(s) at {last_px[token]:g} on PF {a['pf']}")
         send_entry(a["pf"], token, side, QTY).add_done_callback(lambda f: settled(token, "enter", f))
@@ -649,16 +655,53 @@ def run_directional():
         for token in list(position):
             leave(token, "exit_all")
 
+    def on_trade(update, is_replay):
+        """orders_trade: token, buy_sell, fill_quantity, fill_price, response_order_number, PF, activity_time. Its PF is wire-level
+        (USER * PF_PER_USER + the book's pf, so 41004 is user 4's book pf 1004), converted back before matching. DISPLAY ONLY: the exit
+        of this script is a `squareup`, which closes whatever the engine really holds, so no quantity decision depends on this."""
+        ch = update.added(["PF", "buy_sell", "fill_quantity"])
+        if ch is None:
+            return
+        for wire_pf, bs, qty in zip(ch["PF"], ch["buy_sell"], ch["fill_quantity"]):
+            pf = int(wire_pf) - USER * PF_PER_USER
+            if pf in pf_side:
+                q = int(qty)
+                filled[pf] = filled.get(pf, 0) + (q if int(bs) == pf_side[pf] else -q)
+
+    def start_trade_listener(attempt=1):
+        """orders_trade is a plain console table, not a service's own, so it may not be in the session yet when this script starts.
+        Keep looking in the background rather than giving up: until it is found, status() says so instead of showing a wrong number."""
+        table = globals().get("orders_trade")
+        if table is None:
+            if attempt <= 60:                                      # about ten minutes of looking, then one line and no more
+                t = threading.Timer(10.0, start_trade_listener, (attempt + 1,))
+                t.daemon = True
+                t.start()
+            else:
+                print(f"{STRATEGY}: orders_trade never arrived; status() shows the ORDERED quantity, not the filled one")
+            return None
+        try:
+            from deephaven.table_listener import listen
+            trade_listener[0] = listen(table, on_trade, do_replay=False)
+            print(f"{STRATEGY}: following orders_trade -- status() shows the real filled quantity")
+        except Exception as e:
+            print(f"{STRATEGY}: could not follow orders_trade ({e}); status() shows the ORDERED quantity")
+        return trade_listener[0]
+
     def status():
         print(f"{STRATEGY}: sending {'ON' if algo_sending(STRATEGY) else 'OFF'}, {len(position)} open position(s), baskets {', '.join(f'{n} ({len(m)})' for n, m in BASKETS.items())}")
         for token, p in position.items():
-            print(f"   {symbol_of[token]:16} {'LONG' if p['side'] == 1 else 'SHORT'} {p['qty']} lot(s) entry {p['entry']:g} now {last_px.get(token, float('nan')):g} PF {p['pf']} {p['state']}")
+            print(f"   {symbol_of[token]:16} {'LONG' if p['side'] == 1 else 'SHORT'} {p['qty']} lot(s) ordered, filled {filled.get(p['pf'], 0) if trade_listener[0] else '?'} entry {p['entry']:g} now {last_px.get(token, float('nan')):g} PF {p['pf']} {p['state']}")
         print("   signals: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none yet"))
 
     tick_start()
     listener = watch("candles", on_candle, owner=STRATEGY)         # follows the table if candles are restarted; pasting again replaces this listener
 
+    start_trade_listener()                                         # real fill tracking for status(), retried in the background if orders_trade is late
+
     def stop():
+        if trade_listener[0] is not None:
+            trade_listener[0].stop()
         listener.stop()
         if tick_state:
             tick_state[1].stop()
