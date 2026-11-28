@@ -138,7 +138,14 @@ def run_two_sides(tmp_path, fake_dh, monkeypatch, **replace):
     """A weak ranking (so either side can pass once DIRECTION_MATCH is off), live candles that rise sharply (a new day's high -> BUY, the next candle's jump hits the target),
     then fall sharply (a new day's low -> SELL). Returns (subscribes, labels)."""
     last = write_history(tmp_path, ["2020-01-13", "2020-01-14", "2020-01-15"], step=+0.25)
-    ns, svc, wire, calls = start(tmp_path, monkeypatch, pct=SELL_PCT, **{"DIRECTION_MATCH = True": "DIRECTION_MATCH = False", **replace})
+    # this test is about "one entry, its exit, and no second entry", not about the owner's exit tuning (which has
+    # its own tests): a plain 2% target with the trail off, so the price path below certainly reaches it
+    ns, svc, wire, calls = start(tmp_path, monkeypatch, pct=SELL_PCT,
+                                 **{"DIRECTION_MATCH = True": "DIRECTION_MATCH = False",
+                                    "TARGET_PCT = x": "TARGET_PCT = 2.0", "STOP_PCT = x": "STOP_PCT = 1.0",
+                                    "TRAIL_TRIGGER_PCT = x": "TRAIL_TRIGGER_PCT = None",
+                                    "PROFIT_LOCK_PCT = x": "PROFIT_LOCK_PCT = None",
+                                    "TRAIL_STEP_PCT = x": "TRAIL_STEP_PCT = None", **replace})
     done = set()
     for i in range(80):
         bar = i // 5
@@ -146,11 +153,11 @@ def run_two_sides(tmp_path, fake_dh, monkeypatch, **replace):
         candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [price], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
         if listener_on(fake_dh, "fo_market_data") is not None:
             quote(fake_dh, FUT, float(price))
-        for k, (subj, lab, prm) in enumerate(list(wire.sent)):                                                 # every order that is now working fills in full, as the
-            if lab == "subscribe" and k not in done:                                                           # engine would report it: an exit is sized from the
-                done.add(k)                                                                                    # entry's REAL fills, and the position closes on the
-                fills(fake_dh, USER_ID * PF_PER_USER + int(subj.rsplit(".", 1)[1]), prm["SIDE"], prm["QTY"])    # exit's, which frees the stock to be entered again
-        time.sleep(0.05)
+        time.sleep(0.05)                                                                                       # let the order actually go out before reporting its fill
+        for k, (subj, lab, prm) in enumerate(list(wire.sent)):                                                 # every order now working fills in full, as the engine
+            if lab == "subscribe" and k not in done:                                                           # would report it. This has to happen BEFORE the next
+                done.add(k)                                                                                    # candle: arm_exit drops a position whose portfolio
+                fills(fake_dh, USER_ID * PF_PER_USER + int(subj.rsplit(".", 1)[1]), prm["SIDE"], prm["QTY"])    # "shows no confirmed fill yet"
     time.sleep(0.3)
     svc.on_stop()
     return [p for _, lab, p in wire.sent if lab == "subscribe"], [lab for _, lab, p in wire.sent]
