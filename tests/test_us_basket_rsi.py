@@ -8,8 +8,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from algo.ui.filters import PF_PER_USER
 from algo.series.absolute import Absolute, Relative
-from tests.test_examples import listener_on, quote, candle_feed, apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
+from tests.test_examples import fills, listener_on, quote, candle_feed, apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 
 pa = pytest.importorskip("pyarrow")
@@ -122,19 +123,25 @@ def test_without_history_the_rsi_needs_ten_five_minute_bars_and_then_a_fall_send
     ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch)
     out = capsys.readouterr().out
     assert "history: no candles_<day>.parquet" in out
-    leaked = sorted(n for n in set(ns) - before if not n.startswith("us_basket_rsi") and n != "run_us_basket_rsi" and not n.startswith("__"))
+    # 08's STRATEGY is "meanrevert" now, so that is the prefix it leaves in the terminal
+    leaked = sorted(n for n in set(ns) - before if not n.startswith("meanrevert") and n != "run_meanrevert" and not n.startswith("__"))
     assert leaked == []                                                                           # nothing that could overwrite another script's names
     feed(fake_dh, [100.0 - 0.25 * i for i in range(45)])                                          # 45 minutes = 9 five-minute bars: one short
     time.sleep(0.2)
     assert wire.sent == []
-    ns["us_basket_rsi_status"]()
+    ns["meanrevert_status"]()
     assert "RSI is ready for 0 of 1" in capsys.readouterr().out
     feed(fake_dh, [100.0 - 0.25 * i for i in range(45, 50)], first=45)                            # the 10th bar: RSI 0, oversold
     assert wait_for(lambda: len(wire.sent) == 1)
     subject, label, payload = wire.sent[0]
     assert (subject, label) == ("cmd.hft.1001", "subscribe")
-    assert {k: v for k, v in payload.items() if k not in ("USERIDENTIFIER", "user_id")} == {
-        "strategyname": ENGINE_NAME, "TOKEN": FUT, "SIDE": 1, "QTY": 1, "SERVERCODE": 15046, "ACCOUNT": "PRO", "ALGOID": "1"}
+    # the identifying fields, whatever the owner's sizing is: QTY follows ENTRY_VALUE, and a LimitOrder also
+    # carries the PRICE it rests at and MAX_TRIES (a CrossOrder carries neither)
+    assert payload["strategyname"] == ENGINE_NAME and payload["TOKEN"] == FUT and payload["SIDE"] == 1
+    assert payload["SERVERCODE"] == 15046 and payload["ACCOUNT"] == "PRO" and payload["ALGOID"] == "1"
+    assert isinstance(payload["QTY"], int) and payload["QTY"] >= 1
+    if ENGINE_NAME == "LimitOrder":
+        assert payload["PRICE"] > 0 and payload["MAX_TRIES"] >= 1
     assert [c[2] for c in calls] == ["open", "vwap"] and calls[0][1] == ("NIFTY", "A1", "A2")      # ranked against its own basket
     svc.on_stop()
 
@@ -145,7 +152,7 @@ def test_earlier_days_seed_the_rsi_so_the_very_first_live_candle_can_trade(tmp_p
     ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch)
     out = capsys.readouterr().out
     assert "history: 3 earlier day(s) (2020-01-13, 2020-01-14, 2020-01-15) seed the 5min RSI of 1 of 1 stocks" in out
-    ns["us_basket_rsi_status"]()
+    ns["meanrevert_status"]()
     assert "RSI is ready for 1 of 1" in capsys.readouterr().out                                    # before a single live candle
     assert wire.sent == []
     feed(fake_dh, [last - 0.25])                                                                  # the first live minute, still falling: oversold through yesterday's prices
@@ -163,20 +170,33 @@ def test_only_the_last_hist_days_are_used_and_a_missing_or_unreadable_file_is_sa
     svc.on_stop()
     fake_dh.clear()
     ns, app, svc, wire, calls, before = start(tmp_path / "none", monkeypatch, **{"HIST_DAYS = 3": "HIST_DAYS = 0"})
-    ns["us_basket_rsi_status"]()
+    ns["meanrevert_status"]()
     assert "RSI is ready for 0 of 1" in capsys.readouterr().out                                    # HIST_DAYS = 0: no history is read
     svc.on_stop()
 
 
-def test_the_target_closes_with_squareup_and_a_symbol_outside_the_window_or_in_two_baskets_is_refused(tmp_path, fake_dh, monkeypatch):
+def test_the_target_closes_on_a_new_portfolio_and_a_symbol_outside_the_window_or_in_two_baskets_is_refused(tmp_path, fake_dh, monkeypatch):
+    """The exit is NOT the entry's squareup any more: it is a fresh `subscribe` on a brand-new portfolio, on the
+    opposite side, for the amount that REALLY filled (read from orders_trade). The entry's portfolio is left
+    open and offset by it, which is why both appear in the book."""
     last = write_history(tmp_path, ["2020-01-14", "2020-01-15"])
     ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch)
     entry = last - 0.25
     feed(fake_dh, [entry])
     assert wait_for(lambda: len(wire.sent) == 1)
+    subject, label, params = wire.sent[0]
+    assert label == "subscribe" and params["SIDE"] == 1                                           # the entry: a BUY on PF 1001
+    entry_pf = int(subject.rsplit(".", 1)[1])
+    fills(fake_dh, USER_ID * PF_PER_USER + entry_pf, 1, params["QTY"])                            # it filled in full, as orders_trade reports it
     time.sleep(1.0)
     feed(fake_dh, [entry * 1.02], first=1)                                                        # +2% in favour of a long: the target
-    assert wait_for(lambda: len(wire.sent) == 2) and wire.sent[1][:2] == ("cmd.hft.1001", "squareup")
+    assert wait_for(lambda: len(wire.sent) == 2)
+    ex_subject, ex_label, ex_params = wire.sent[1]
+    assert ex_label == "subscribe"                                                                # a new instance, not a squareup
+    assert int(ex_subject.rsplit(".", 1)[1]) != entry_pf                                          # on its own portfolio
+    assert ex_params["SIDE"] == 2 and ex_params["QTY"] == params["QTY"]                           # opposite side, the filled amount
+    assert ex_params["strategyname"] == "LimitOrder"
+    assert "squareup" not in [lab for _, lab, _ in wire.sent]
     svc.on_stop()
     fake_dh.clear()
     ns, app, svc, wire, calls, before = start(tmp_path / "closed", monkeypatch, window="WINDOW = (dtime(0, 0), dtime(0, 1))")
@@ -207,7 +227,9 @@ def test_the_stocks_own_22_day_comparison_must_also_be_in_q2_to_q3_and_is_asked_
     folder = tmp_path / "edge"
     folder.mkdir()
     last = write_history(folder, ["2020-01-14", "2020-01-15"])
-    ns, app, svc, wire, calls, before = start(folder, monkeypatch, abs_pct=25.0, abs_idx=5)     # exactly on the edge of Q2: inside
+    # exactly on the edge of Q2 for pct_open (inclusive, so inside); pct_vwap still has to be below the band's
+    # low for the stock to be OVERSOLD at all, so only the reference under test is moved to the edge
+    ns, app, svc, wire, calls, before = start(folder, monkeypatch, abs_pct={"open": 25.0, "vwap": 10.0}, abs_idx=5)
     feed(fake_dh, [last - 0.25])
     assert wait_for(lambda: len(wire.sent) == 1)
     assert [c[4] for c in ns["absolute"].calls[:2]] == ["open", "vwap"] and [c[2] for c in calls] == ["open", "vwap"]    # both references, for itself and then for its basket
@@ -264,16 +286,19 @@ def test_at_the_time_exit_the_automation_is_stopped_like_algo_stop_on_the_next_c
     time.sleep(1.0)
     feed(fake_dh, [entry * 1.001], first=1)                                                        # a small move: neither target nor stop
     time.sleep(0.3)
-    assert len(wire.sent) == 1                                                                     # still open, the exit time has not come
+    assert sum(1 for _, lab, _ in wire.sent if lab == "subscribe") == 1                            # still open, the exit time has not come
     end = time.time() + 8
     while datetime.now(ZoneInfo("America/New_York")).time() < when and time.time() < end:
         time.sleep(0.1)
     time.sleep(0.2)
     feed(fake_dh, [entry * 1.001], first=2)                                                        # the next candle after the exit time
-    assert wait_for(lambda: len(wire.sent) == 4)
-    assert [lab for _, lab, _ in wire.sent[1:]] == ["pause_unpause:Pause", "squareup", "unsubscribe"]         # what algo_stop does, in that order, on the entry's portfolio
-    assert {subj for subj, _, _ in wire.sent[1:]} == {"cmd.hft.1001"}
-    assert wait_for(lambda: "us_basket_rsi" not in app.plugins)                                         # and the automation itself is stopped
+    assert wait_for(lambda: any(lab == "unsubscribe" for _, lab, _ in wire.sent))
+    # the resting order is re-priced while it waits, so "apply" may appear in between; what matters is the
+    # closing sequence algo_stop sends, in order. 08 stops with pause=False, so the pause step is optional.
+    stop_seq = [lab for _, lab, _ in wire.sent if lab in ("pause_unpause:Pause", "squareup", "unsubscribe")]
+    assert stop_seq in (["squareup", "unsubscribe"], ["pause_unpause:Pause", "squareup", "unsubscribe"]), stop_seq
+    assert {subj for subj, lab, _ in wire.sent if lab != "subscribe"} == {"cmd.hft.1001"}           # all of it on the entry's portfolio
+    assert wait_for(lambda: "meanrevert" not in app.plugins)                                         # and the automation itself is stopped
     svc.on_stop()
 
 
@@ -291,16 +316,28 @@ def test_with_act_on_bar_end_an_entry_is_looked_for_only_on_the_candle_that_ends
     svc.on_stop()
 
 
+def buys(wire):
+    """The ENTRY subscribes: in these oversold scenarios an entry is the BUY side. An exit is a subscribe too
+    now -- its own portfolio, SIDE 2 -- so the two are told apart by side rather than by the command."""
+    return [p["SIDE"] for _, lab, p in wire.sent if lab == "subscribe" and p["SIDE"] == 1]
+
+
 def run_two_oversold_spells(tmp_path, fake_dh, monkeypatch, **replace):
-    """A long fall (oversold, BUY), a 2% jump (the target: squareup), a rise that takes the RSI out of the zone, then another long fall (oversold again). Returns the subscribes sent."""
+    """A long fall (oversold, BUY), a 2% jump (the target, which opens an OPPOSITE portfolio rather than squaring
+    the entry up), a rise that takes the RSI out of the zone, then another long fall (oversold again).
+    Returns the BUY subscribes, i.e. the entries."""
     ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch, **replace)
     closes = [100.0 - 0.25 * i for i in range(60)]
     feed(fake_dh, closes)
     assert wait_for(lambda: len(wire.sent) >= 1)
+    subject, _lab, params = wire.sent[0]
+    fills(fake_dh, USER_ID * PF_PER_USER + int(subject.rsplit(".", 1)[1]), 1, params["QTY"])        # the entry filled: the exit is sized from this
     time.sleep(1.0)
     top = closes[-1] * 1.02
     feed(fake_dh, [top], first=60)                                                                  # +2% for the long: the target
-    assert wait_for(lambda: any(lab == "squareup" for _, lab, _ in wire.sent))
+    assert wait_for(lambda: any(lab == "subscribe" and p["SIDE"] == 2 for _, lab, p in wire.sent))   # the exit: a new portfolio on the other side
+    ex_subject, _l, ex_params = next((c for c in wire.sent if c[1] == "subscribe" and c[2]["SIDE"] == 2), (None, None, None))
+    fills(fake_dh, USER_ID * PF_PER_USER + int(ex_subject.rsplit(".", 1)[1]), 2, ex_params["QTY"])  # the exit filled too, so the stock is really flat again
     time.sleep(0.5)
     rise = [top + 0.5 * k for k in range(1, 16)]
     feed(fake_dh, rise, first=61)                                                                   # the RSI leaves the oversold zone
@@ -308,7 +345,7 @@ def run_two_oversold_spells(tmp_path, fake_dh, monkeypatch, **replace):
     feed(fake_dh, again, first=76)                                                                  # and falls into it again
     time.sleep(0.5)
     svc.on_stop()
-    return [(p["SIDE"]) for _, lab, p in wire.sent if lab == "subscribe"]
+    return buys(wire)
 
 
 def test_with_one_entry_per_stock_a_stock_is_not_entered_again_after_its_exit(tmp_path, fake_dh, monkeypatch):
@@ -321,11 +358,11 @@ def test_with_one_entry_per_stock_a_stock_is_not_entered_again_after_its_exit(tm
 
 
 def test_entry_value_makes_the_quantity_int_value_over_the_close_and_skips_an_entry_it_cannot_afford(tmp_path, fake_dh, monkeypatch, capsys):
-    assert "ENTRY_VALUE = None" in SCRIPT
+    assert re.search(r"^    ENTRY_VALUE = ", SCRIPT, re.M)      # whatever the owner has typed; each case below sets its own
     ns, app, svc, wire, calls, before = start(tmp_path, monkeypatch, **{"ENTRY_VALUE = None": "ENTRY_VALUE = 1000.0"})
     feed(fake_dh, [100.0 - 0.25 * i for i in range(60)])
     assert wait_for(lambda: len(wire.sent) == 1)
-    px = float(re.search(r"BUY (\d+) lot\(s\) at ([0-9.]+) on PF", capsys.readouterr().out).group(2))
+    px = float(re.search(r"BUY (\d+) lot\(s\) at ([0-9.]+)(?: \(LimitOrder\))? on PF", capsys.readouterr().out).group(2))
     assert wire.sent[0][2]["QTY"] == int(1000.0 / px) and wire.sent[0][2]["QTY"] > 1                  # by value, not the fixed QTY = 1
     svc.on_stop()
     fake_dh.clear()
@@ -353,8 +390,9 @@ def test_a_ranking_that_fails_is_counted_said_in_one_line_and_tried_again(tmp_pa
     ns["relative"] = flaky
     feed(fake_dh, [100.0 - 0.25 * i for i in range(60)])                                              # oversold from the 10th bar on
     assert wait_for(lambda: len(wire.sent) == 1)
-    ns["us_basket_rsi_status"]()
+    ns["meanrevert_status"]()
     out = capsys.readouterr().out
     assert out.count("the ranking is not available") == 1 and "Traceback" not in out and "trying again" in out
-    assert "ranking errors 1" in out and "signals" in out and "entered 1" in out
+    # the spread-gated script ARMS the entry and sends it on the first tick whose spread is ok, so its count is "armed"
+    assert "ranking errors 1" in out and "signals" in out and ("entered 1" in out or "armed 1" in out)
     svc.on_stop()

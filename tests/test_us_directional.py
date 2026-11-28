@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from algo.series.absolute import Absolute, Relative
-from tests.test_examples import candle_feed, apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
+from tests.test_examples import listener_on, quote, candle_feed, apply_replace, inline_params, EXAMPLES, FUT, Update, console_with_services, wait_for
 from tests.test_plugins_wiring import fake_dh  # noqa: F401  (a pytest fixture)
 from tests.test_us_basket_rsi import ALWAYS_OPEN, DAY0, MY_BASKET, basket_block, write_history
 
@@ -18,7 +18,7 @@ SCRIPT = inline_params(EXAMPLES / "14_us_directional_crossorder.py")
 OPEN_WINDOW = re.search(r"WINDOW = [(]dtime[(]\d+, \d+[)], dtime[(]\d+, \d+[)][)]", SCRIPT).group(0)
 
 
-def start(tmp_path, monkeypatch, pct=50.0, iv_cannot=False, rvol_now=10.0, **replace):
+def start(tmp_path, monkeypatch, pct=50.0, iv_cannot=False, rvol_now=10.0, turnover_now=1e12, **replace):
     ns, app, svc, wire = console_with_services(tmp_path, monkeypatch, "ok")
     calls = []
 
@@ -31,6 +31,8 @@ def start(tmp_path, monkeypatch, pct=50.0, iv_cannot=False, rvol_now=10.0, **rep
         calls.append(("absolute", series, symbol))
         if series == "volume":                                       # history averaging 1.0; rvol_now defaults well above RVOL_MIN_MULT x that, so it passes unless a test lowers it
             return Absolute(np.ones(n), 11, now=rvol_now, n_valid=n, pctile=100.0, series=series, level=level, symbol=symbol)
+        if series == "turnover":                                     # the flat TURNOVER_MIN floor: today's traded value so far. Far above it by default, so it only
+            return Absolute(np.ones(n), 11, now=turnover_now, n_valid=n, pctile=100.0, series=series, level=level, symbol=symbol)   # gets in the way when a test lowers it
         return Absolute(np.arange(float(n)), -1 if (series == "iv" and iv_cannot) else 11, now=0.5, n_valid=n, pctile=pct, series=series, level=level, symbol=symbol)
 
     ns["absolute_warm"] = lambda *a, **k: None
@@ -53,6 +55,8 @@ def run(tmp_path, fake_dh, monkeypatch, up, pct=50.0, **kw):
         price = last + (+10.0 if up else -10.0) * (i // 5 + 1) + (i % 5) * 0.01
         before = len(wire.sent)
         candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [price], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        if listener_on(fake_dh, "fo_market_data") is not None:
+            quote(fake_dh, FUT, float(price))
         time.sleep(0.05)
         if len(wire.sent) > before:
             entries.append(i)
@@ -92,7 +96,7 @@ def test_the_weak_side_on_both_refs_sells(tmp_path, fake_dh, monkeypatch):
 
 
 def test_rvol_below_the_minimum_multiple_of_the_average_refuses_the_entry(tmp_path, fake_dh, monkeypatch):
-    assert "RVOL_MIN_MULT = 2.0" in SCRIPT                                                                # history averages 1.0 (see start()); 2.0 under it fails the gate
+    assert re.search(r"^    RVOL_MIN_MULT = [0-9.]+", SCRIPT, re.M)      # whatever the owner has typed; the cases below set their own
     svc, wire, entries, calls = run(tmp_path, fake_dh, monkeypatch, up=True, pct=100.0, rvol_now=1.5)     # would otherwise be the clean BUY of the first test
     assert wire.sent == []
     assert ("absolute", "volume", "NIFTY") in calls
@@ -125,6 +129,8 @@ def run_two_sides(tmp_path, fake_dh, monkeypatch, **replace):
         bar = i // 5
         price = last + (10.0 * (bar + 1) if bar < 8 else 80.0 - 15.0 * (bar - 7)) + (i % 5) * 0.01             # 8 bars up, then 8 bars down to a new low of the day
         candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [price], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        if listener_on(fake_dh, "fo_market_data") is not None:
+            quote(fake_dh, FUT, float(price))
         time.sleep(0.05)
     time.sleep(0.3)
     svc.on_stop()
@@ -143,9 +149,9 @@ def test_with_one_entry_per_stock_a_stock_is_not_entered_again_after_its_exit(tm
 
 
 def test_entry_value_makes_the_quantity_int_value_over_the_close(tmp_path, fake_dh, monkeypatch, capsys):
-    assert "ENTRY_VALUE = None" in SCRIPT
+    assert re.search(r"^    ENTRY_VALUE = ", SCRIPT, re.M)      # whatever the owner has typed; the case below sets its own
     svc, wire, entries, calls = run(tmp_path, fake_dh, monkeypatch, up=True, pct=100.0, **{"ENTRY_VALUE = None": "ENTRY_VALUE = 100000.0"})
-    px = float(re.search(r"BUY (\d+) lot\(s\) at ([0-9.]+) on PF", capsys.readouterr().out).group(2))
+    px = float(re.search(r"BUY (\d+) lot\(s\) at ([0-9.]+)(?: \(LimitOrder\))? on PF", capsys.readouterr().out).group(2))
     subs = [p for _, lab, p in wire.sent if lab == "subscribe"]
     assert len(subs) == 1 and subs[0]["QTY"] == int(100000.0 / px) and subs[0]["QTY"] > 1
     svc.on_stop()
@@ -174,6 +180,8 @@ def two_bars(tmp_path, fake_dh, monkeypatch, first_offset, second_offset, up=Tru
     ns, svc, wire, calls = start(tmp_path, monkeypatch, pct=100.0 if up else 10.0, **replace)
     for i, off in enumerate([first_offset] * 5 + [second_offset] * 5):
         candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [last + off + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        if listener_on(fake_dh, "fo_market_data") is not None:
+            quote(fake_dh, FUT, float(last + off + (i % 5) * 0.01))
         time.sleep(0.05)
     time.sleep(0.2)
     svc.on_stop()
@@ -218,9 +226,11 @@ def two_up_bars_with_a_flaky_ranking(tmp_path, fake_dh, monkeypatch, capsys, **r
     flaky_ranking(ns)
     for i in range(11):                                                                                 # bar 0, bar 1 (its last candle is i = 9) and one candle of bar 2
         candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [last + (10.0 if i < 5 else 20.0 if i < 10 else 30.0) + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
+        if listener_on(fake_dh, "fo_market_data") is not None:
+            quote(fake_dh, FUT, float(last + (10.0 if i < 5 else 20.0 if i < 10 else 30.0) + (i % 5) * 0.01))
         time.sleep(0.05)
     time.sleep(0.3)
-    ns["us_directional_status"]()
+    ns["directional_status"]()
     out = capsys.readouterr().out
     svc.on_stop()
     return [p for _, lab, p in wire.sent if lab == "subscribe"], out
@@ -243,7 +253,9 @@ def test_status_counts_where_the_signals_went(tmp_path, fake_dh, monkeypatch, ca
     ns, svc, wire, calls = start(tmp_path, monkeypatch, pct=50.0)                                        # the middle band: relative refuses every look
     for i in range(10):
         candle_feed(fake_dh).fn(Update(added={"token": [FUT], "Close": [last + (10.0 if i < 5 else 20.0) + (i % 5) * 0.01], "Minute": [DAY0 + np.timedelta64(i, "m")]}), False)
-    ns["us_directional_status"]()
+        if listener_on(fake_dh, "fo_market_data") is not None:
+            quote(fake_dh, FUT, float(last + (10.0 if i < 5 else 20.0) + (i % 5) * 0.01))
+    ns["directional_status"]()
     out = capsys.readouterr().out
     svc.on_stop()
     assert "signals: " in out and "refused by basket" in out and "looked at" in out and "entered" not in out

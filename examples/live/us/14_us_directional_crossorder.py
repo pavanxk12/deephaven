@@ -664,6 +664,10 @@ def run_directional():
                 q = int(qty)
                 opens = pf_side.get(pf)                             # fills are NETTED, not summed: a fill on the opening side adds, one on the other side
                 filled[pf] = filled.get(pf, 0) + (q if opens is None or int(bs) == opens else -q)   # (a squareup) takes away, so `filled` is the real live size
+                for tok, pos in list(position.items()):             # an exit that has now filled in full closes its position AT ONCE, rather than waiting out
+                    if pos.get("exit_pf") == pf and filled[pf] >= pos.get("exit_qty", 0) > 0:       # UNSUB_AFTER_S: the portfolio still goes at the timer, but the
+                        position.pop(tok, None)                     # stock is free to be entered again as soon as it is really flat
+                        maybe_untrack(tok)
 
     def start_trade_listener():
         """watch() checks app.tables/app.ns, which orders_trade may never be registered in even once it exists as a bare console
